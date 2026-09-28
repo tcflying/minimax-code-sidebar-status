@@ -8,7 +8,10 @@
 //   node selftest.mjs
 
 import fs from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { StatusDb, BUCKET, bucketFor, DEFAULT_DB } from './lib/status-db.mjs';
+import { CdpSession } from './lib/cdp.mjs';
+import { createRefreshLoop, installFatalGuards } from './daemon.mjs';
 import {
   buildBootstrapExpression,
   buildRefreshExpression,
@@ -28,6 +31,7 @@ function check(name, cond, detail) {
     console.log(`  FAIL  ${name}${detail ? ' :: ' + detail : ''}`);
   }
 }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 console.log('\n=== 1. bucketFor 映射规则 ===');
 check('started -> running', bucketFor({ status: 'started' }) === BUCKET.running);
@@ -137,6 +141,481 @@ rawSeg.split('\n').forEach((line, i) => {
 });
 check('模板体内无游离反引号', offenders.length === 0, offenders.join(','));
 check('不出现 backtick 包裹的注释', !/^\s*\/\/.*`[A-Za-z_$]/.test(rawSeg));
+
+console.log('\n=== 4. 崩溃链回归：tick 循环不得产生未处理拒绝 ===');
+// 2026-09-28 实证：logs/daemon-9352.err 里是
+//   Error: CDP 超时(30000ms): Runtime.evaluate  -> Node.js v24.18.0
+// 即 4590 个 tick 后整个守护进程死了。原因是 setInterval 回调里
+// session.evaluateWithRetry(...) 的 promise 只有 1/10 的分支挂了 .catch。
+const daemonSrc = fs.readFileSync(new URL('./daemon.mjs', import.meta.url), 'utf8');
+
+// Extracts the BODY of a function, skipping its parameter list (which may
+// itself contain braces and parens, e.g. `{ log: logFn = () => {} }`).
+function blockOf(src, header) {
+  const start = src.indexOf(header);
+  if (start < 0) return null;
+  let depth = 0;
+  let sawOpen = false;
+  let i = start;
+  for (; i < src.length; i++) {
+    const c = src[i];
+    if (c === '(') {
+      depth++;
+      sawOpen = true;
+    } else if (c === ')') depth--;
+    else if (c === '{' && sawOpen && depth === 0) break;
+  }
+  if (i >= src.length) return null;
+  let braces = 0;
+  for (let j = i; j < src.length; j++) {
+    if (src[j] === '{') braces++;
+    else if (src[j] === '}') {
+      braces--;
+      if (braces === 0) return src.slice(i + 1, j);
+    }
+  }
+  return null;
+}
+
+const tickBodyRaw = blockOf(daemonSrc, 'function tick()');
+check('daemon.mjs 里能定位到 tick 函数体', !!tickBodyRaw);
+// Comments are stripped first: a long explanatory comment between the call and
+// its handler must not push the handler out of the scan window.
+const tickBody = (tickBodyRaw || '').replace(/\/\/[^\n]*/g, '');
+
+// Every evaluateWithRetry call site must be followed, within a short window, by
+// .then / .catch / await / Promise.resolve - otherwise it is a bare promise.
+const callSites = [];
+{
+  const re = /evaluateWithRetry\(/g;
+  let m;
+  while ((m = re.exec(tickBody)) !== null) callSites.push(m.index);
+}
+const bareCalls = callSites.filter(
+  (i) => !/\.(then|catch)\(|\bawait\b|Promise\.resolve\(/.test(tickBody.slice(i, i + 420))
+);
+check('tick 内每个 evaluateWithRetry 调用点都挂了处理', bareCalls.length === 0, `${callSites.length} 个调用点`);
+check('tick 内不存在 %10 才处理一次的裸分支', !/ticks\s*%\s*\d+\s*===/.test(tickBody));
+check(
+  'tick 对 promise 同时给了成功与失败处理',
+  /Promise\.resolve\(p\)\s*\n?\s*\.then\(\(res\) => onTickOk\(res, tickNo\), onTickErr\)/.test(tickBody)
+);
+check('tick 处理链尾部还有 .catch 兜底', /\.then\(\(res\) => onTickOk\(res, tickNo\), onTickErr\)\s*\n?\s*\.catch\(/.test(tickBody));
+check(
+  'tick 日志用发起该请求的 tick 号，而不是结算时的计数',
+  /function onTickOk\(res, tickNo\)/.test(daemonSrc) &&
+    /if \(tickNo % logEvery === 0\)/.test(daemonSrc) &&
+    /const tickNo = \+\+state\.ticks/.test(tickBody)
+);
+check('setInterval 只出现一次且回调是具名 tick', (daemonSrc.match(/setInterval\(/g) || []).length === 1 && /setInterval\(tick,/.test(daemonSrc));
+// The classic trap: a try/catch that catches nothing because the call is async.
+// The catch here may only catch a SYNCHRONOUS throw, and it must return so the
+// (never created) promise cannot escape.
+check(
+  'tick 的 try/catch 只兜同步抛出且立刻 return',
+  /try\s*\{\s*p = getSession\(\)\.evaluateWithRetry\(expression\);\s*\}\s*catch \(e\) \{\s*noteFailure\('刷新调用同步抛出', e\);\s*return;\s*\}/.test(tickBody)
+);
+check('daemon.mjs 注册了 unhandledRejection 兜底', /process\.on\('unhandledRejection'/.test(daemonSrc));
+check('daemon.mjs 注册了 uncaughtException 兜底', /process\.on\('uncaughtException'/.test(daemonSrc));
+const guardBody = blockOf(daemonSrc, 'export function installFatalGuards') || '';
+check('兜底处理器函数体被成功定位', guardBody.length > 200, `${guardBody.length} chars`);
+check('兜底处理器内部不调用 process.exit', !/process\.exit/.test(guardBody));
+check('兜底决策写进了注释', /never exit here|KEEP RUNNING/.test(daemonSrc));
+
+// The command line surface is frozen: the user depends on every one of these.
+const CLI_FLAGS = [
+  '--port', '--db', '--interval', '--once', '--offsetX', '--show-done',
+  '--show-aborted', '--no-collapse', '--active-bg', '--active-bg-hover', '--active-bar',
+];
+const missingFlags = CLI_FLAGS.filter((f) => !daemonSrc.includes(`'${f}'`));
+check('11 个命令行参数一个都没被删/改名', missingFlags.length === 0, missingFlags.join(','));
+check('只有 --no-collapse 关闭折叠', /--no-collapse'\)\s*out\.collapse = false/.test(daemonSrc));
+
+// Record any unhandled rejection that happens inside THIS process while the
+// behaviour tests below run. A single occurrence fails the suite.
+let unhandledSeen = 0;
+process.on('unhandledRejection', () => {
+  unhandledSeen++;
+});
+
+const fakeDb = {
+  refresh() {},
+  snapshot: () => ({ abc: 'running' }),
+};
+
+console.log('\n=== 5. 行为测试：刷新必定 reject 时进程不退出 ===');
+{
+  const lines = [];
+  let calls = 0;
+  const dyingSession = {
+    evaluateWithRetry() {
+      calls++;
+      return Promise.reject(new Error('CDP 超时(30000ms): Runtime.evaluate'));
+    },
+    close() {
+      this.closed = true;
+    },
+  };
+  const loop = createRefreshLoop({
+    getSession: () => dyingSession,
+    setSession: () => {},
+    db: fakeDb,
+    bootstrapConfig: {},
+    log: (...m) => lines.push(m.join(' ')),
+    intervalMs: 1,
+    failureThreshold: 3,
+    reconnectBaseMs: 2,
+    reconnectMaxMs: 8,
+    rebootBaseMs: 2,
+    rebootMaxMs: 8,
+    reconnect: async () => {
+      throw new Error('假重连：没有 target');
+    },
+    autoStart: false,
+  });
+  for (let i = 0; i < 15; i++) loop.tick();
+  await sleep(150);
+  loop.stop();
+  check('拒绝的 refresh 被调用了 15 次', calls === 15, `calls=${calls}`);
+  check('进程仍然活着（没有设置退出码）', !process.exitCode, `exitCode=${process.exitCode}`);
+  check('日志里有刷新失败记录', lines.some((l) => l.includes('刷新失败')), lines[0] || '(无日志)');
+  check('连续失败被计数', loop.state.consecutiveFailures === 15, `n=${loop.state.consecutiveFailures}`);
+  check('达到阈值后触发了重连', loop.state.reconnectAttempts >= 1, `attempts=${loop.state.reconnectAttempts}`);
+  check('重连失败后进入退避（不是 busy loop）', loop.state.reconnectBackoffMs > 2, `backoff=${loop.state.reconnectBackoffMs}ms`);
+  check('整个过程零未处理拒绝', unhandledSeen === 0, `unhandledRejection=${unhandledSeen}`);
+}
+
+console.log('\n=== 6. 行为测试：setInterval 真实驱动下的异步失败 ===');
+{
+  const lines = [];
+  const loop = createRefreshLoop({
+    getSession: () => ({
+      evaluateWithRetry: () => Promise.reject(new Error('boom')),
+      close() {},
+    }),
+    setSession: () => {},
+    db: fakeDb,
+    bootstrapConfig: {},
+    log: (...m) => lines.push(m.join(' ')),
+    intervalMs: 10,
+    failureThreshold: 2,
+    reconnectBaseMs: 2,
+    reconnectMaxMs: 6,
+    rebootBaseMs: 2,
+    rebootMaxMs: 6,
+    reconnect: async () => {
+      throw new Error('假重连失败');
+    },
+  });
+  await sleep(400);
+  const ticks = loop.state.ticks;
+  const failLines = lines.filter((l) => l.startsWith('刷新失败')).length;
+  loop.stop();
+  check('真实定时器跑出了多次 tick', ticks >= 5, `ticks=${ticks}`);
+  check('定时器驱动下依旧零未处理拒绝', unhandledSeen === 0, `unhandledRejection=${unhandledSeen}`);
+  check('定时器驱动下进程未退出', !process.exitCode, `exitCode=${process.exitCode}`);
+  check('失败日志被限流而非刷屏', failLines <= 1 + Math.ceil(ticks / 10), `${failLines} 条刷新失败日志 / ${ticks} ticks`);
+}
+
+console.log('\n=== 7. 行为测试：连接断了要自愈重连并退避 ===');
+{
+  const lines = [];
+  let attempts = 0;
+  let oldClosed = false;
+  const deadSession = {
+    evaluateWithRetry: () => Promise.reject(new Error('CDP 超时(30000ms): Runtime.evaluate')),
+    close() {
+      oldClosed = true;
+    },
+  };
+  const healthySession = {
+    evaluateWithRetry: async () => ({ ok: true, stats: { collapsed: 0 } }),
+    close() {},
+  };
+  let current = deadSession;
+  const loop = createRefreshLoop({
+    getSession: () => current,
+    setSession: (s) => {
+      current = s;
+    },
+    db: fakeDb,
+    bootstrapConfig: {},
+    log: (...m) => lines.push(m.join(' ')),
+    intervalMs: 1,
+    failureThreshold: 3,
+    reconnectBaseMs: 2,
+    reconnectMaxMs: 8,
+    reconnect: async () => {
+      attempts++;
+      if (attempts < 3) throw new Error('target 尚未就绪');
+      return { session: healthySession, target: { url: 'app://./archon' } };
+    },
+    autoStart: false,
+  });
+  for (let i = 0; i < 3; i++) loop.tick();
+  await sleep(400);
+  loop.stop();
+  check('重连被反复尝试过', attempts >= 3, `attempts=${attempts}`);
+  check('退避期间间隔被拉长', loop.state.reconnectAttempts >= 2, `attempts=${loop.state.reconnectAttempts}`);
+  check('重连成功后替换了新 session', current === healthySession);
+  check('旧 session 被关闭', oldClosed);
+  check('成功重连后失败计数归零', loop.state.consecutiveFailures === 0, `n=${loop.state.consecutiveFailures}`);
+  check('成功重连后回到初始退避', loop.state.reconnectBackoffMs === 2, `backoff=${loop.state.reconnectBackoffMs}`);
+  check('日志记录了重连成功', lines.some((l) => l.includes('重连成功')));
+  check('重连路径零未处理拒绝', unhandledSeen === 0, `unhandledRejection=${unhandledSeen}`);
+}
+
+console.log('\n=== 8. 行为测试：注入被页面重载清掉后要重新 bootstrap ===');
+{
+  const lines = [];
+  let boots = 0;
+  let installed = false;
+  // The renderer document was replaced: refresh answers not-installed forever
+  // until we run the full bootstrap again.
+  const session = {
+    evaluateWithRetry: async (expr) => {
+      const isBootstrap = expr.includes('__mmxStatusMain');
+      if (isBootstrap) {
+        boots++;
+        installed = true;
+        return { ok: true, initial: { painted: 85 } };
+      }
+      return installed ? { ok: true, stats: { collapsed: 0 } } : { ok: false, reason: 'not-installed' };
+    },
+    close() {},
+  };
+  const loop = createRefreshLoop({
+    getSession: () => session,
+    setSession: () => {},
+    db: fakeDb,
+    bootstrapConfig: { offsetX: 4, showDone: false, collapseOnStart: true },
+    log: (...m) => lines.push(m.join(' ')),
+    intervalMs: 1,
+    failureThreshold: 3,
+    reconnectBaseMs: 2,
+    reconnectMaxMs: 8,
+    rebootBaseMs: 4,
+    rebootMaxMs: 8,
+    reconnect: async () => {
+      throw new Error('不应该重连：传输层是好的');
+    },
+    autoStart: false,
+  });
+  // 20 个连续 not-installed 的 tick。
+  for (let i = 0; i < 20; i++) loop.tick();
+  await sleep(0); // 让 promise 回调落地（onTickOk 是异步的）
+  check('not-installed 被识别为注入丢失', loop.state.notInstalled === 20, `n=${loop.state.notInstalled}`);
+  check('退避门槛内没有立刻打 bootstrap', boots === 0, `boots=${boots}`);
+  check('not-installed 不被误判为传输失败', loop.state.reconnectAttempts === 0, `attempts=${loop.state.reconnectAttempts}`);
+  await sleep(80);
+  check('退避后确实重新 bootstrap 了', boots >= 1, `boots=${boots}`);
+  check('bootstrap 次数远少于 tick 数（退避生效）', boots < 20, `boots=${boots} / 20 ticks`);
+  check('重新注入成功后计数归零', loop.state.notInstalled === 0, `n=${loop.state.notInstalled}`);
+  check('重新注入成功被计数', loop.state.reboots >= 1, `reboots=${loop.state.reboots}`);
+  check('注入恢复后不再重复 bootstrap', boots === loop.state.reboots, `boots=${boots} reboots=${loop.state.reboots}`);
+  check('日志记录了注入消失', lines.some((l) => l.includes('注入已消失')));
+  check('日志记录了重新注入成功', lines.some((l) => l.includes('重新注入成功')));
+  // 注入恢复后刷新重新变 ok，且不再触发任何重装。
+  loop.tick();
+  loop.tick();
+  await sleep(10);
+  check('恢复后刷新回到正常且不重复注入', boots === 1 && loop.state.notInstalled === 0, `boots=${boots} n=${loop.state.notInstalled}`);
+  loop.stop();
+}
+
+console.log('\n=== 9. 行为测试：bootstrap 自身失败要继续退避重试 ===');
+{
+  const lines = [];
+  let attempts = 0;
+  const session = {
+    evaluateWithRetry: async (expr) => {
+      if (expr.includes('__mmxStatusMain')) {
+        attempts++;
+        // 页面正在导航，document.body 还没挂上。
+        return { ok: false, reason: 'no-document-body' };
+      }
+      return { ok: false, reason: 'not-installed' };
+    },
+    close() {},
+  };
+  const loop = createRefreshLoop({
+    getSession: () => session,
+    setSession: () => {},
+    db: fakeDb,
+    bootstrapConfig: {},
+    log: (...m) => lines.push(m.join(' ')),
+    intervalMs: 1,
+    failureThreshold: 3,
+    reconnectBaseMs: 2,
+    reconnectMaxMs: 8,
+    rebootBaseMs: 2,
+    rebootMaxMs: 10,
+    reconnect: async () => {
+      throw new Error('不应该重连');
+    },
+    autoStart: false,
+  });
+  for (let i = 0; i < 10; i++) loop.tick();
+  await sleep(200);
+  loop.stop();
+  check('失败的 bootstrap 被继续重试', attempts >= 2, `attempts=${attempts}`);
+  check('重试间隔被拉长（退避）', loop.state.rebootBackoffMs > 2, `backoff=${loop.state.rebootBackoffMs}ms`);
+  check('失败的 bootstrap 不被计为成功', loop.state.reboots === 0, `reboots=${loop.state.reboots}`);
+  check('bootstrap 失败不触发传输层重连', loop.state.reconnectAttempts === 0);
+  check('bootstrap 失败也不崩', unhandledSeen === 0, `unhandledRejection=${unhandledSeen}`);
+  check('bootstrap 失败被记进日志', lines.some((l) => l.includes('重新注入未成功')));
+}
+
+console.log('\n=== 10. CdpSession：ws 关闭时立刻拒掉所有 pending ===');
+class FakeWs extends EventTarget {
+  constructor(onSend = null) {
+    super();
+    this.sent = [];
+    this.onSend = onSend;
+    this.closeCalled = false;
+  }
+  send(payload) {
+    const msg = JSON.parse(payload);
+    this.sent.push(msg);
+    if (this.onSend) this.onSend(msg, this);
+  }
+  close() {
+    this.closeCalled = true;
+  }
+  reply(id, result) {
+    const ev = new Event('message');
+    ev.data = JSON.stringify({ id, result });
+    this.dispatchEvent(ev);
+  }
+  die(type) {
+    this.dispatchEvent(new Event(type));
+  }
+}
+
+async function pendingAllRejected(ws, timeoutMs) {
+  const s = new CdpSession(ws);
+  const errs = [];
+  const ps = [
+    s.send('Runtime.evaluate', { a: 1 }, timeoutMs).catch((e) => errs.push(e)),
+    s.send('Runtime.evaluate', { b: 2 }, timeoutMs).catch((e) => errs.push(e)),
+    s.send('Runtime.evaluate', { c: 3 }, timeoutMs).catch((e) => errs.push(e)),
+  ];
+  await sleep(10);
+  const t0 = Date.now();
+  ws.die('close');
+  const done = await Promise.race([
+    Promise.all(ps).then(() => true),
+    sleep(1500).then(() => false),
+  ]);
+  return { done, ms: Date.now() - t0, errs, session: s };
+}
+
+{
+  const r = await pendingAllRejected(new FakeWs(), 30000);
+  check('ws close 后所有 pending 都被 reject', r.done && r.errs.length === 3, `${r.errs.length}/3`);
+  check('不需要白等 30 秒', r.ms < 1500, `${r.ms}ms（timeoutMs=30000）`);
+  check('拒绝原因指明是 socket 关闭', r.errs.every((e) => /已关闭/.test(e.message)), r.errs[0] && r.errs[0].message);
+  check('pending 表已清空', r.session.pending.size === 0, `pending=${r.session.pending.size}`);
+  check('pending 的超时计时器全部清理', r.session.activeTimeouts.size === 0, `${r.session.activeTimeouts.size} 个残留`);
+}
+
+{
+  const r = await pendingAllRejected(new FakeWs(), 30000);
+  // FakeWs.die('close') above; this block re-checks the error path on a fresh ws.
+  const ws = new FakeWs();
+  const s = new CdpSession(ws);
+  let err = null;
+  s.send('Runtime.evaluate', {}, 30000).catch((e) => {
+    err = e;
+  });
+  await sleep(10);
+  ws.die('error');
+  await sleep(30);
+  check('ws error 也会拒掉 pending', err instanceof Error && /错误/.test(err.message), err && err.message);
+  check('error 之后不再接受新请求（立即失败）', await s.send('Runtime.evaluate', {}, 30000).then(() => false, (e) => /WebSocket 错误/.test(e.message)));
+  void r;
+}
+
+{
+  const ws = new FakeWs();
+  const s = new CdpSession(ws);
+  const t0 = Date.now();
+  const p = s.send('Runtime.evaluate', {}, 30000);
+  ws.reply(1, { result: { value: 42 } });
+  const got = await p;
+  // send() resolves with the raw CDP result payload - unchanged semantics.
+  check('成功路径返回值语义不变', got && got.result && got.result.value === 42, JSON.stringify(got));
+  check('成功后超时计时器被清理', s.activeTimeouts.size === 0, `${s.activeTimeouts.size} 个残留`);
+  check('成功后 pending 为空', s.pending.size === 0);
+  const ms = Date.now() - t0;
+  check('成功路径没有等待超时', ms < 1000, `${ms}ms`);
+}
+
+// evaluate() must keep behaving exactly as e2e.mjs and selftest.mjs rely on it:
+// returnByValue unwrapping, plus a throw when the page itself raised.
+{
+  const ws = new FakeWs((msg, self) => {
+    if (msg.method === 'Runtime.evaluate') {
+      if (String(msg.params.expression).includes('throw')) {
+        self.reply(msg.id, {
+          result: {},
+          exceptionDetails: {
+            text: 'Uncaught',
+            exception: { description: 'Error: page boom' },
+          },
+        });
+      } else {
+        self.reply(msg.id, { result: { value: 42 } });
+      }
+    } else {
+      self.reply(msg.id, {});
+    }
+  });
+  const s = new CdpSession(ws);
+  check('evaluate() 按 returnByValue 解包', (await s.evaluate('42')) === 42);
+  check(
+    'evaluate() 对页面异常抛错（语义未被改掉）',
+    await s
+      .evaluate('throw new Error("page boom")')
+      .then(() => false, (e) => /页面异常/.test(e.message) && /page boom/.test(e.message))
+  );
+  check('evaluate 发的参数仍带 awaitPromise/userGesture', JSON.stringify(ws.sent.find((m) => m.method === 'Runtime.evaluate').params.returnByValue) === 'true');
+}
+
+console.log('\n=== 11. unhandledRejection 兜底：子进程退出码验证 ===');
+{
+  const daemonUrl = new URL('./daemon.mjs', import.meta.url).href;
+  const script = (withGuard) =>
+    [
+      `import { installFatalGuards } from ${JSON.stringify(daemonUrl)};`,
+      withGuard ? 'installFatalGuards({ log: () => {} });' : '',
+      "Promise.reject(new Error('boom-unhandled'));",
+      "setTimeout(() => { console.log('STILL_ALIVE'); }, 200);",
+    ].join('\n');
+  const run = (withGuard) =>
+    spawnSync(process.execPath, ['--input-type=module', '-e', script(withGuard)], {
+      encoding: 'utf8',
+      timeout: 20000,
+    });
+  const guarded = run(true);
+  const bare = run(false);
+  check(
+    '对照组：没有兜底时 unhandledRejection 直接杀进程（退出码 1）',
+    bare.status === 1,
+    `status=${bare.status}`
+  );
+  check(
+    '装上兜底后退出码不是 1',
+    guarded.status === 0,
+    `status=${guarded.status} ${guarded.stderr.trim().slice(0, 120)}`
+  );
+  check(
+    '装上兜底后进程继续跑完剩余工作',
+    (guarded.stdout || '').includes('STILL_ALIVE'),
+    JSON.stringify((guarded.stdout || '').trim())
+  );
+  check('兜底脚本没有语法错误', !/SyntaxError/.test(guarded.stderr || ''), (guarded.stderr || '').slice(0, 120));
+}
 
 console.log(`\n=== E2E 结果: ${pass} passed, ${fail} failed ===`);
 process.exit(fail === 0 ? 0 : 1);

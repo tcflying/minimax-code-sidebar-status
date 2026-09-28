@@ -244,7 +244,17 @@ function __mmxStatusMain(cfg) {
     mount: mount,
     apply: apply,
     enforceNoAutoExpand: enforceNoAutoExpand,
-    refresh: function (nextStatus) { cfg.status = nextStatus || {}; apply(); return enforceNoAutoExpand(); },
+    // apply()'s return value used to be discarded here, so the paint statistics
+    // (rows / painted / removed / unknownIds) were unobservable and a stale-dot
+    // regression could not be asserted by any test. Return the paint stats and
+    // carry the collapse result inside them.
+    refresh: function (nextStatus) {
+      cfg.status = nextStatus || {};
+      var painted = apply();
+      var collapse = enforceNoAutoExpand();
+      painted.collapse = collapse;
+      return painted;
+    },
     dispose: function () {
       disposed = true;
       try { observer.disconnect(); } catch (e) {}

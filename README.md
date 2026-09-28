@@ -559,7 +559,88 @@ pwsh -NoProfile -File test-launcher.ps1        20 项 · 自建一次性实例
 
 ---
 
-## 14. 目录结构
+## 14. 重启后自愈链路（本轮新增）
+
+"重启 MiniMax Code 后侧边栏又全恢复了" —— 这不是一个 bug，是**三层独立根因同时存在**。
+只修任何一层都不会好。
+
+### 14.1 三层根因
+
+| # | 根因 | 现象 | 证据 |
+|---|---|---|---|
+| 1 | 启动入口不带 CDP 参数 | 从开始菜单 / 桌面图标启动，注入器永远接不上 | `.lnk` 的 `Arguments` 为空 |
+| 2 | 守护进程被异步 reject 打死 | 跑了几小时后整个 Node 进程消失 | `Error: CDP 超时(30000ms): Runtime.evaluate` |
+| 3 | 页面重载后永不重连 | 界面闪一下点全没了，守护还活着但空转 | 日志连续 `{"ok":false,"reason":"not-installed"}` |
+
+第 2 条的机制最容易重犯，值得单说：
+
+```js
+// ❌ try/catch 对异步 reject 完全无效
+setInterval(() => {
+  try {
+    const p = session.evaluateWithRetry(expr);
+    if (i % 10 === 0) p.catch(noop);   // 只有 1/10 的分支挂了 catch
+  } catch {}
+}, 2500);
+// 其余 9/10 的 tick 是裸奔 promise → unhandledRejection
+// → Node 24 默认 --unhandled-rejections=throw → 整个进程死
+```
+
+第 3 条最隐蔽：刷新返回 `not-installed`（`window.__mmxStatus` 随新文档消失），
+守护只把它当一次普通失败记一行，**从不重新 bootstrap**。实测
+`tick 30: ok:true` → `tick 40/50: not-installed`，进程活着但注入永不再回。
+
+### 14.2 解法
+
+```
+开机自启 ──► watchdog.mjs 常驻
+                 ├─ 探测应用是否在跑
+                 ├─ 发现 CDP 端口（DevToolsActivePort 文件 + 命令行，双路互证）
+                 └─ 守护没了？──► 拉起 daemon.mjs
+                                       └─ 注入掉了？──► 重新 bootstrap
+```
+
+- **快捷方式改写**：开始菜单 + 桌面的 `MiniMax Code.lnk` 指向
+  `launch-mmx-status.ps1`（`-WindowStyle Hidden` 无窗口），原图标备份为 `.lnk.bak`
+- **端口自动发现**：绝不写死。优先读 Electron 自己写的
+  `%APPDATA%\<App>\DevToolsActivePort`（内容形如 `9331\n/devtools/browser/<uuid>`，
+  取第一行要 `trim`，Windows 上常见 CRLF），再用进程命令行兜底
+- **绝不自动杀应用**：`APP_UP_NO_CDP` 时只告警不动进程；自动修复必须显式加 `--fix-app`
+- **不碰官方自启项**：`com.minimax.agent.cn` 只读打印，从不改写
+
+### 14.3 端口写死是隐患
+
+实测同一个应用在不同时期跑过 **9351 / 9352 / 9331** 三个端口。
+任何把端口写进配置的做法都会在某次重启后失效。
+
+### 14.4 安装与还原
+
+```powershell
+# 先干跑，确认不动任何东西
+pwsh -NoProfile -File .\src\install-launcher.ps1 -DryRun
+pwsh -NoProfile -File .\src\install-launcher.ps1
+
+# 还原
+pwsh -NoProfile -File .\src\uninstall-launcher.ps1
+```
+
+`uninstall` 把 `.lnk` 从 `.lnk.bak` 原样拷回，并删掉自己加的 `Run\mmxStatusWatchdog`。
+没有 `.bak` 的图标只跳过不删（保守，避免毁掉官方图标）。
+
+### 14.5 怎么验证"重启后真的能恢复"
+
+```powershell
+node .\tests\reload-e2e.mjs 9331 45000        # 强制 Page.reload，验证自恢复
+node .\tests\watchdog-heal-e2e.mjs 9331        # 杀掉守护，验证 watchdog 自愈
+```
+
+`reload-e2e.mjs` 里有一条**判据自证**值得单独说：reload 前往页面写一个
+`window.__probeMark` 标记，reload 后必须确认标记已消失；否则判定"reload 根本没发生"、
+这次 PASS 是假的。没有这条，一个还没被换掉的旧文档就能骗出满分。
+
+---
+
+## 15. 目录结构
 
 ```
 minimax-code-sidebar-status/
@@ -571,14 +652,26 @@ minimax-code-sidebar-status/
 │   ├── 04-never-expand.md       永不展开守卫
 │   ├── 05-bugs.md               三个真 bug 复盘
 │   └── 06-testing.md            测试体系与假 PASS 陷阱
+├── tests/                       ← 本轮新增：跨进程真实验证
+│   ├── reload-e2e.mjs           强制 Page.reload，验证自恢复（含判据自证）
+│   ├── watchdog-heal-e2e.mjs    杀守护，验证 watchdog 自愈（两种残留态）
+│   ├── check-inject.mjs         独立进程查真实 DOM
+│   ├── check-active.mjs         选中行底色独立复核
+│   └── rebootstrap.mjs          一次性重新注入
 └── src/
-    ├── daemon.mjs               守护主程序
-    ├── start-mmx-status.ps1     启动器（带 CDP 参数拉起客户端）
+    ├── daemon.mjs               守护主程序（重连 / 重注入 / 致命兜底）
+    ├── watchdog.mjs             常驻看门狗（双路端口发现 + 单实例锁）
+    ├── watchdog-selftest.mjs    74 项自测
+    ├── reload-recovery.mjs      重载后自恢复验证
+    ├── launch-mmx-status.ps1    无窗口启动器（快捷方式入口）
+    ├── install-launcher.ps1     安装：改写 .lnk + 加开机自启
+    ├── uninstall-launcher.ps1   还原
+    ├── start-mmx-status.ps1     原始启动器（带 CDP 参数拉起客户端）
     ├── stop-mmx-status.ps1      还原 + 停守护
     ├── cleanup.mjs              页面侧还原
     ├── capture.mjs              截图 + 状态探针
-    ├── selftest.mjs             41 项自测
-    ├── e2e.mjs                  18 项端到端
+    ├── selftest.mjs             110 项自测
+    ├── e2e.mjs                  19 项端到端
     ├── test-launcher.ps1        20 项启动器测试
     ├── verify-guard-causal3.mjs 守卫因果对照
     └── lib/
@@ -589,7 +682,7 @@ minimax-code-sidebar-status/
 
 ---
 
-## 15. 致谢
+## 16. 致谢
 
 - 第三方项目 [`sqing33/minimax-code-skin`](https://github.com/sqing33/minimax-code-skin)
   首次证明了 CDP 路线在 MiniMax Code 上可行。**但要注意**：它的 subagent 识别在真机上

@@ -66,20 +66,25 @@ if (probe.totalRows > 0) {
 
 console.log('\n=== 2. 刷新（模拟状态变化）===');
 const before = s1.dots;
-const rendered = await session.evaluateWithRetry(
-  `[...new Set([...document.querySelectorAll('[data-session-id]')].map(r => r.getAttribute('data-session-id')))]`
+// Pick a row that ACTUALLY carries a dot. The old selector ("a row in the DOM
+// whose id exists in the DB snapshot") can land on a virtualised row that was
+// never painted, so deleting its status removed nothing and the assertion
+// failed for the wrong reason.
+const paintedId = await session.evaluateWithRetry(
+  `(() => { const d = document.querySelector('[data-session-id] [data-mmx-dot]');` +
+    ` return d ? d.closest('[data-session-id]').getAttribute('data-session-id') : null; })()`
 );
-const paintedId = rendered.find((id) => db.snapshot()[id]);
 if (paintedId) {
   const mutated = { ...db.snapshot() };
   delete mutated[paintedId];
   const r2 = await session.evaluateWithRetry(buildRefreshExpression(mutated));
   const s2 = await state(session);
+  check('挑中的行确实带点（判据自证）', before > 0, `paintedId=${paintedId} before=${before}`);
   check('refresh 后该会话的点被移除', s2.dots === before - 1, `${before} -> ${s2.dots} (${JSON.stringify(r2.stats)})`);
   check('remove 计数与预期一致', r2.stats.removed === 1, JSON.stringify(r2.stats));
   check('其余点仍在', s2.dots > 0, `${s2.dots}`);
 } else {
-  console.log(`  (跳过刷新断言：没有已渲染且有状态的行，rendered=${rendered.length})`);
+  console.log(`  (跳过刷新断言：页面上一个点都没有)`);
 }
 
 console.log('\n=== 3. 停止还原（关键回归：rAF 不得复活）===');

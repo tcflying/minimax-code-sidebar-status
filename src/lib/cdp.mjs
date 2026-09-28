@@ -56,6 +56,13 @@ export class CdpSession {
     this.ws = ws;
     this.id = 0;
     this.pending = new Map();
+    // Timers armed by send(). A settled request must drop its timer right
+    // away: the old code never cleared it, so every successful call left a
+    // live 30s timer behind (and the whole guard in daemon.mjs leaked one per
+    // tick). Exposed so tests can assert "no timer survives a settle".
+    this.activeTimeouts = new Set();
+    this.closed = false;
+    this.closeReason = null;
     this.ws.addEventListener('message', (ev) => {
       let msg;
       try {
@@ -64,12 +71,37 @@ export class CdpSession {
         return;
       }
       if (msg.id && this.pending.has(msg.id)) {
-        const { resolve, reject } = this.pending.get(msg.id);
+        const { resolve, reject, timer } = this.pending.get(msg.id);
         this.pending.delete(msg.id);
+        this._clearTimer(timer);
         if (msg.error) reject(new Error(`${msg.error.message} (${msg.error.code})`));
         else resolve(msg.result);
       }
     });
+    // A dead socket used to leave every pending request hanging until its own
+    // timeout fired, i.e. one dead renderer cost a full 30s wait per request
+    // and a wall of "CDP 超时" noise. Fail them the instant the socket dies.
+    this.ws.addEventListener('close', () => this._failAllPending('WebSocket 已关闭'));
+    this.ws.addEventListener('error', () => this._failAllPending('WebSocket 错误'));
+  }
+
+  _clearTimer(timer) {
+    if (!timer) return;
+    clearTimeout(timer);
+    this.activeTimeouts.delete(timer);
+  }
+
+  /** Reject everything still in flight, with the reason the socket died. */
+  _failAllPending(reason) {
+    this.closed = true;
+    this.closeReason = reason;
+    if (!this.pending.size) return;
+    const entries = [...this.pending.entries()];
+    this.pending.clear();
+    for (const [id, entry] of entries) {
+      this._clearTimer(entry.timer);
+      entry.reject(new Error(`${reason}，未决请求 #${id} 被拒绝`));
+    }
   }
 
   static async connect(wsUrl) {
@@ -85,16 +117,31 @@ export class CdpSession {
 
   send(method, params = {}, timeoutMs = 30000) {
     const id = ++this.id;
+    // A request issued on a dead socket can never be answered; fail fast
+    // instead of parking the caller for the full timeout.
+    if (this.closed) {
+      return Promise.reject(
+        new Error(`${this.closeReason || '会话已关闭'}，无法发送 ${method}（请求 #${id}）`)
+      );
+    }
     const payload = JSON.stringify({ id, method, params });
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.ws.send(payload);
-      setTimeout(() => {
+      const timer = setTimeout(() => {
         if (this.pending.has(id)) {
           this.pending.delete(id);
+          this.activeTimeouts.delete(timer);
           reject(new Error(`CDP 超时(${timeoutMs}ms): ${method}`));
         }
       }, timeoutMs);
+      this.activeTimeouts.add(timer);
+      this.pending.set(id, { resolve, reject, timer });
+      try {
+        this.ws.send(payload);
+      } catch (e) {
+        this.pending.delete(id);
+        this._clearTimer(timer);
+        reject(new Error(`WebSocket 发送失败: ${method}: ${e.message}`));
+      }
     });
   }
 
