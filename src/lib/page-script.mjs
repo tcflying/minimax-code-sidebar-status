@@ -65,7 +65,28 @@ function __mmxStatusMain(cfg) {
       '@keyframes __mmxPulse{0%,100%{transform:scale(.7);opacity:.45}50%{transform:scale(1.25);opacity:.08}}',
       '[' + MARK + '][data-mmx-bucket="paused"]{ background:var(--orange_400,#f59e0b); }',
       '[' + MARK + '][data-mmx-bucket="error"]{ background:var(--red_400,#ef4444); }',
-      '[' + MARK + '][data-mmx-bucket="done"]{ background:var(--gray_400,#9ca3af); }'
+      '[' + MARK + '][data-mmx-bucket="done"]{ background:var(--gray_400,#9ca3af); }',
+
+      // ---- selected (active) session row background override ----
+      // The app marks the selected row by putting a BARE class
+      // bg-bg_interaction_tertiary_hover on the row's button element, while
+      // unselected rows only carry the hover: variant of the same class name
+      // (whose class string contains that substring, hence the :not() guard).
+      // Verified live: selected => rgba(10,10,10,0.04) on a bare class.
+      '[data-session-id] button.bg-bg_interaction_tertiary_hover'
+        + ':not([class*="hover:bg-bg_interaction_tertiary_hover"]){',
+      '  background-color: var(--mmx-active-bg) !important;',
+      '  box-shadow: inset 3px 0 0 0 var(--mmx-active-bar, transparent);',
+      '}',
+      '[data-session-id] button.bg-bg_interaction_tertiary_hover'
+        + ':not([class*="hover:bg-bg_interaction_tertiary_hover"]):hover{',
+      '  background-color: var(--mmx-active-bg-hover) !important;',
+      '}',
+      ':root{',
+      '  --mmx-active-bg: ' + cfg.activeBg + ';',
+      '  --mmx-active-bg-hover: ' + cfg.activeBgHover + ';',
+      '  --mmx-active-bar: ' + cfg.activeBar + ';',
+      '}',
     ].join('\n');
     (document.head || mount).appendChild(style);
   }
@@ -262,6 +283,11 @@ export function buildBootstrapExpression(cfg) {
     scope: '',
     showDone: false,
     collapseOnStart: true,
+    // Selected-row background. The app default is rgba(10,10,10,0.04) which is
+    // very faint; these are the deepened / recoloured alternatives.
+    activeBg: 'rgba(10, 10, 10, 0.10)',
+    activeBgHover: 'rgba(10, 10, 10, 0.14)',
+    activeBar: 'rgba(0, 148, 252, 0.90)',
     status: {},
     ...cfg,
   };

@@ -16,6 +16,7 @@
 |---|---|---|
 | 会话行加状态点 | ❌ 无任何 UI 扩展点 | ✅ CDP 注入，已实测 |
 | 侧边栏按状态筛选 | ⚠️ 内置筛选器**不覆盖置顶区** | ✅ 两个区域都覆盖 |
+| 选中行底色加深 | ⚠️ 应用默认 `rgba(10,10,10,0.04)`，很淡 | ✅ 覆盖为 10% + 蓝色左条，可调 |
 | 会话永不自动展开 | ❌ 应用强制行为，无设置 | ✅ 持续无条件折叠守卫 |
 | 不改本体 | — | ✅ 零字节改动 |
 
@@ -460,6 +461,46 @@ node daemon.mjs
   --show-done       给"已完成"也打灰点（默认关，233 个灰点噪音太大）
   --show-aborted    把"主动取消"也算暂停（默认关）
   --no-collapse     关闭"永不展开"守卫
+  --active-bg <css>       选中行底色（默认 rgba(10,10,10,0.10)）
+  --active-bg-hover <css> 选中行 hover 底色（默认 rgba(10,10,10,0.14)）
+  --active-bar <css>      选中行左侧色条（默认 rgba(0,148,252,0.90)，传 transparent 关掉）
+```
+
+### 选中行底色
+
+应用自己的选中底色是 `rgba(10,10,10,0.04)`——只有 4% 不透明度，在高 DPI 屏上几乎看不出来。
+本工具把它加深到 **10%** 并加一条 **3px 蓝色左边条**。
+
+**怎么找到的**：`[data-session-id]` 行本身既没有 class 也没有背景，
+`aria-current` / `data-active` 都不在它上面。最终在源码里挖到判据——
+行组件 `ti` 的 `U = activePage === null && activeSessionId === session.id`，
+选中时给该行的 `<button>` 加**裸类** `bg-bg_interaction_tertiary_hover`，
+未选中行只带 `hover:` 变体。因为 class 选择器按整 token 匹配，
+`button.bg-bg_interaction_tertiary_hover` 天然只命中选中行。
+
+覆盖规则：
+
+```css
+[data-session-id] button.bg-bg_interaction_tertiary_hover
+  :not([class*="hover:bg-bg_interaction_tertiary_hover"]) {
+  background-color: var(--mmx-active-bg) !important;
+  box-shadow: inset 3px 0 0 0 var(--mmx-active-bar);
+}
+```
+
+实测：覆盖前 `rgba(10,10,10,0.04)` → 覆盖后 `rgba(10,10,10,0.1)`，
+`boxShadow` 出现 `rgba(0,148,252,0.9) 3px 0px 0px 0px inset`，
+未选中行不受影响（`verify-active-bg.mjs` 自动断言这一点）。
+
+换成别的颜色：
+
+```powershell
+# 更深
+node daemon.mjs --active-bg 'rgba(10,10,10,0.16)'
+# 淡蓝底 + 不要色条
+node daemon.mjs --active-bg 'rgba(0,148,252,0.10)' --active-bar 'transparent'
+# 深色主题（跟随应用时把 alpha 调低）
+node daemon.mjs --active-bg 'rgba(255,255,255,0.10)'
 ```
 
 ### 10.5 排查工具
