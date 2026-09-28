@@ -1,0 +1,12 @@
+# The injected script and its String.raw template are byte-sensitive: a CRLF
+# rewrite of a .mjs file changes what the page evaluates. Git was configured
+# with autocrlf=true, which silently rewrote LF -> CRLF on checkout and emitted
+# "LF will be replaced by CRLF" for every file. Pin the line endings instead.
+*.mjs text eol=lf
+*.md  text eol=lf
+*.json text eol=lf
+*.js  text eol=lf
+
+# PowerShell is the one exception: pwsh handles LF fine, but a .ps1 that will be
+# double-clicked or run through cmd on Windows is safer with CRLF.
+*.ps1 text eol=crlf
