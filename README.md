@@ -832,7 +832,7 @@ error 圆点 6px → 8px；paused 保持 6px；done 不显示。
 ```
 置顶
 ┌──────────────────────────────────┐
-│ ● 2 个运行中                      │  ← #mmx-running-summary
+│ ▎ 2 个运行中                      │  ← #mmx-running-summary
 └──────────────────────────────────┘
   ○ 对比多个 codex 集成 ChatGPT 的项目
   ...
@@ -848,16 +848,30 @@ index 2  折叠动画容器（grid grid-cols-[minmax(0,1fr)] transition-[grid-te
 
 **必须避开 index 2**——那是应用的折叠动画容器，往里插节点会直接搞坏展开动画。
 
+**前缀是闪烁竖条，不是圆点。** `step-end`（实测序列化为 `steps(1)`）给的是硬开关边缘，
+眼睛会锁上去；平滑淡入淡出只会变成又一次慢脉冲，重新混进列表噪音里。
+
 实测断言：
 
 ```
 exists: true, text: "2 个运行中", shown: 2, paintedRunning: 2, countMatches: true
-display: flex, height: 22, width: 366, bg: rgba(34, 197, 94, 0.12)
+display: flex, height: 23, width: 366, bg: rgba(34, 197, 94, 0.16)
+box-shadow: rgba(34, 197, 94, 0.45) 0px 0px 0px 1px inset
 indexInSection: 1, prevIsHeader: true, nextIsListGrid: true, visible: true
+
+前缀竖条 <i>：
+  3px × 13px  linear-gradient(rgb(74,222,128), rgb(22,163,74))
+  box-shadow rgba(34,197,94,0.7) 0 0 5px
+  animation __mmxBlink 1.2s  timing-function steps(1)  iteration infinite
 ```
 
 `countMatches: true` 是关键——**条上写的数字必须等于实际 running 行数**，
-不是写死一个数。无 running 时置 `data-mmx-empty="1"` 自动隐藏。
+不是写死一个数。
+
+**没有新增任何 DOM 节点**：把 `ensureSummary()` 里早就建好的那个 `<i>` 指示点
+从「呼吸圆点」改样式成「闪烁竖条」，`#id i { … }` 一条 CSS 规则的事。
+建节点逻辑一行没改，所以 React 冲突面为零。无 running 时置
+`data-mmx-empty="1"` 自动隐藏。
 
 ### 15.4 为什么不能让 running 行自动置顶（实测判死）
 

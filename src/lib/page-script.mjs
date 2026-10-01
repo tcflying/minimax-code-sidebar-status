@@ -116,20 +116,26 @@ function __mmxStatusMain(cfg) {
       // nodes fights React over a virtualised, grid-animated tree. A count gives
       // the same "how much is running" answer without touching list order.
       '#' + SUMMARY_ID + '{',
-      '  display:flex;align-items:center;gap:6px;',
-      '  height:22px;margin:0 0 2px 6px;padding:0 8px;',
-      '  border-radius:6px;',
-      '  background:rgba(34,197,94,.12);',
-      '  box-shadow:inset 0 0 0 1px rgba(34,197,94,.35);',
+      '  display:flex;align-items:center;gap:7px;',
+      '  height:23px;margin:0 0 3px 6px;padding:0 9px;',
+      '  border-radius:7px;',
+      '  background:rgba(34,197,94,.16);',
+      '  box-shadow:inset 0 0 0 1px rgba(34,197,94,.45);',
       '  color:#15803d;font-size:11px;font-weight:600;',
       '  pointer-events:none;white-space:nowrap;',
       '}',
       '#' + SUMMARY_ID + '[data-mmx-empty="1"]{ display:none; }',
+      // A blinking vertical bar reads as "live" far faster than a dot that
+      // just pulses in size: step-end gives a hard on/off edge the eye locks
+      // onto, while a smooth fade just looks like a slow pulse that blends
+      // into the row noise.
       '#' + SUMMARY_ID + ' i{',
-      '  width:6px;height:6px;border-radius:9999px;',
-      '  background:#22c55e;flex:none;',
-      '  animation:__mmxBar 1.6s ease-in-out infinite;',
+      '  width:3px;height:13px;border-radius:2px;flex:none;',
+      '  background:linear-gradient(#4ade80,#16a34a);',
+      '  box-shadow:0 0 5px rgba(34,197,94,.7);',
+      '  animation:__mmxBlink 1.2s step-end infinite;',
       '}',
+      '@keyframes __mmxBlink{ 0%,55%{opacity:1} 56%,100%{opacity:.2} }',
       '#' + SUMMARY_ID + ' b{ font-weight:700; }',
 
       // ---- selected (active) session row background override ----
