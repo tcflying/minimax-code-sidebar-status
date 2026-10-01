@@ -19,7 +19,10 @@ import path from 'node:path';
 import fs from 'node:fs';
 
 const port = Number(process.argv[2] || 9331);
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'mmx-status');
+// daemon 与 watchdog 都在 src/ 下，本脚本在 tests/ 下，所以往上一级再进 src。
+// 旧写法是 '..', 'mmx-status'，解析成 mmx-status-github\mmx-status —— 该目录不存在
+// （Test-Path = False），本测试 100% 在 fs.openSync 处 ENOENT，从未真正跑起来过。
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'src');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const ps = (script) =>

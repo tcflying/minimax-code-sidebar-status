@@ -44,7 +44,19 @@ MiniMax Code 桌面端不开源，官网文档也查不到这些细节。唯一�
 
 ### 2.1 解包 asar 索引
 
-`app.asar` 头部是一个 JSON 索引，记录每个文件的 size/offset/integrity。整包 531,928,215 字节、46,859 个文件。
+`app.asar` 头部是一个 JSON 索引，记录每个文件的 size/offset/integrity。
+
+> **尺寸口径（两处数字不是同一个东西，别混）**
+>
+> | 数字 | 含义 | 观测时点 |
+> |---|---|---|
+> | 531,928,215 字节（≈507 MiB） | 调查期解包时该版本的整包大小，46,859 个文件 | 2026-09-28 前后（见 2.1 的 python 脚本读的就是这个文件） |
+> | 426,404,876 字节（≈406.7 MiB） | **当前** `G:\MiniMax\MiniMax Code\resources\app.asar` 实测大小，`LastWriteTime = 2026-09-29 22:25:34` | 2026-10-02 复核 |
+>
+> 两者不是同一个东西：官方更新器在 2026-09-29 22:25 换过一次包（见 14.1 第 4 条时间线），
+> 换的是**新版本的 app.asar**，不是"整包变了"。所以 14.1 里那个 426 MB 的说法指的就是
+> 今天这个文件本身，而 2.1 的 531,928,215 指的是调查当时那个版本。
+> 写文档时凡提到尺寸，必须带时点和口径，否则就是新的"文档与代码不符"。
 
 ```python
 import json
@@ -401,7 +413,7 @@ check('PAGE_FN 模板内反引号恰为 2 个（开+闭）', tickCount === 2, `�
 
 ### 9.3 `Write-Host -NoNewline` 写成 `Write-NoNewline`
 
-只测内层 `daemon.mjs` 就宣称完成，结果主上唯一要用的入口 `start-mmx-status.ps1`
+只测内层 `daemon.mjs` 就宣称完成，结果启动器 `start-mmx-status.ps1`
 第一次跑就炸。补测后连抓三个真 bug（详见 7.1、以及下面这条）：
 
 `Start-Process -ArgumentList` 把数组元素**用空格拼成一条命令行**，
@@ -515,13 +527,139 @@ CDP 参数从头到尾没生效过。
 那一刻 `$runningCount` 真的是 0，坏写法和好写法结果**碰巧相同**。
 测试场景和故障场景不是同一个，这个盲区靠"正例 + 反例"才补得上。
 
-`test-process-filters.ps1`（7 项）锁死这个形态：
+`test-process-filters.ps1`（**19 项**）锁死这个形态：
 A1 坏写法恒为 0 / A2·A3 两种好写法都 >0 / A4 两者数量一致 /
 B1 两种好写法的 PID 集合完全相同 / C1·C2 源码里不再有坏过滤器。
+D0-D11 这 12 条测的是另一件事——`Test-IsStaleDaemonProcess` 的筛选逻辑
+（哪些进程允许被杀、哪些绝对不许碰），见第 11 章覆盖表。
 
 **同族排查**：全项目 grep `GetFileNameWithoutExtension` + `Get-CimInstance -Filter "Name="`，
 只有这一处中招——`start-mmx-status.ps1` 做同样的事却用了 `Get-Process`，所以是好的。
 **同一个项目里两份做同一件事的脚本，一对一错，最能说明"别靠直觉抄自己"**。
+
+### 9.6 两份代码副本：测试全绿，用户却一点没变
+
+**这是本项目危害最大的一个坑，README 此前完全没有覆盖。**
+它的可怕之处在于：所有客观指标都是绿的，而用户看到的产品一点没变。
+
+#### 现象
+
+修复全部打进 git 副本后，**5 个测试套件全绿**、沙箱端到端 PASS、git 也推了，
+**运行时一行都没生效**。用户现象只有一句：「还是不会置顶」。
+
+#### 根因：同一套代码存在两份副本，用户加载的是没被改的那份
+
+机器上当时同时存在两个目录，内容几乎一样、**只有一份是 git 仓库**：
+
+| 副本 | 性质 | 桌面快捷方式当时指向 |
+|---|---|---|
+| `G:\mmx-project\fix mmx\mmx-status\` | 裸目录，**无 `.git`** | ✅ 就是它 |
+| `G:\mmx-project\fix mmx\mmx-status-github\` | git 仓库（真源） | ❌ 没指向它 |
+
+修复全部打进第二份，第一份原封不动。**红 M 加载的是裸目录那份**，
+于是"测试通过"和"用户看到"之间隔着一次**指向哪份代码**的选择。
+
+#### 证据
+
+最硬的一条证据不是日志、不是点数，而是**两份 `page-script.mjs` 的默认值本身就不同**：
+
+```
+mmx-status\lib\page-script.mjs:556          reorder: false   ← 裸副本（旧）
+mmx-status-github\src\lib\page-script.mjs:568  reorder: true    ← git 仓库（新）
+```
+
+裸副本连新增的 `test-reorder-defaults.mjs` 都没有。两个文件长度也不同
+（26152 vs 26892 字节），是**两个不同版本**，不是同一份的两条路径。
+
+而快捷方式改写前的原始配置被备份了下来（`logs\mmx-fix-lnk-backup.json`），
+它自己就记录了旧指向，是不需要推断的物证：
+
+```json
+{
+  "TargetPath": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+  "Arguments": "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"G:\\mmx-project\\fix mmx\\mmx-status\\launch-mmx-status.ps1\"",
+  "WorkingDirectory": "G:\\mmx-project\\fix mmx\\mmx-status"
+}
+```
+
+#### 判别要点（比数点数、看样式、看日志都可靠）
+
+**直接读页面上的配置对象**：`window.__mmxStatus.cfg.reorder`。
+主实例读到 `false`、沙箱读到 `true`，**同屏对照一步定位**——同一份代码不可能有两种默认值。
+
+**"状态点 88 个、汇总条都在"恰恰是旧版也能画出来的假象**，
+所以数点数、看样式、看日志这三样**都会给出假 PASS**，必须读 `cfg` 里的真实开关值。
+
+#### 修复：让 git 仓库成为唯一真源
+
+桌面 `mmx-fix.lnk` 已改指 git 仓库，并且**工作目录也一起改对**（相对路径依赖它）：
+
+```
+Target : powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden
+         -File "G:\mmx-project\fix mmx\mmx-status-github\src\launch-mmx-status.ps1"
+WDir   : G:\mmx-project\fix mmx\mmx-status-github\src
+```
+
+原配置备份在 `logs\mmx-fix-lnk-backup.json`（**注意是仓库根目录的 `logs\`，
+不是 `src\logs\`**——`install-launcher.ps1` 才会写 `src\logs\`，红 M 是手工建的）。
+
+#### 9.6.1 附带坑：四条启动链，改一条不够
+
+**只改桌面快捷方式是不够的。** 这台机器上有**四条**能拉起 daemon 的路径，
+历史上**全部指向旧裸目录**，只改一条必然被其余三条拖回旧版本：
+
+| 启动链 | 作用 | 改代码后必须同步 |
+|---|---|---|
+| 桌面 `mmx-fix.lnk` | 日常入口 | ✅ 已指向 git 仓库 |
+| `src\start-mmx-status.ps1` | 终端启动器 | 跟着仓库走，天然一致 |
+| `src\watchdog.mjs` | 常驻看门狗，检测不到 daemon 就自动拉起 | ⚠️ 见下 |
+| 手动 `node daemon.mjs` | 手工 | 手工输入，用绝对路径才不会错 |
+
+**真实事故**：只改了快捷方式，**watchdog 仍在自动拉起旧目录的 daemon，
+并把手动起的新版杀掉**（顺 `ParentProcessId` 查出来的）。
+
+**治本**：所有链路的路径都由**同一个 git 仓库根**派生，不允许任何一条写死绝对路径到旧目录。
+排查这类"改了没生效"时，**先把四条链路的实际命令行全部列出来**：
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
+  Where-Object { $_.CommandLine -match 'mmx' } |
+  Select-Object ProcessId, ParentProcessId, CommandLine
+```
+
+**开机自启是第五条，容易被漏掉**（2026-10-02 实测仍是旧路径）：
+
+```
+HKCU\Software\Microsoft\Windows\CurrentVersion\Run\mmxStatusWatchdog
+  = "node.exe" "G:\mmx-project\fix mmx\mmx-status\watchdog.mjs" --log "...\mmx-status\logs\watchdog.log"
+```
+
+⚠️ 这条**注册表项还指着已废弃的裸目录**。它不影响当前使用（watchdog 进程当前没在跑），
+但**下次开机就会从旧目录拉起一个旧版 watchdog**。它由 `install-launcher.ps1` 写入，
+`uninstall-launcher.ps1` 或手工删掉这个 Run 项即可清除。
+
+#### 9.6.2 watchdog 有 kill / 重启能力，启用前必须确认用户没在用
+
+`watchdog.mjs` **带结束进程和重启应用的能力**，源码里写得很直白：
+
+```js
+// watchdog.mjs:701
+log.warn('  重启 ' + exe + ' --remote-debugging-port=' + port);
+```
+
+即：配 `--fix-app` 时，它会**结束正在运行的 MiniMax Code 实例并带 CDP 参数重启**。
+14.3 的三道闸门（连续 6 次失败 / 启动满 45 秒 / 退避）是为了压住误杀，
+但**闸门只是降低概率，不是消除风险**——正在编辑的会话仍然可能被打断
+（历史上真触发过 12 次修复，打断过正在进行的编辑）。
+
+**本机当前状态：watchdog 停用**（`node watchdog.mjs` 进程当前不在运行），
+理由就是**用户当时正在使用主实例**，启用有杀掉用户窗口的风险。
+
+启用前必须确认：
+
+1. 用户当前**没有正在进行的会话**（先问，别自己判断）
+2. 只在**独立沙箱实例**（第 16 章）上验证 `watchdog-heal-e2e.mjs`
+3. **绝对不要**在用户正在用的实例上开 `--fix-app`
 
 ---
 
@@ -536,37 +674,71 @@ B1 两种好写法的 PID 集合完全相同 / C1·C2 源码里不再有坏过�
 
 ### 10.2 首次使用
 
+**日常入口是桌面上那个自绘的红色 M 图标 `mmx-fix.lnk`**，不是任何 `.ps1` 脚本。
+先把仓库拉下来，然后确认红 M 指向的是**这一个 git 仓库**（见 9.6，两份副本会全盘失效）：
+
 ```powershell
 git clone https://github.com/tcflying/minimax-code-sidebar-status.git
-cd minimax-code-sidebar-status\src
+cd minimax-code-sidebar-status
 
-# 看看会执行什么，不真跑
-.\start-mmx-status.ps1 -DryRun
-
-# 正式启动（会提示重启 MiniMax Code）
-.\start-mmx-status.ps1
+# 确认红 M 指向的是当前这个仓库，而不是别处的副本
+$sh = New-Object -ComObject WScript.Shell
+$sh.CreateShortcut("$env:USERPROFILE\Desktop\mmx-fix.lnk") |
+  Select-Object TargetPath, Arguments, WorkingDirectory
 ```
 
-> ⚠️ 首次会结束当前 MiniMax Code 进程树后用 CDP 参数重启。进行中的会话存在
-> SQLite 里，重启后从侧边栏点回去即可恢复。
+`Arguments` 里必须出现 `...\minimax-code-sidebar-status\src\launch-mmx-status.ps1`。
+不对就按 9.6 的"修复：让 git 仓库成为唯一真源"手工改一次——**这一步是全套里唯一必须手工的**，
+因为仓库里**没有**创建 `mmx-fix.lnk` 的安装脚本（`install-launcher.ps1` 改的是**官方**那两个
+`.lnk`，与 14.2「不改官方 `.lnk`」相冲突，别拿它当红 M 的安装器用）。
+图标本身用 `.\src\make-mmx-icon.ps1` 生成。
 
-### 10.3 日常使用
+装好之后**日常就双击红 M**，不再碰任何脚本。
 
-以后每次都从启动器开：
+> ⚠️ 红 M 第一次运行时，若应用在跑但没带 CDP 参数，它会**结束当前 MiniMax Code 进程树**
+> 再用 CDP 参数重启。进行中的会话存在 SQLite 里，重启后从侧边栏点回去即可恢复。
+> **动手前先确认没有正在进行的会话。**
+
+### 10.3 日常使用：只点红 M
+
+用户视角的全部操作就是下面这 5 条：
+
+1. **想用就点桌面红 M 图标**（`mmx-fix.lnk`）——这是**唯一**日常入口
+2. **关闭应用就正常点窗口右上角的 X**，**不要**用红 M 关
+3. **下次仍然点红 M**（不要改用开始菜单或官方的 `MiniMax Code.lnk`）
+4. **红 M 只能启动 / 纠正，不能关闭应用**——它没有"关掉"这个语义
+5. **官方桌面和开始菜单的 `MiniMax Code.lnk` 保持无参数原样，不要动**
+   （官方更新器会按名字覆盖它们；红 M 名字不冲突，所以更新器碰不到，见 14.1 第 4 条根因）
+
+**为什么不点 X 之外的方式**：红 M 负责的是"确保应用是带 CDP 参数起来的"，
+关应用的语义仍然归应用自己的窗口按钮。用红 M 去管生命周期，就会和 9.6.1 的
+watchdog 一样，出现"另一条链把它又拉起来"的多入口问题。
+
+#### `start-mmx-status.ps1`：终端用户 / 排查用，**不是日常入口**
+
+`start-mmx-status.ps1` 是**前台交互式**脚本——它有 `Read-Host`（第 69-73 行），
+只能在终端里敲着跑，**双击快捷方式是跑不起来的**（详见它自己的第 12 行注释：
+unattended/scripted use 必须加 `-Force`）。保留它是为了排查和脚本化：
 
 ```powershell
 .\start-mmx-status.ps1          # 交互式，检测到未开 CDP 会问你要不要重启
 .\start-mmx-status.ps1 -Force   # 无人值守，直接重启不询问
-.\stop-mmx-status.ps1           # 一键完全还原，停止守护
+.\start-mmx-status.ps1 -DryRun  # 只打印将要执行什么，不真跑
+.\stop-mmx-status.ps1           # 清注入 + 停守护（**不关应用**）
 ```
 
 `Read-Host` 读控制台，无法用管道喂输入，所以脚本化必须加 `-Force`。
 
+**要静默无窗口地启动，用 `launch-mmx-status.ps1`**（没有 `Read-Host`，做完美活立刻退出，
+控制台窗口不会留在桌面上）——红 M 调的就是它。
+
 ### 10.4 全部命令行参数
+
+`daemon.mjs`（13 个）：
 
 ```
 node daemon.mjs
-  --port <n>        CDP 端口（默认 9351）
+  --port <n>        CDP 端口（默认 9331）
   --db <path>       数据库路径（默认 ~/.minimax/v2/sqlite/runtime-state.sqlite）
   --interval <ms>   轮询间隔（默认 2500）
   --once            跑一次就还原
@@ -580,6 +752,39 @@ node daemon.mjs
   --active-bg-hover <css> 选中行 hover 底色（默认 rgba(10,10,10,0.14)）
   --active-bar <css>      选中行左侧色条（默认 rgba(0,148,252,0.90)，传 transparent 关掉）
 ```
+
+> 默认端口是 **9331**，与 `launch-mmx-status.ps1:281` 的兜底一致。
+> 2026-10-02 之前这些默认值是 9351，裸跑 stop/daemon 会连上一个根本没在监听的
+> 端口——症状是"改了代码没反应"、或 stop 声称成功实际没停。
+
+`watchdog.mjs`（13 个，全部核对自 `src/watchdog.mjs` 的 `parseArgs`）：
+
+```
+node watchdog.mjs
+  --port <n>              目标 CDP 端口。不传 = 自动发现
+                          （① <user-data-dir>\DevToolsActivePort  ② 扫进程命令行）
+  --interval <ms>         巡检间隔（默认 5000）
+  --fix-app               允许在「应用在跑但没 CDP」时结束它并重启（默认只告警）
+  --fix-app-after <n>     连续几次没 CDP 才允许 --fix-app 动手（默认 6）
+                          ——应用冷启动时正常会有一段时间没 CDP，
+                            不设这道闸会把 2 秒等待变成 kill/restart 循环
+  --min-uptime-ms <ms>    应用启动不足这么久就不动它（默认 45000，同上）
+  --user-data-dir <path>  限定只看这个 profile 的实例（沙箱测试用）
+  --app-process-name <s>  应用进程名（默认 MiniMax Code.exe）
+  --daemon <path>         被守护的 daemon 脚本（默认同目录 daemon.mjs）
+  --no-heal                只监控，不拉起 daemon
+  --no-reorder             透传给 daemon 的逃生舱（见下）
+  --reorder                显式开启置顶（默认已开，写出来只为兼容）
+  --once                  巡检一次就退出
+  --log <path>            日志（默认 logs\watchdog.log）
+  --lock <path>           单实例锁文件（默认 logs\watchdog.lock）
+  --stop-daemon-on-exit   自己退出时把 daemon 一起带走
+```
+
+> `--no-reorder`（2026-10-02 新增）是**开机自启路径的逃生舱**：置顶默认开是好事，
+> 但 15.5 那个重排死循环真要复发时，`Run\mmxStatusWatchdog` 这条链原先没有任何
+> 办法把它关掉——自启是在 `Read-Host` 都不存在的后台上下文里跑的。
+> 现在 `spawnDaemon` 会把 `--no-reorder` 透传给 `daemon.mjs`。
 
 ### 选中行底色
 
@@ -622,33 +827,42 @@ node daemon.mjs --active-bg 'rgba(255,255,255,0.10)'
 
 | 脚本 | 用途 |
 |---|---|
-| `node capture.mjs --port 9351 --out shot.png` | 截侧边栏 + 打印注入统计 |
-| `node verify-guard-causal3.mjs --port 9351` | 守卫因果对照（只变开关） |
-| `node verify-never-expand.mjs --port 9351` | 真实点击标题/箭头后检查是否展开 |
-| `node diagnose-expand-owner.mjs --port 9351` | 展开状态归因 + localStorage 键 |
-| `node diagnose-collapse-stick.mjs --port 9351` | 手动折叠能不能粘住 |
-| `node debug-guard.mjs --port 9351` | 守卫是被调用了还是调用了没压住 |
-| `node diagnose-dots.mjs --port 9351` | 区分"惰性残留"和"仍在重绘" |
+| `node capture.mjs --port 9331 --out shot.png` | 截侧边栏 + 打印注入统计 |
+| `node verify-guard-causal3.mjs --port 9331` | 守卫因果对照（只变开关） |
+| `node verify-never-expand.mjs --port 9331` | 真实点击标题/箭头后检查是否展开 |
+| `node diagnose-expand-owner.mjs --port 9331` | 展开状态归因 + localStorage 键 |
+| `node diagnose-collapse-stick.mjs --port 9331` | 手动折叠能不能粘住 |
+| `node debug-guard.mjs --port 9331` | 守卫是被调用了还是调用了没压住 |
+| `node diagnose-dots.mjs --port 9331` | 区分"惰性残留"和"仍在重绘" |
 
 ---
 
 ## 11. 测试体系
 
+所有脚本都在 `src\` 下，**在仓库根目录执行**，命令要带 `.\src\` 前缀（漏了会
+`MODULE_NOT_FOUND`，因为根目录没有这些 `.mjs`）：
+
 ```
-node selftest.mjs                              110 项 · 不需要 CDP
-node watchdog-selftest.mjs                     74 项 · 不需要 CDP
-node test-autofix-gates.mjs                    32 项 · 不需要 CDP
-pwsh -File test-process-filters.ps1              7 项 · 需要应用在跑
-node e2e.mjs --port 9351                       19 项 · 需要已开 CDP 的实例
-pwsh -NoProfile -File test-launcher.ps1        20 项 · 自建一次性实例
+node .\src\selftest.mjs                      110 项 · 不需要 CDP
+node .\src\watchdog-selftest.mjs             74 项 · 不需要 CDP
+node .\src\test-autofix-gates.mjs            32 项 · 不需要 CDP
+node .\src\test-reorder-defaults.mjs          38 项 · 不需要 CDP
+pwsh -NoProfile -File .\src\test-process-filters.ps1   19 项 · 需要应用在跑
+node .\src\e2e.mjs --port 9331               19 项 · 需要已开 CDP 的实例
+pwsh -NoProfile -File .\src\test-launcher.ps1        20 项 · 自建一次性实例
 ```
+
+> 上面 5 个**不需要 CDP** 的套件可以随时跑。后两个会**连真实实例**
+> （`e2e.mjs` 连已开 CDP 的端口、`test-launcher.ps1` 自建实例），
+> **在用户正在使用主实例时不要执行**——见 16 章「绝不拿用户正在用的实例做实验」。
 
 | 套件 | 覆盖 |
 |---|---|
 | `selftest` | 桶映射规则 / 真实库只读 / 注入表达式语法 / **无破坏性 DOM 调用** / dispose 回归 / 反引号守卫 |
 | `watchdog-selftest` | 双路端口发现 / 单实例锁 / 僵尸回收 / 退避节奏 |
 | `test-autofix-gates` | `--fix-app` 三道闸门，**每道都配正例 + 反例** |
-| `test-process-filters` | WMI 与 Get-Process 的过滤器语义差异（详见 9.5） |
+| `test-reorder-defaults` | reorder 默认值为 **true** / `--no-reorder` 逃生舱 / 启动器参数构造（dry-run 打印的和真跑的是同一个数组）/ **杀旧 daemon 的筛选**（含"启动器源码里没有任何针对 MiniMax Code / Electron 的 taskkill 或按名批量杀"这条静态断言） |
+| `test-process-filters` | WMI 与 Get-Process 的过滤器语义差异（详见 9.5）；**另加** `Test-IsStaleDaemonProcess` 筛选逻辑 **D0-D11 共 12 条**：同端口旧 daemon 要选、**Electron 主实例和 renderer 子进程绝不能选**、不同端口不选、非 daemon 的 node 不选、同端口的 `e2e.mjs` 不选、进程名不是 `node` 的一律不选、空命令行不选、`--port=9331` 等号写法也认 |
 | `e2e` | 真实渲染进程闭环：注入 → 刷新精确删 1 → 归零 → **10 秒不复活** → 重注入幂等 |
 | `test-launcher` | 启动器 DryRun / 冷启动 / 停止三分支，**全程不碰主实例** |
 
@@ -702,7 +916,7 @@ Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
 | 状态点是纯装饰，不改变任何业务行为 | 设计如此 |
 | 展开守卫会与应用争 React 状态 | 同帧执行，视觉上无感；`--no-collapse` 可关 |
 | 桌面端源不开源，升级后锚点可能变 | 锚点只有 `data-session-id` 一个，稳定性较好 |
-| 只覆盖**置顶区** | 项目分组区由应用自己的列表渲染，同样带 `data-session-id`，也已覆盖 |
+| 覆盖范围：置顶区 + 各项目分组区 | 二者都由应用自己的列表渲染、都带 `data-session-id`，**都已覆盖**。置顶区实测 `kids=7 / withRow=6`（第 7 个是折叠控件不是会话行），所以判据用容差 `withRow >= kids-1` 而非 `===`——用 `===` 会静默漏掉置顶区 |
 | macOS 未实测 | 启动参数与 Windows 略有差异（`-na <app> --args`） |
 
 ---
@@ -753,7 +967,7 @@ setInterval(() => {
 时间线（实测）：
 
 ```
-2026-09-29 22:25   app.asar 被官方更新器替换（426 MB）
+2026-09-29 22:25   app.asar 被官方更新器替换（426,404,876 字节 ≈406.7 MiB）
 2026-09-30 20:56   桌面 MiniMax Code.lnk 被改回无参数直连
 2026-10-01 02:56   开始菜单 MiniMax Code.lnk 被改回无参数直连
 ```
@@ -782,11 +996,43 @@ setInterval(() => {
 
 - **快捷方式改写**：新建 `mmx-fix.lnk` 指向 `launch-mmx-status.ps1`
   （`-WindowStyle Hidden` 无窗口），配自绘红色 M 图标。**不改官方那两个 `.lnk`**
+  —— `install-launcher.ps1` 现在**只创建 `mmx-fix.lnk`**，
+  官方桌面/开始菜单的 `MiniMax Code.lnk` 保持原样、一个字节都不动
+  （见下方"为什么必须改这个脚本"）
 - **端口自动发现**：绝不写死。优先读 Electron 自己写的
   `%APPDATA%\<App>\DevToolsActivePort`（内容形如 `9331\n/devtools/browser/<uuid>`，
   取第一行要 `trim`，Windows 上常见 CRLF），再用进程命令行兜底
 - **默认不碰任何进程**：`APP_UP_NO_CDP` 时只告警不动进程
 - **不碰官方自启项**：`com.minimax.agent.cn` 只读打印，从不改写
+
+#### 为什么 `install-launcher.ps1` 必须只建 `mmx-fix.lnk`
+
+这一节单独写出来，因为**旧版 `install-launcher.ps1` 的行为与 14.1 的处方完全相反**：
+
+| | 旧版（错） | 现在 |
+|---|---|---|
+| 改谁 | 按官方名字改写桌面 + 开始菜单的 `MiniMax Code.lnk` | **只创建** `mmx-fix.lnk` |
+| 结果 | 官方更新器按名字回写 → 每次更新注入断一次 | 名字不冲突，更新器永远碰不到 |
+| 建 `mmx-fix.lnk` 吗 | **完全没有这段代码** | 有 |
+
+第二行是最隐蔽的坑：全仓 grep 确认 `mmx-fix.lnk` 只在 `fix-coldstart.ps1` /
+`restart-cold.ps1` / `restart-e2e.ps1` 里被**消费**（`Start-Process` 那个路径），
+**从不创建**。也就是说旧版装完之后红 M 根本不存在，本工具的冷启动链是断的——
+而用户照着 README 跑安装，得到的正是 14.1 声称要避免的那个故障。
+
+`uninstall-launcher.ps1` 同步改成"删除 `mmx-fix.lnk` + 删 Run 项"，
+官方 `.lnk` 从未被本工具动过，卸载时也无需"还原"。
+历史版本遗留的 `MiniMax Code.lnk.bak` 脚本会列出来提示，可自行删除。
+
+#### install-launcher.ps1 写的自启项
+
+注册表自启项 `Run\mmxStatusWatchdog` 的值现在由
+`$Root`（脚本自身位置）拼出 `$Root\watchdog.mjs` 与 `$Root\logs\watchdog.log`，
+所以**装在哪份代码里就指向哪份**，不会再指向已废弃的旧副本
+（2026-10-02 复核：旧写法会写出指向 `G:\mmx-project\fix mmx\mmx-status\watchdog.mjs`，
+而那份目录没有 git、`daemon.mjs` 的 reorder 默认还是 `false` 的旧版）。
+**本项目只改脚本里的写入逻辑，不动已有注册表值**——需要刷新时用户自己重跑一次
+`install-launcher.ps1`（它会覆盖写同一项）。
 
 ### 14.3 `--fix-app` 的三道闸门
 
@@ -815,6 +1061,12 @@ node watchdog.mjs --port 9331 --fix-app
 ```
 
 **本项目默认关闭 `--fix-app`**，日常靠 `mmx-fix` 图标启动即可。
+
+> ⚠️ **danger：watchdog 有 kill / 重启应用的能力，启用前先确认用户没有正在进行的会话。**
+> `watchdog.mjs:701` 会「结束 PID 并带 `--remote-debugging-port` 重启」——
+> 三道闸门只是**降低误杀概率，不是消除风险**（历史上真触发过 12 次修复，打断过正在进行的编辑）。
+> **本机当前 watchdog 是停用的**，理由正是用户当时正在使用主实例。
+> 完整判据与启用前检查清单见 **9.6.2**。
 
 ### 14.4 端口写死是隐患
 
@@ -1157,41 +1409,73 @@ minimax-code-sidebar-status/
 │   ├── check-inject.mjs         独立进程查真实 DOM
 │   ├── check-active.mjs         选中行底色独立复核
 │   └── rebootstrap.mjs          一次性重新注入
+├── logs/                         ← 运行时日志与安装状态（git 忽略）
+│   └── mmx-fix-lnk-backup.json   红 M 原始快捷方式配置备份（见 9.6）
 ├── assets/
 │   └── mmx-fix.ico              自绘红色 M 图标（7 档尺寸，16~256）
-└── src/
+└── src/                          ← 24 个 .mjs（21 + lib/ 3）+ 18 个 .ps1
     ├── daemon.mjs               守护主程序（重连 / 重注入 / 致命兜底）
-    ├── watchdog.mjs             常驻看门狗（双路端口发现 + 单实例锁 + 三闸门）
+    ├── watchdog.mjs             常驻看门狗（双路端口发现 + 单实例锁 + 三闸门；⚠️ 能 kill/重启应用，见 9.6.2）
+    │
+    │  ── 测试（5 个不需要 CDP，随时可跑）──
+    ├── selftest.mjs             110 项自测
     ├── watchdog-selftest.mjs    74 项自测
     ├── test-autofix-gates.mjs   --fix-app 三闸门测试（32 项，每闸门正例+反例）
-    ├── test-process-filters.ps1  7 项进程过滤器回归（9.5 那个 bug 的看门狗）
-    ├── reload-recovery.mjs      重载后自恢复验证
-    ├── launch-mmx-status.ps1    无窗口启动器（mmx-fix.lnk 指向它）
-    ├── install-launcher.ps1     安装：建 mmx-fix.lnk + 加开机自启
-    ├── uninstall-launcher.ps1   还原
-    ├── relaunch-cdp-delayed.ps1 延迟带 CDP 参数重启
-    ├── make-mmx-icon.ps1        GDI+ 生成 mmx-fix.ico
-    ├── fix-ps1-encoding.ps1     批量补 UTF-8 BOM + 统一 CRLF（见 9.4）
-    ├── push-retry.ps1           测连通性后再 push（见 18.x 网络不通时的用法）
-    ├── start-mmx-status.ps1     原始启动器（带 CDP 参数拉起客户端）
+    ├── test-reorder-defaults.mjs reorder 默认值 / 逃生舱 / 启动器参数构造 / 杀旧 daemon 筛选（38 项）
+    ├── test-process-filters.ps1 进程过滤器回归（D 组 Test-IsStaleDaemonProcess + 端口参数形态，见 9.5）
+    │
+    │  ── 启动 / 安装 ──
+    ├── launch-mmx-status.ps1    无窗口启动器（**红 M 调的就是它**，无 Read-Host，做完即退）
+    ├── start-mmx-status.ps1     原始前台交互启动器（有 Read-Host，终端/排查用，不是日常入口）
     ├── stop-mmx-status.ps1      清注入 + 停守护（**不关应用**）
-    ├── cleanup.mjs              页面侧还原
-    ├── capture.mjs              截图 + 状态探针
-    ├── selftest.mjs             110 项自测
-    ├── e2e.mjs                  19 项端到端
-    ├── test-launcher.ps1        20 项启动器测试（自建一次性实例）
-    ├── open-sandbox-instance.ps1   开独立沙箱实例（第 16 章）
+    ├── install-launcher.ps1     **只创建 mmx-fix.lnk**（不碰官方 .lnk）+ 加 Run\mmxStatusWatchdog 自启（见 14.2）
+    ├── uninstall-launcher.ps1   删 mmx-fix.lnk 并删自启项（官方 .lnk 从未被改动，无需还原）
+    ├── lib-stale-daemon.ps1     共享：杀陈旧 daemon + --port 参数形态判定（launch/start/stop 三处 dot-source）
+    ├── relaunch-cdp-delayed.ps1 延迟带 CDP 参数重启（排程用：说完话再自动执行）
+    ├── fix-coldstart.ps1        一键修复：换成带 CDP 的启动（⚠️ 会关闭所有非沙箱实例，含主实例）
+    ├── make-mmx-icon.ps1        GDI+ 生成 mmx-fix.ico
+    ├── push-retry.ps1           测连通性后再 push（见 18.2 网络不通时的用法）
+    ├── fix-ps1-encoding.ps1     批量补 UTF-8 BOM + 统一 CRLF（见 9.4）
+    │
+    │  ── 沙箱（第 16 章，绝不拿主实例做实验）──
+    ├── open-sandbox-instance.ps1   开独立沙箱实例（独立 user-data-dir + 独立端口）
     ├── close-sandbox-instance.ps1  关沙箱（只认沙箱路径，不认端口）
     ├── reorder-sandbox-test.ps1    带 CPU 熔断的沙箱实验
-    ├── fix-coldstart.ps1        一键修复：换成带 CDP 的启动
+    ├── apply-to-main-window.ps1    把变更施加到主窗口（破坏性，仅在确认无进行中会话时用）
+    │
+    │  ── 冷启动 / 重启验收（都会动应用进程，慎用）──
     ├── restart-cold.ps1         真杀应用的冷启动验收
     ├── restart-e2e.ps1          端到端重启验收
-    ├── verify-guard-causal3.mjs 守卫因果对照
+    ├── reload-recovery.mjs      重载后自恢复验证
+    │
+    │  ── 诊断 ──
+    ├── diagnose-dots.mjs            状态点排查
+    ├── diagnose-expand.mjs          展开行为排查
+    ├── diagnose-click-expand.mjs    点击是否触发展开
+    ├── diagnose-collapse-stick.mjs  手动折叠能不能粘住
+    ├── diagnose-expand-owner.mjs    展开状态到底归谁所有
+    ├── diagnose-active-row4.mjs     选中行底色（第 4 版锚点法）
+    ├── debug-guard.mjs              展开守卫调试开关
+    ├── probe-active.mjs             当前选中行探针
+    ├── capture.mjs                  截图 + 状态探针
+    ├── cleanup.mjs                  页面侧还原
+    │
+    │  ── 验证 ──
+    ├── verify-guard-causal3.mjs  守卫因果对照（8.3）
+    ├── verify-never-expand.mjs   永不展开验证
+    ├── verify-active-bg.mjs      选中行底色验证
+    ├── e2e.mjs                   19 项端到端（⚠️ 连真实实例，勿在主实例上跑）
+    ├── test-launcher.ps1         20 项启动器测试（⚠️ 自建一次性实例）
+    │
     └── lib/
         ├── cdp.mjs              零依赖 CDP 客户端
-        ├── page-script.mjs      注入脚本（核心：状态点 + running 竖条 + 汇总条 + 置顶）
+        ├── page-script.mjs      注入脚本（核心：状态点 + running 竖条 + 汇总条 + 置顶，reorder 默认 true）
         └── status-db.mjs        只读状态读取 + 桶映射
 ```
+
+> 📌 `src\` 下 24 个 `.mjs` + 18 个 `.ps1` 全部列在此。
+> **新增文件时务必同步更新这棵树**——它就是"真源在哪"的唯一书面记录，
+> 而 9.6 那个坑正是"改了一份、跑的是另一份"造成的。
 
 ---
 
@@ -1199,25 +1483,46 @@ minimax-code-sidebar-status/
 
 | 症状 | 最可能的原因 | 怎么确认 | 怎么修 |
 |---|---|---|---|
-| **侧边栏一个状态点都没有** | 用官方 `MiniMax Code.lnk` 启动的（没带 CDP 参数） | `Get-CimInstance Win32_Process -Filter "Name='MiniMax Code.exe'" \| Where-Object { $_.CommandLine -notlike '*--type=*' }` 看命令行有没有 `--remote-debugging-port` | 关掉，用 **`mmx-fix`**（红 M 图标）重开；或跑 `.\src\fix-coldstart.ps1` |
+| **侧边栏一个状态点都没有** | 用官方 `MiniMax Code.lnk` 启动的（没带 CDP 参数） | `Get-CimInstance Win32_Process -Filter "Name='MiniMax Code.exe'" \| Where-Object { $_.CommandLine -notlike '*--type=*' }` 看命令行有没有 `--remote-debugging-port` | 关掉，用 **`mmx-fix`**（红 M 图标）重开；或跑 `.\src\fix-coldstart.ps1` ⚠️ **该脚本会关闭所有非沙箱实例，正在进行的会话会中断——只想纠正主实例就别用它，点红 M 即可** |
 | 端口文件里有 `9331`，但注入不上 | **陈旧残留**。文件存在 ≠ 端口在监听 | `Invoke-RestMethod http://127.0.0.1:9331/json/version` 必须返回 200 | 同上，重启应用 |
 | daemon 跑着但点不变 | daemon 内存里是**旧版 page-script** | 状态点数量正常、但样式是旧的 → 就是没重启 | 杀掉 daemon 重起 |
+| **改完代码、测试全绿、git 也推了，用户却一点没变化** | **用户加载的是另一份副本**（详见 9.6） | **读 `window.__mmxStatus.cfg.reorder`：主实例和沙箱同屏对照**。一个 `false` 一个 `true` 就是铁证。数点数/看样式/看日志都会给假 PASS | 把快捷方式和**全部四条启动链**指向同一真源（git 仓库），并核对 `mmx-fix.lnk` 的 `WorkingDirectory` |
+| 改了没生效，但 `git log` 明明有提交 | `Run\mmxStatusWatchdog` 开机自启仍指向旧副本，开机后 watchdog 又把旧版拉起来 | `Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'` 看 `mmxStatusWatchdog` 的值 | 删掉或改指向 git 仓库下的 `watchdog.mjs`（`uninstall-launcher.ps1` 可清） |
+| 现象符合预期，但**应用莫名重启 / 窗口被关掉** | **watchdog 带 `--fix-app` 在自动重启应用**（`watchdog.mjs:701`） | 查有没有 `watchdog.mjs` 进程、命令行里是否带 `--fix-app` | 立刻停掉 watchdog。**本机当前状态是停用的**，原因就是启用它会杀掉用户正在用的实例（见 9.6.2） |
+| **想启用 watchdog 自愈，但用户正在用主实例** | `--fix-app` 会结束正在运行的实例并重启 | 先问用户有没有进行中的会话，**不要自己判断** | 确认无会话后，只在**独立沙箱实例**上验证；绝不在主实例上开 |
 | 点了红 M 图标没反应 | 应用已带 CDP 在跑，launcher 正确地什么都不做 | 看 `logs\launch-*.log` 最后两行 | 正常，无需处理 |
 | 侧边栏 CPU 飙高、界面卡死 | 改宿主布局导致重排死循环（见 15.5） | renderer `CPU` 持续上涨，`Runtime.evaluate` 30s 超时 | 只能重启应用；2026-10-02 起置顶默认开启，`--no-reorder` / `-NoReorder` 就是为这个症状准备的逃生舱 |
 | e2e 报「还原后 10 秒不复活」失败 | **daemon 正在运行**，每 2.5s 会把点重新画回来 | `Get-CimInstance ... -like '*mmx-status*daemon*'` | 跑 e2e 前先确认没有 daemon |
 | `.ps1` 双击报错、pwsh 里却正常 | UTF-8 无 BOM + 中文，PS 5.1 按 GBK 解码崩溃 | 用 `powershell.exe`（5.1）解析会报错，pwsh 7 不报 | `.\src\fix-ps1-encoding.ps1 -Dir .\src` |
 
-### 最常用的一条命令
+### 18.1 最常用的一条命令
+
+> ⚠️ **这一条会关闭所有非沙箱的 MiniMax Code 实例，正在进行的会话会中断。**
+> 只想纠正主实例、不想动任何窗口的话，**点桌面红 M（`mmx-fix.lnk`）就行**。
+> 下面这条是最后手段。
 
 ```powershell
 # 一键把状态恢复到"应用带 CDP + daemon 在跑 + 注入正常"
 pwsh -NoProfile -File .\src\fix-coldstart.ps1 -DelaySec 0
 ```
 
-它会：杀掉所有没带 CDP 的实例 → 用 `mmx-fix` 重开 → 轮询确认端口真通 →
+> ⚠️ **动手前必读：它会关闭所有非沙箱的 MiniMax Code 实例。**
+> 2026-10-02 之前这个脚本是两次无条件 `taskkill /T /F /IM 'MiniMax Code.exe'`，
+> 杀光**全部**实例——含已带 CDP 的主实例，也含沙箱，而且不区分。
+> 现在它按 PID 逐个杀，并**排除沙箱**（判据只看命令行的 `--user-data-dir`
+> 路径或 `mmx-sandbox` 标识，**不按端口**：2026-10-02 踩过"沙箱换端口就漏判、
+> 又被当主实例杀掉"的坑）。
+>
+> 即便如此，它仍会关闭**主实例**，所有正在进行的会话都会中断。
+> 数据存在 SQLite，重启后可从侧边栏点回，但那一轮正在跑的东西没了。
+>
+> **只想纠正主实例、不要动任何窗口：别用这个脚本，点桌面红 M（`mmx-fix.lnk`）。**
+> `fix-coldstart.ps1` 是最后手段。
+
+它会：杀掉所有没带 CDP 的非沙箱实例 → 用 `mmx-fix` 重开 → 轮询确认端口真通 →
 验证注入。**全程会关闭应用**，动手前请确认当前没有正在进行的会话。
 
-### 推不上去时：先测连通性，别对着死出口反复重试
+### 18.2 推不上去时：先测连通性，别对着死出口反复重试
 
 ```powershell
 pwsh -NoProfile -File .\src\push-retry.ps1

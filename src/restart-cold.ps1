@@ -14,7 +14,10 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$Root    = 'G:\mmx-project\fix mmx\mmx-status'
+# 从脚本自身位置派生：写死的 'G:\mmx-project\fix mmx\mmx-status' 是已废弃的
+# 裸目录副本（无 git、daemon 默认 reorder=false），它仍存在于磁盘上，
+# 写死会让结果文件落进那份假副本，看起来成功、实际验收的是错代码。
+$Root    = $PSScriptRoot
 $Lnk     = Join-Path $env:USERPROFILE 'Desktop\mmx-fix.lnk'
 $OutFile = Join-Path $Root 'logs\restart-cold-result.txt'
 $ShotDir = Join-Path $Root 'shots'

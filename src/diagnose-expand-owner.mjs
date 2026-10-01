@@ -3,7 +3,7 @@
 // finds out WHO owns that state: persisted app state, or computed per render.
 import { connectRenderer } from './lib/cdp.mjs';
 
-const port = Number(process.argv[process.argv.indexOf('--port') + 1] || 9351);
+const port = Number(process.argv[process.argv.indexOf('--port') + 1] || 9331);
 const { session } = await connectRenderer(port);
 
 const LS = `(() => {

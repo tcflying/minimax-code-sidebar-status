@@ -5,12 +5,35 @@
 # an ASCII token so the assertions cannot be corrupted by console codepage.
 #
 #   pwsh -NoProfile -File test-launcher.ps1
+#
+# ⚠️ 这个脚本会真的起一个 MiniMax Code 实例（第 B 组）并按 --user-data-dir
+#    结束它。运行前请先关掉你正在用的沙箱窗口，或直接跳过本脚本。
+#
+# 端口护栏（2026-10-02 修）：旧默认 9355 与用户正在运行的沙箱实例端口完全相同，
+# 而本脚本第 B 组会起真实例、第 D 组会按 user-data-dir 杀进程 —— 用户照着跑
+# 会直接撞上自己的沙箱。换成 9455，并在下面加了一道显式护栏：目标端口上
+# 已经有 CDP 在监听就直接退出，绝不碰那个进程。
+# 选 9455 的理由：远离生产 9331 与沙箱 9355，落在 Chromium/Electron
+# 调试常用高位段（9xxx）内，且与本机其它已知端口无冲突。
 
 $ErrorActionPreference = 'Continue'
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $launcher = Join-Path $Root 'start-mmx-status.ps1'
-$port = 9355
+$port = 9455
 $udd = Join-Path $env:TEMP 'mmx-launcher-test2'
+
+# ---- 显式护栏：目标端口已有 CDP 在监听就退出，绝不碰那个进程 ----
+$portBusy = $false
+try {
+  $r = Invoke-WebRequest -Uri "http://127.0.0.1:$port/json/version" -TimeoutSec 2 -UseBasicParsing
+  $portBusy = ($r.StatusCode -eq 200)
+} catch { $portBusy = $false }
+if ($portBusy) {
+  Write-Host "端口 $port 上已经有 CDP 在监听 —— 那不是本脚本起的实例。" -ForegroundColor Red
+  Write-Host '本脚本会按 --user-data-dir 结束进程，绝不能误伤别人的实例。已退出。' -ForegroundColor Red
+  exit 2
+}
+Write-Host "护栏通过：端口 $port 上没有 CDP。"
 
 $script:pass = 0
 $script:fail = 0

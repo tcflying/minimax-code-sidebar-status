@@ -1,6 +1,9 @@
 ﻿[CmdletBinding()]
 param(
-  [int]$Port = 9351
+  # 默认端口与生产端口一致（9331）。旧默认是 9351，而 launch-mmx-status.ps1
+  # 的兜底就是 9331：裸跑 stop 会去停一个根本不存在的 9351 daemon，
+  # 对真正在跑的 9331 毫无作用，还照常打印「完成。」
+  [int]$Port = 9331
 )
 
 # Removes every injected node and style from the running MiniMax Code
@@ -9,6 +12,8 @@ param(
 
 $ErrorActionPreference = 'Continue'
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+# 端口参数形态判定与 launch/start 共用同一份实现，避免出现第四份正则。
+. (Join-Path $Root 'lib-stale-daemon.ps1') -Root $Root
 $node = (Get-Command node -ErrorAction SilentlyContinue).Source
 
 if (-not $node) { Write-Host '找不到 node.exe。' -ForegroundColor Red; exit 1 }
@@ -23,7 +28,11 @@ Write-Host '还原页面注入...'
 #    take down an unrelated instance that happens to be serving another port.
 $all = @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
   Where-Object { $_.CommandLine -and $_.CommandLine -match 'daemon\.mjs' })
-$daemons = @($all | Where-Object { $_.CommandLine -match ("--port\s+" + $Port + '(\s|$)') })
+# 旧写法是 ('--port\s+' + $Port + '(\s|$)')，只匹配空格分隔。
+# 任何以 --port=9331 启动的 daemon 会被静默漏杀，而下面还会照常打印
+# 「没有端口 X 的守护进程。」+「完成。」—— 最坏情况是 stop 声称成功、
+# 实际没停。launch-mmx-status.ps1 用的就是 '--port[=\s]'。
+$daemons = @($all | Where-Object { Test-DaemonPortArg -CommandLine $_.CommandLine -Port $Port })
 $others = $all.Count - $daemons.Count
 
 if ($daemons.Count -gt 0) {

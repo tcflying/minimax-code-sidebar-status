@@ -190,7 +190,8 @@ start-mmx-status.ps1:
 ### 为什么漏了
 
 我测试了 `daemon.mjs`、`selftest.mjs`、`e2e.mjs`，
-**唯独没测 `start-mmx-status.ps1`**——而那是用户唯一要用的入口。
+**唯独没测 `start-mmx-status.ps1`**——而它是终端/排查用的启动入口
+（日常入口是桌面红 M `mmx-fix.lnk`，见 README 10.3 / 14.1）。
 
 ### 同一批抓到的另外两个
 

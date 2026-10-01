@@ -5,7 +5,7 @@
 import { connectRenderer } from './lib/cdp.mjs';
 import { buildDisposeExpression } from './lib/page-script.mjs';
 
-const port = Number(process.argv[process.argv.indexOf('--port') + 1] || 9351);
+const port = Number(process.argv[process.argv.indexOf('--port') + 1] || 9331);
 const { session } = await connectRenderer(port);
 
 const EXPAND_PROBE = `(() => {

@@ -83,8 +83,11 @@ await realClick(x, y);
 
 ### 陷阱二：只测内层不测入口
 
-`daemon.mjs` 全绿，但用户唯一要用的 `start-mmx-status.ps1` 一跑就炸
+`daemon.mjs` 全绿，但终端/排查入口 `start-mmx-status.ps1` 一跑就炸
 （`Write-NoNewline` 这个 cmdlet 不存在）。
+（日常入口是桌面红 M `mmx-fix.lnk` → `launch-mmx-status.ps1`；
+`start-mmx-status.ps1` 是终端/排查用，见 README 10.3。
+现在 `test-launcher.ps1` 就是专门测它的，见下。）
 
 **判据**：
 > 只测内层不测入口，等于用内层的绿担保用户的体验。

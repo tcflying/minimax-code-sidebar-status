@@ -4,7 +4,7 @@
   所以「排程 → 说完话 → 自动执行」，避免命令发出后拿不到任何结果。
 
   用法（延迟 20 秒）：
-    pwsh -NoProfile -File 'G:\mmx-project\fix mmx\mmx-status\relaunch-cdp-delayed.ps1' -DelaySec 20
+    pwsh -NoProfile -File .\relaunch-cdp-delayed.ps1 -DelaySec 20
 #>
 [CmdletBinding()]
 param(

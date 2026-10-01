@@ -1,7 +1,9 @@
 ﻿[CmdletBinding()]
 param(
   [switch]$DryRun,
-  [int]$Port = 9351,
+  # 默认端口与生产端口一致（9331）。旧默认 9351 与 launch 的兜底不一致，
+  # 裸跑会对不上真正在跑的 daemon。
+  [int]$Port = 9331,
   [int]$Interval = 2500,
   [switch]$Once,
   [switch]$NoRestart,
@@ -22,6 +24,14 @@ try {
 } catch { }
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+# 陈旧 daemon 清理与 launch-mmx-status.ps1 共用同一份实现（绝不复制粘贴两份）。
+# 旧代码全文没有任何 daemon 清理：同端口已有 daemon 在跑（跑着旧 page-script
+# 快照）时症状会原样重现，而且两个 daemon 会同时连同一个 CDP 互相打架。
+. (Join-Path $Root 'lib-stale-daemon.ps1') -Root $Root -Log { param($m, $l)
+  if ($l -eq 'ERROR') { Write-Host $m -ForegroundColor Red }
+  elseif ($l -eq 'WARN') { Write-Host $m -ForegroundColor Yellow }
+  else { Write-Host $m }
+}
 
 function Get-MiniMaxExecutable {
   $candidates = New-Object System.Collections.Generic.List[string]
@@ -100,5 +110,9 @@ if (-not $cdpUp) {
 }
 
 Write-Host 'CDP 已就绪，启动注入守护。' -ForegroundColor Green
+# 拉新 daemon 之前先干掉占用同一端口的旧 daemon（理由见 lib-stale-daemon.ps1 头注释）。
+Stop-StaleDaemon -Port $Port
+$nodeExe = (Get-Command node -ErrorAction SilentlyContinue).Source
+if ($nodeExe) { Invoke-LegacyDispose -NodeExe $nodeExe -Port $Port }
 & node @daemonArgList
 exit $LASTEXITCODE

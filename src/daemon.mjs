@@ -3,7 +3,7 @@
 // session row. Read-only against the app: no app.asar change, no IPC, and the
 // injected nodes are fully removable with a single call.
 //
-//   node daemon.mjs [--port 9351] [--db <path>] [--interval 2500] [--once] [--no-reorder]
+//   node daemon.mjs [--port 9331] [--db <path>] [--interval 2500] [--once] [--no-reorder]
 //
 // Ctrl+C removes every injected node before exiting.
 
@@ -36,7 +36,10 @@ const ARCHON_URL_RE = /^app:\/\/\.\/archon(?:[/#?]|$)/i;
 // flag semantics without starting a daemon or touching a live CDP endpoint.
 export function parseArgs(argv) {
   const out = {
-    port: 9351,
+    // 默认端口与生产端口一致（9331）。旧默认 9351 与
+    // launch-mmx-status.ps1:281 的兜底 9331 不一致：裸跑 daemon 会去连
+    // 一个根本没在监听的端口，症状表现为「改了代码没反应」。
+    port: 9331,
     db: DEFAULT_DB,
     interval: 2500,
     once: false,

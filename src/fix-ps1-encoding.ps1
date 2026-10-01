@@ -3,7 +3,11 @@
 # 不走 Get-Content|Set-Content —— PS 5.1 那条管道会再写一次 BOM，且会改内容。
 [CmdletBinding()]
 param(
-    [string]$Dir = 'G:\mmx-project\fix mmx\mmx-status'
+    # 默认 = 本脚本所在的 src 目录（从自身位置派生）。
+    # 旧默认值写死 'G:\mmx-project\fix mmx\mmx-status'，那是已废弃的裸目录副本，
+    # 裸跑会把编码修到那份假副本上去，真正的 git 仓库反而没被处理。
+    # 参数覆盖仍保留：要修别处就显式 -Dir 传进去。
+    [string]$Dir = $PSScriptRoot
 )
 
 $ErrorActionPreference = 'Stop'
@@ -12,7 +16,10 @@ $dir = $Dir
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 $utf8Bom   = [System.Text.UTF8Encoding]::new($true)
 
-Get-ChildItem -LiteralPath $dir -File -Filter *.ps1 | Sort-Object Name | ForEach-Object {
+# -Recurse：18 个 .ps1 目前都在 src\ 顶层所以不用也能跑，但以后新增子目录
+# （如 lib\）就会漏掉。编码不合规的脚本在 PS 5.1 下是直接解析崩溃的，漏一个就
+# 是一条线上事故，所以这里递归扫。
+Get-ChildItem -LiteralPath $dir -File -Filter *.ps1 -Recurse | Sort-Object FullName | ForEach-Object {
     $path = $_.FullName
     $bytes = [System.IO.File]::ReadAllBytes($path)
     $hadBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191)

@@ -163,82 +163,14 @@ function Get-MiniMaxProcesses {
 # ---------------------------------------------------------------------------
 # 陈旧 daemon 清理（2026-10-02 实测事故）
 #
-# daemon 是独立的 node 进程，不在 Electron 进程树里，所以「把应用全部关掉再
-# 重开」根本杀不掉它。而 daemon 在启动时只读一次 lib/page-script.mjs 就常驻
-# 内存：现场 PID 44328 起于 1:31:43，应用 PID 30760 起于 2:32:47，那个 daemon
-# 比应用早 61 分钟，一直忠实地跑着 1:31 的旧代码 —— 现象就是「改了代码没反应」。
+# 实现已抽到共享模块 src/lib-stale-daemon.ps1，由本脚本与 start-mmx-status.ps1
+# 共用 —— 事故背景与安全边界全部写在那里，这里不重复一份，改一处即可生效。
 #
-# 安全边界：只认「node.exe + 命令行含 daemon.mjs + --port 就是本次端口」这一种
-# 进程。绝不能用 Get-Process -Name node（全局同名，会误伤别的 node），更不能
-# 碰任何 MiniMax Code / Electron 进程 —— 用户的主实例正在用。
+# 这里同时注入 Write-Log，让共享模块的日志走本脚本的带时间戳日志文件。
 # ---------------------------------------------------------------------------
-
-function Test-IsStaleDaemonProcess {
-  param($Proc, [int]$Port)
-  # 第一道：进程名必须是 node。Electron 的可执行名是 'MiniMax Code.exe'。
-  $name = [string]$Proc.Name
-  if ($name -and $name -notmatch '^node(\.exe)?$') { return $false }
-  $cmd = [string]$Proc.CommandLine
-  if ([string]::IsNullOrWhiteSpace($cmd)) { return $false }
-  # 第二道：命令行必须点名 daemon.mjs。应用的命令行永远不含这个串。
-  if ($cmd -notmatch 'daemon\.mjs') { return $false }
-  # 第三道：端口必须就是本次这个。
-  # 注意 --port 前面是两个连字符，应用的 --remote-debugging-port=9331 里
-  # 不存在 "--port" 这个子串，所以这条不会误伤 Electron。
-  if ($cmd -notmatch ('--port[=\s]' + $Port + '(\s|$|")')) { return $false }
-  return $true
-}
-
-function Get-StaleDaemonProcess {
-  param([int]$Port)
-  if ($Port -le 0) { return @() }
-  # 用 CIM 过滤出 node.exe 之后自己看 CommandLine —— 不用 Get-Process -Name node。
-  $all = @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue)
-  return @($all | Where-Object { Test-IsStaleDaemonProcess -Proc $_ -Port $Port })
-}
-
-function Stop-StaleDaemon {
-  param([int]$Port)
-  $stale = @(Get-StaleDaemonProcess -Port $Port)
-  if ($stale.Count -eq 0) { return }
-  Write-Log "发现 $($stale.Count) 个占用端口 $Port 的旧 daemon，先结束它，免得它继续用旧代码快照服务。" 'WARN'
-  foreach ($p in $stale) {
-    try {
-      Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
-      Write-Log "已结束旧 daemon pid=$($p.ProcessId)"
-    } catch {
-      Write-Log "结束旧 daemon pid=$($p.ProcessId) 失败：$($_.Exception.Message)" 'WARN'
-    }
-  }
-  # 等它真的消失，最多 5s。
-  for ($i = 0; $i -lt 50; $i++) {
-    if (@(Get-StaleDaemonProcess -Port $Port).Count -eq 0) { return }
-    Start-Sleep -Milliseconds 100
-  }
-  Write-Log "旧 daemon 5s 内没完全退出，仍继续启动新 daemon（端口 $Port 可能冲突）。" 'WARN'
-}
-
-function Invoke-LegacyDispose {
-  param([string]$NodeExe, [int]$Port)
-  # 旧 daemon 是被 Stop-Process -Force 干掉的（Windows 上等于 TerminateProcess，
-  # 走不到它自己的 SIGTERM 还原分支），所以它注入的节点还留在页面上。这里用
-  # 现成的 cleanup.mjs 还原一次 —— 它只删本工具自己注入的节点，不碰应用。
-  # 等 8s 封顶：cleanup.mjs 内部 CDP 超时最长 30s，不能让启动器被它拖住。
-  # 失败也不致命：新 daemon 的 bootstrap 会再调一次上一个实例的 dispose
-  # （lib/page-script.mjs 顶部 previous.dispose()），双保险。
-  try {
-    $cp = Start-Process -FilePath $NodeExe -ArgumentList "`"$Root\cleanup.mjs`" --port $Port" `
-      -WindowStyle Hidden -PassThru
-    Wait-Process -Id $cp.Id -Timeout 8 -ErrorAction SilentlyContinue
-    if (-not $cp.HasExited) {
-      try { Stop-Process -Id $cp.Id -Force -ErrorAction SilentlyContinue } catch { }
-      Write-Log "cleanup.mjs 8s 没返回，已放弃并杀掉它（新 daemon 会重新注入）。" 'WARN'
-    } else {
-      Write-Log "已用 cleanup.mjs 还原旧 daemon 留下的注入（exit=$($cp.ExitCode)）。"
-    }
-  } catch {
-    Write-Log "调用 cleanup.mjs 失败（不影响启动，新 daemon 会重新注入）：$($_.Exception.Message)" 'WARN'
-  }
+. (Join-Path $Root 'lib-stale-daemon.ps1') -Root $Root -Log {
+  param($Message, $Level)
+  Write-Log $Message $Level
 }
 
 # --------------------------------------------------------------- main

@@ -11,7 +11,9 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$Root    = 'G:\mmx-project\fix mmx\mmx-status'
+# 从脚本自身位置派生，理由同 restart-cold.ps1：写死的旧目录仍在磁盘上，
+# 写死会让结果文件落进已废弃的裸副本而不是 git 真源。
+$Root    = $PSScriptRoot
 $Lnk     = Join-Path $env:USERPROFILE 'Desktop\mmx-fix.lnk'
 $OutFile = Join-Path $Root 'logs\restart-e2e-result.txt'
 $ShotDir = Join-Path $Root 'shots'

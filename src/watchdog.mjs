@@ -6,6 +6,7 @@
 //   node watchdog.mjs [--port <n>] [--interval 5000] [--fix-app] [--once]
 //                    [--log <path>] [--lock <path>] [--user-data-dir <path>]
 //                    [--app-process-name <name>] [--no-heal] [--stop-daemon-on-exit]
+//                    [--no-reorder]
 //
 // Two independent port discovery paths, either one is enough:
 //   A) <user-data-dir>\DevToolsActivePort written by Electron itself
@@ -51,6 +52,12 @@ export function parseArgs(argv) {
     heal: true,
     stopDaemonOnExit: false,
     daemon: DEFAULT_DAEMON,
+    // Escape hatch, forwarded to daemon.mjs as --no-reorder. The reordering
+    // guard normally defaults ON (daemon.mjs reorder:true), but the reflow
+    // loop incident in lib/page-script.mjs means a runaway re-layout can still
+    // lock up the renderer. Without this passthrough the boot-time autostart
+    // path (HKCU\...\Run\mmxStatusWatchdog) has no way to turn it off.
+    reorder: true,
     // Auto-repair must not fire on the FIRST no-CDP observation: the app is
     // often still cold-starting, and killing a booting app to "repair" it turns
     // a 2-second wait into a kill/restart cycle. Require N consecutive misses.
@@ -72,6 +79,8 @@ export function parseArgs(argv) {
     else if (a === '--min-uptime-ms') out.minUptimeMs = Number(argv[++i]);
     else if (a === '--once') out.once = true;
     else if (a === '--no-heal') out.heal = false;
+    else if (a === '--no-reorder') out.reorder = false;
+    else if (a === '--reorder') out.reorder = true;
     else if (a === '--stop-daemon-on-exit') out.stopDaemonOnExit = true;
   }
   if (!Number.isInteger(out.port) || out.port <= 0) out.port = null;
@@ -379,15 +388,16 @@ export function spawnDaemon(args, port) {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const outPath = path.join(HERE, 'logs', 'watchdog-daemon-' + stamp + '.log');
   const errPath = path.join(HERE, 'logs', 'watchdog-daemon-' + stamp + '.err');
+  // Default is to pass NO reorder flag at all, so daemon.mjs uses its own
+  // default (reorder:true). Only an explicit --no-reorder appends the flag.
+  // Ordering: this is the exact array that gets spawned, nothing re-derived.
+  const daemonArgs = [args.daemon, '--port', String(port), '--interval', String(DAEMON_INTERVAL)];
+  if (args.reorder === false) daemonArgs.push('--no-reorder');
   try {
     fs.mkdirSync(path.dirname(outPath), { recursive: true });
     const out = fs.openSync(outPath, 'a');
     const err = fs.openSync(errPath, 'a');
-    const child = spawn(
-      process.execPath,
-      [args.daemon, '--port', String(port), '--interval', String(DAEMON_INTERVAL)],
-      { detached: true, stdio: ['ignore', out, err] }
-    );
+    const child = spawn(process.execPath, daemonArgs, { detached: true, stdio: ['ignore', out, err] });
     child.unref();
     if (typeof child.pid === 'number') {
       writeDaemonPid(child.pid, port);

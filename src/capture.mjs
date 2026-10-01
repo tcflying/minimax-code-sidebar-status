@@ -9,7 +9,7 @@ import path from 'node:path';
 import { connectRenderer } from './lib/cdp.mjs';
 
 function parseArgs(argv) {
-  const out = { port: 9351, out: 'shot.png', clip: '', zoom: 2 };
+  const out = { port: 9331, out: 'shot.png', clip: '', zoom: 2 };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--port') out.port = Number(argv[++i]);

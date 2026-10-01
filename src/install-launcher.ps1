@@ -1,13 +1,25 @@
 ﻿<#
 .SYNOPSIS
-  安装 mmx-status 快捷方式改写 + 看门狗开机自启。
+  安装 mmx-fix.lnk 桌面入口 + 看门狗开机自启。
 
 .DESCRIPTION
-  做三件事：
-    1. 备份并改写开始菜单 / 桌面的 MiniMax Code.lnk，使其指向
+  做两件事：
+    1. 新建（或覆盖）桌面上的 mmx-fix.lnk，指向
        powershell.exe -NoProfile -WindowStyle Hidden -File launch-mmx-status.ps1
     2. 新增 HKCU\...\Run 项（名字 mmxStatusWatchdog）启动 watchdog.mjs
     3. 打印「改了什么 / 备份在哪 / 怎么还原」
+
+  ══ 为什么不碰官方那两个 .lnk（2026-10-02 修正）══
+  旧版这个脚本改写的正是「开始菜单 / 桌面的 MiniMax Code.lnk」——按官方名字。
+  这与 README 第 14 章的处方**完全相反**：官方更新器是按名字回写这两个 .lnk 的
+  （实测 2026-09-30 22:25 桌面、2026-10-01 02:56 开始菜单被改回无参数直连），
+  所以按官方名字改写 = 每次官方更新注入就断一次。治本办法是**不要用官方名字**：
+  唯一命名一个 mmx-fix.lnk，官方 lnk 保持原样、一个字节都不动。
+
+  旧版还有个更隐蔽的问题：全文件**没有任何创建 mmx-fix.lnk 的代码**，
+  而 fix-coldstart.ps1 / restart-cold.ps1 / restart-e2e.ps1 全都在**消费**
+  桌面上的 mmx-fix.lnk（Start-Process 那个路径）。也就是说旧版装完，红 M
+  根本不存在，本工具的冷启动链是断的。
 
   绝不触碰官方自启项 HKCU\...\Run\com.minimax.agent.cn。
 
@@ -18,11 +30,11 @@
 param(
   # 只打印将要做的改动，不落盘。
   [switch]$DryRun,
-  # 跳过开机自启，只改快捷方式。
+  # 跳过开机自启，只建快捷方式。
   [switch]$NoAutostart,
   # 开机自启时带上 --fix-app（会结束正在运行的无 CDP 实例并重启）。
   [switch]$FixApp,
-  # 不改快捷方式，只装开机自启。
+  # 不建快捷方式，只装开机自启。
   [switch]$OnlyAutostart
 )
 
@@ -32,6 +44,9 @@ $Launcher = Join-Path $Root 'launch-mmx-status.ps1'
 $Watchdog = Join-Path $Root 'watchdog.mjs'
 $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $RunName = 'mmxStatusWatchdog'
+# 唯一入口的名字。刻意不叫 MiniMax Code.lnk —— 官方更新器按名字回写，
+# 撞上名字就等于每次更新断一次注入。
+$FixLnkName = 'mmx-fix.lnk'
 
 if (-not (Test-Path -LiteralPath $Launcher)) { throw "缺少 $Launcher" }
 if (-not (Test-Path -LiteralPath $Watchdog)) { throw "缺少 $Watchdog" }
@@ -40,7 +55,12 @@ $stateDir = Join-Path $Root 'logs'
 if (-not (Test-Path -LiteralPath $stateDir)) { New-Item -ItemType Directory -Path $stateDir -Force | Out-Null }
 $StateFile = Join-Path $stateDir 'install-state.json'
 
-function Get-ShortcutTargets {
+# 本脚本要建的**只有**这一个快捷方式。
+function Get-ShortcutTarget {
+  return (Join-Path ([Environment]::GetFolderPath('Desktop')) $FixLnkName)
+}
+# 官方那两个：只读列出、明确报告「不动」，绝不写。
+function Get-OfficialShortcuts {
   $paths = @()
   $startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\MiniMax Code.lnk'
   $desktop = Join-Path ([Environment]::GetFolderPath('Desktop')) 'MiniMax Code.lnk'
@@ -59,7 +79,7 @@ function New-Shortcut {
     $sc.Arguments = $Arguments
     $sc.WorkingDirectory = $Root
     $sc.IconLocation = $IconLocation
-    $sc.Description = 'MiniMax Code (mmx-status launcher)'
+    $sc.Description = 'MiniMax Code (mmx-status 启动入口，红 M)'
     $sc.Save()
   } finally {
     [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($shell)
@@ -83,38 +103,32 @@ if ($official) {
   Write-Host '[提示] 未发现官方自启项 com.minimax.agent.cn（正常，不做任何修改）。' -ForegroundColor DarkGray
 }
 
-# ---- 2. 快捷方式 ----
+# ---- 2. 只建 mmx-fix.lnk；官方 lnk 一个字节都不动 ----
 if (-not $OnlyAutostart) {
-  foreach ($lnk in (Get-ShortcutTargets)) {
-    $bak = "$lnk.bak"
-    if (Test-Path -LiteralPath $lnk) {
-      if (Test-Path -LiteralPath $bak) {
-        Write-Host "[跳过备份] 已存在 $bak（保留最早的原始备份）" -ForegroundColor Yellow
-      } else {
-        if ($DryRun) {
-          Write-Host "[dry-run] 备份 $lnk -> $bak" -ForegroundColor Yellow
-        } else {
-          Copy-Item -LiteralPath $lnk -Destination $bak -Force
-          Write-Host "已备份: $bak" -ForegroundColor Green
-          $backups.Add($bak)
-        }
-      }
-    } else {
-      Write-Host "[跳过] $lnk 不存在（不会凭空创建图标）" -ForegroundColor DarkGray
-      continue
+  # 官方 lnk 只读报告：明确告诉用户本脚本不会碰它们。
+  foreach ($o in (Get-OfficialShortcuts)) {
+    if (Test-Path -LiteralPath $o) {
+      Write-Host "[保持不动] 官方快捷方式 $o（官方更新器按名字回写它，改它等于每次更新断一次注入）" -ForegroundColor DarkGray
     }
-    $icon = ''
-    if ($official) { $icon = 'C:\Program Files\MiniMax Code\MiniMax Code.exe,0' }
-    if ($DryRun) {
-      Write-Host "[dry-run] 改写 $lnk" -ForegroundColor Yellow
-      Write-Host "           Target = $psExe"
-      Write-Host "           Args   = $launcherArgs"
-    } else {
-      New-Shortcut -Path $lnk -Target $psExe -Arguments $launcherArgs -IconLocation $icon
-      Write-Host "已改写: $lnk" -ForegroundColor Green
-    }
-    $changes.Add("快捷方式 $lnk -> powershell -WindowStyle Hidden -File `"$Launcher`"")
   }
+
+  $lnk = Get-ShortcutTarget
+  # 自绘红色 M 图标：优先用仓库里的 assets/mmx-fix.ico，没有就退回官方 exe 的图标 0 号。
+  $iconRepo = Join-Path (Split-Path -Parent $Root) 'assets\mmx-fix.ico'
+  $icon = ''
+  if (Test-Path -LiteralPath $iconRepo) { $icon = "$iconRepo,0" }
+  else { $icon = 'C:\Program Files\MiniMax Code\MiniMax Code.exe,0' }
+
+  if ($DryRun) {
+    Write-Host "[dry-run] 创建/覆盖 $lnk" -ForegroundColor Yellow
+    Write-Host "           Target = $psExe"
+    Write-Host "           Args   = $launcherArgs"
+    Write-Host "           Icon   = $icon"
+  } else {
+    New-Shortcut -Path $lnk -Target $psExe -Arguments $launcherArgs -IconLocation $icon
+    Write-Host "已创建: $lnk" -ForegroundColor Green
+  }
+  $changes.Add("快捷方式 $lnk -> powershell -WindowStyle Hidden -File `"$Launcher`"")
 }
 
 # ---- 3. 开机自启 ----
@@ -186,9 +200,11 @@ Write-Host ''
 Write-Host '=== 改了什么 ===' -ForegroundColor Cyan
 if ($changes.Count -eq 0) { Write-Host '（无）' } else { $changes | ForEach-Object { Write-Host "  - $_" } }
 Write-Host '=== 备份在哪 ===' -ForegroundColor Cyan
-if ($backups.Count -eq 0) { Write-Host '（无）' } else { $backups | ForEach-Object { Write-Host "  - $_" } }
+if ($backups.Count -eq 0) {
+  Write-Host '  （无。本脚本不改任何官方 .lnk，所以没有需要还原的官方快捷方式。）'
+} else { $backups | ForEach-Object { Write-Host "  - $_" } }
 Write-Host '=== 怎么还原 ===' -ForegroundColor Cyan
 Write-Host '  pwsh -NoProfile -File ".\uninstall-launcher.ps1"'
-Write-Host '  （uninstall 会把 .lnk 从 .lnk.bak 原样复制回去，并删除 Run 项 mmxStatusWatchdog）'
+Write-Host '  （uninstall 会删除 mmx-fix.lnk 并删除 Run 项 mmxStatusWatchdog；官方 .lnk 从未被改动，无需还原）'
 if ($DryRun) { Write-Host '（本次为 -DryRun，未做任何实际改动）' -ForegroundColor Yellow }
 exit 0

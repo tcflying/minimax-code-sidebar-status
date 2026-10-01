@@ -1,7 +1,8 @@
 ﻿[CmdletBinding()]
 param(
   [int]$DelaySeconds = 25,
-  [int]$Port = 9351,
+  # 默认端口与生产端口一致（9331）。旧默认 9351 会连错实例。
+  [int]$Port = 9331,
   [int]$Interval = 2500,
   [switch]$NoDaemon
 )

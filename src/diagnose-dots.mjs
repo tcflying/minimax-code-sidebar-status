@@ -5,7 +5,7 @@ import { connectRenderer } from './lib/cdp.mjs';
 
 const port = (() => {
   const i = process.argv.indexOf('--port');
-  return i >= 0 ? Number(process.argv[i + 1]) : 9351;
+  return i >= 0 ? Number(process.argv[i + 1]) : 9331;
 })();
 
 const { session } = await connectRenderer(port);

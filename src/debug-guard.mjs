@@ -6,7 +6,7 @@ import { connectRenderer } from './lib/cdp.mjs';
 import { StatusDb, DEFAULT_DB } from './lib/status-db.mjs';
 import { buildBootstrapExpression } from './lib/page-script.mjs';
 
-const port = Number(process.argv[process.argv.indexOf('--port') + 1] || 9351);
+const port = Number(process.argv[process.argv.indexOf('--port') + 1] || 9331);
 const ME = 'mvs_743fa844a372415fadfb9dd9bc57140d';
 const { session } = await connectRenderer(port);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

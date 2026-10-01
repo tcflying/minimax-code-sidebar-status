@@ -6,7 +6,7 @@
 // already expands. If it does, a one-shot startup collapse is not enough.
 import { connectRenderer } from './lib/cdp.mjs';
 
-const port = Number(process.argv[process.argv.indexOf('--port') + 1] || 9351);
+const port = Number(process.argv[process.argv.indexOf('--port') + 1] || 9331);
 const { session } = await connectRenderer(port);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 

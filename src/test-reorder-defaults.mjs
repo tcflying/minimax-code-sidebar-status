@@ -28,6 +28,13 @@ const read = (f) => fs.readFileSync(path.join(HERE, f), 'utf8');
 const daemon = read('daemon.mjs');
 const launch = read('launch-mmx-status.ps1');
 const start = read('start-mmx-status.ps1');
+// 共享的陈旧-daemon 清理模块（launch / start / stop 三处 dot-source 它）
+let shared = '';
+try {
+  shared = read('lib-stale-daemon.ps1');
+} catch {
+  shared = '';
+}
 const pageScript = read(path.join('lib', 'page-script.mjs'));
 
 let pass = 0;
@@ -127,12 +134,20 @@ check(
 );
 
 // ---- 4. 杀掉陈旧 daemon 的前置动作（根因 B）------------------------------
+// 2026-10-02 二次修：这套实现已抽到共享模块 src/lib-stale-daemon.ps1，
+// 由 launch / start / stop 三处 dot-source，不再只写在 launch 里。
+// 所以下面这些断言的对象是「共享模块 + 各调用点」，不是 launch 源码本身。
 console.log('\n=== 4. 红 M 启动器：先杀同端口的旧 daemon ===');
-check('定义了 Test-IsStaleDaemonProcess 纯函数', /function Test-IsStaleDaemonProcess \{/.test(launch));
-check('定义了 Stop-StaleDaemon', /function Stop-StaleDaemon \{/.test(launch));
+check(
+  '共享模块 lib-stale-daemon.ps1 存在',
+  shared.length > 0,
+  shared.length > 0 ? '' : 'src/lib-stale-daemon.ps1 读不到'
+);
+check('定义了 Test-IsStaleDaemonProcess 纯函数', /function Test-IsStaleDaemonProcess \{/.test(shared));
+check('定义了 Stop-StaleDaemon', /function Stop-StaleDaemon \{/.test(shared));
 check(
   '用 CIM 精确查 node.exe，不是 Get-Process -Name node',
-  /Get-CimInstance Win32_Process -Filter "Name='node\.exe'"/.test(launch)
+  /Get-CimInstance Win32_Process -Filter "Name='node\.exe'"/.test(shared)
 );
 // 断言「不存在坏写法」时必须先剥掉整行注释：源码里那句
 // 「不用 Get-Process -Name node」本身就是提醒用的注释，不是代码。
@@ -140,12 +155,16 @@ const launchCode = launch
   .split('\n')
   .filter((l) => !/^\s*#/.test(l))
   .join('\n');
+const sharedCode = shared
+  .split('\n')
+  .filter((l) => !/^\s*#/.test(l))
+  .join('\n');
 check(
   '源码里不存在 Get-Process -Name node（那会误伤别的 node 进程）',
-  !/Get-Process\s+-Name\s+node\b/.test(launchCode)
+  !/Get-Process\s+-Name\s+node\b/.test(launchCode) && !/Get-Process\s+-Name\s+node\b/.test(sharedCode)
 );
-check('筛选要求命令行含 daemon.mjs', /daemon\\?\.mjs/.test(launch));
-check('筛选要求 --port 就是本次端口', /'--port\[=\\s\]' \+ \$Port/.test(launch));
+check('筛选要求命令行含 daemon.mjs', /daemon\\?\.mjs/.test(shared));
+check('筛选要求 --port 就是本次端口', /'--port\[=\\s\]' \+ \$Port/.test(shared));
 check('Start-Process 之前调用了 Stop-StaleDaemon', /Stop-StaleDaemon -Port \$port/.test(launch));
 const stopIdx = launch.indexOf('Stop-StaleDaemon -Port $port');
 const startIdx = launch.indexOf('-ArgumentList $daemonArgs');
@@ -156,11 +175,15 @@ check(
 );
 check(
   '强杀之后会等进程真正消失',
-  /for \(\$i = 0; \$i -lt 50; \$i\+\+\)/.test(launch)
+  /for \(\$i = 0; \$i -lt 50; \$i\+\+\)/.test(shared)
 );
 check(
   '旧 daemon 留下的注入用现成 cleanup.mjs 还原（Invoke-LegacyDispose）',
-  /function Invoke-LegacyDispose \{/.test(launch) && /cleanup\.mjs`" --port \$Port/.test(launch)
+  /function Invoke-LegacyDispose \{/.test(shared) && /cleanup\.mjs`" --port \$Port/.test(shared)
+);
+check(
+  'start-mmx-status.ps1 也复用同一份实现（不再各写一份）',
+  /lib-stale-daemon\.ps1/.test(start) && /Stop-StaleDaemon -Port \$Port/.test(start)
 );
 check(
   '启动器源码里没有任何针对 MiniMax Code / Electron 的 taskkill 或按名批量杀',

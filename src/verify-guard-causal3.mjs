@@ -6,7 +6,7 @@ import { connectRenderer } from './lib/cdp.mjs';
 import { StatusDb, DEFAULT_DB } from './lib/status-db.mjs';
 import { buildBootstrapExpression, buildDisposeExpression } from './lib/page-script.mjs';
 
-const port = Number(process.argv[process.argv.indexOf('--port') + 1] || 9351);
+const port = Number(process.argv[process.argv.indexOf('--port') + 1] || 9331);
 const ME = process.argv.includes('--session')
   ? process.argv[process.argv.indexOf('--session') + 1]
   : 'mvs_743fa844a372415fadfb9dd9bc57140d';

@@ -15,7 +15,6 @@ param(
     [string]$Exe = 'G:\MiniMax\MiniMax Code\MiniMax Code.exe',
     [string]$LaunchScript = (Join-Path $PSScriptRoot 'launch-mmx-status.ps1')
 )
-
 $ErrorActionPreference = 'Continue'
 $script:pass = 0
 $script:fail = 0
@@ -86,20 +85,22 @@ Write-Host '    判别式证据：日志里【缺少】"检测到 N 个进程在
 # 是旧的 page-script 快照，表现为「改了代码没反应」。修法是杀占用同一端口的
 # 旧 daemon —— 但这条路径一旦写错就是灾难：误杀用户正在用的 MiniMax Code。
 # 所以这里用伪造的进程记录直接调函数，一个真实进程都不枚举、不结束。
+#
+# 2026-10-02 二次修：实现已抽到共享模块 src/lib-stale-daemon.ps1
+# （launch / start / stop 三处共用），所以从共享模块取函数，不再从 launch 源码抽。
 Write-Host ''
 Write-Host '组 5：Test-IsStaleDaemonProcess 筛选逻辑（纯函数，伪造进程记录）'
 
+$sharedLib = Join-Path $PSScriptRoot 'lib-stale-daemon.ps1'
 $launcherSrc = if (Test-Path -LiteralPath $LaunchScript) {
     [System.IO.File]::ReadAllText($LaunchScript, [System.Text.UTF8Encoding]::new($false))
 } else { '' }
 
-$fnMatch = [regex]::Match($launcherSrc, '(?ms)^function Test-IsStaleDaemonProcess \{.*?^\}')
-if (-not $fnMatch.Success) {
-    Check 'D0 在 launcher 源码里找到 Test-IsStaleDaemonProcess' $false ''
+if (-not (Test-Path -LiteralPath $sharedLib)) {
+    Check 'D0 找到共享模块 lib-stale-daemon.ps1' $false $sharedLib
 } else {
-    Check 'D0 在 launcher 源码里找到 Test-IsStaleDaemonProcess' $true ''
-    # 把函数原文定义到当前作用域，后面直接调用。
-    Invoke-Expression $fnMatch.Value
+    Check 'D0 找到共享模块 lib-stale-daemon.ps1' $true ''
+    . $sharedLib -Root $PSScriptRoot -Log { param($m, $l) }
 
     function New-FakeProc {
         param([string]$Name, [string]$CommandLine)
@@ -141,6 +142,44 @@ if (-not $fnMatch.Success) {
     $sideEffect = @(Get-CimInstance Win32_Process -Filter "ProcessId=99999" -ErrorAction SilentlyContinue).Count
     Check 'D11 本组全程没有碰任何真实进程（伪造 PID 99999 不存在于系统）' `
         ($sideEffect -eq 0) "queried=$sideEffect"
+
+    # --- 组 6：--port 参数形态判定（stop 脚本的漏杀 bug）---
+    # bug：stop-mmx-status.ps1 旧写法是 ('--port\s+' + $Port + '(\s|$)')，只匹配
+    # 空格。任何以 --port=9331 启动的 daemon 会被**静默漏杀**，而 stop 还会照常
+    # 打印「没有端口 X 的守护进程。」+「完成。」—— 最坏情况是 stop 声称成功、
+    # 实际没停。这里锁死两种写法都必须匹配。
+    Write-Host ''
+    Write-Host '组 6：--port 参数形态（空格 / 等号两种写法都必须认）'
+
+    Check 'D12 空格写法 --port 9331 必须匹配' `
+        (Test-DaemonPortArg -CommandLine 'node daemon.mjs --port 9331 --interval 2500' -Port 9331) 'got=True'
+    Check 'D13 等号写法 --port=9331 必须匹配（旧 stop 脚本在这里漏杀）' `
+        (Test-DaemonPortArg -CommandLine 'node daemon.mjs --port=9331 --interval 2500' -Port 9331) 'got=True'
+    Check 'D14 引号收尾的等号写法也匹配（路径含空格的启动形态）' `
+        (Test-DaemonPortArg -CommandLine '"G:\mmx-project\fix mmx\mmx-status-github\src\daemon.mjs" --port=9331"' -Port 9331) 'got=True'
+    Check 'D15 端口号不同的不匹配（--port 9355 vs 查 9331）' `
+        (-not (Test-DaemonPortArg -CommandLine 'node daemon.mjs --port 9355' -Port 9331)) 'got=False'
+    Check 'D16 前缀相同的更大端口号不匹配（--port 93310 vs 查 9331）' `
+        (-not (Test-DaemonPortArg -CommandLine 'node daemon.mjs --port 93310' -Port 9331)) 'got=False'
+    Check 'D17 --remote-debugging-port=9331 不匹配（那是应用自己，不是 daemon）' `
+        (-not (Test-DaemonPortArg -CommandLine 'MiniMax Code.exe --remote-debugging-port=9331' -Port 9331)) 'got=False'
+    Check 'D18 空命令行不匹配' `
+        (-not (Test-DaemonPortArg -CommandLine '' -Port 9331)) 'got=False'
+
+    # 静态锁死：stop 脚本里不能再出现旧的 \s+ 写法。
+    # 断言「不存在坏写法」必须先剥掉整行注释：脚本里那句解释 bug 的注释本身
+    # 就写着 --port\s+，只做全文匹配会误报（2026-10-02 实测踩到）。
+    $stopScript = Join-Path $PSScriptRoot 'stop-mmx-status.ps1'
+    if (Test-Path -LiteralPath $stopScript) {
+        $stopSrc = [System.IO.File]::ReadAllText($stopScript, [System.Text.UTF8Encoding]::new($false))
+        $stopCode = ($stopSrc -split "`r?`n" | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+        Check 'D19 stop 脚本的代码行里不再有 --port\s+ 的旧漏杀写法' `
+            (-not ($stopCode -match '--port\\s\+')) ''
+        Check 'D20 stop 脚本复用了共享的 Test-DaemonPortArg' `
+            ($stopCode -match 'Test-DaemonPortArg') ''
+    } else {
+        Check 'D19 找到 stop-mmx-status.ps1' $false $stopScript
+    }
 }
 
 Write-Host ''
