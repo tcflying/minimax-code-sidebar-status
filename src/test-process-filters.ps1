@@ -81,6 +81,68 @@ Write-Host '    若上述过滤器失效，症状是：日志出现"以 --remote
 Write-Host '    但 CDP 端口仍不响应，且旧进程仍在 —— 因为第二个实例被单实例锁吞掉。'
 Write-Host '    判别式证据：日志里【缺少】"检测到 N 个进程在跑且无 CDP"那一行。'
 
+# --- 组 5：杀陈旧 daemon 的筛选函数（纯函数级，不碰任何真实进程）---
+# 2026-10-02 新增。bug：红 M 拉起新 daemon 前不杀旧 daemon，daemon 内存里一直
+# 是旧的 page-script 快照，表现为「改了代码没反应」。修法是杀占用同一端口的
+# 旧 daemon —— 但这条路径一旦写错就是灾难：误杀用户正在用的 MiniMax Code。
+# 所以这里用伪造的进程记录直接调函数，一个真实进程都不枚举、不结束。
+Write-Host ''
+Write-Host '组 5：Test-IsStaleDaemonProcess 筛选逻辑（纯函数，伪造进程记录）'
+
+$launcherSrc = if (Test-Path -LiteralPath $LaunchScript) {
+    [System.IO.File]::ReadAllText($LaunchScript, [System.Text.UTF8Encoding]::new($false))
+} else { '' }
+
+$fnMatch = [regex]::Match($launcherSrc, '(?ms)^function Test-IsStaleDaemonProcess \{.*?^\}')
+if (-not $fnMatch.Success) {
+    Check 'D0 在 launcher 源码里找到 Test-IsStaleDaemonProcess' $false ''
+} else {
+    Check 'D0 在 launcher 源码里找到 Test-IsStaleDaemonProcess' $true ''
+    # 把函数原文定义到当前作用域，后面直接调用。
+    Invoke-Expression $fnMatch.Value
+
+    function New-FakeProc {
+        param([string]$Name, [string]$CommandLine)
+        [pscustomobject]@{ Name = $Name; CommandLine = $CommandLine; ProcessId = 99999 }
+    }
+
+    # 真实的 daemon 启动形态（路径含空格，所以带引号）
+    $realDaemon = New-FakeProc 'node.exe' '"G:\mmx-project\fix mmx\mmx-status-github\src\daemon.mjs" --port 9331 --interval 2500'
+    # 真实的 MiniMax Code 主实例形态：注意它是 --remote-debugging-port，不是 --port
+    $realApp = New-FakeProc 'MiniMax Code.exe' '"G:\MiniMax\MiniMax Code\MiniMax Code.exe" --remote-debugging-port=9331 --remote-debugging-address=127.0.0.1'
+    $realRenderer = New-FakeProc 'MiniMax Code.exe' '"G:\MiniMax\MiniMax Code\MiniMax Code.exe" --type=renderer --lang=zh-CN'
+    $otherDaemonPort = New-FakeProc 'node.exe' '"G:\mmx-project\fix mmx\mmx-status-github\src\daemon.mjs" --port 9351 --interval 2500'
+    $otherNode = New-FakeProc 'node.exe' '"C:\Program Files\nodejs\node.exe" C:\some\other\tool.js --port 9331'
+    $noPort = New-FakeProc 'node.exe' '"G:\mmx-project\fix mmx\mmx-status-github\src\daemon.mjs" --interval 2500'
+    $sandbox = New-FakeProc 'node.exe' '"G:\mmx-project\fix mmx\mmx-status-github\src\e2e.mjs" --port 9331'
+
+    Check 'D1 同一端口的旧 daemon 必须被选中（这正是要杀的那个）' `
+        (Test-IsStaleDaemonProcess -Proc $realDaemon -Port 9331) 'got=True'
+    Check 'D2 MiniMax Code 主实例绝不能被选中（同端口，--remote-debugging-port）' `
+        (-not (Test-IsStaleDaemonProcess -Proc $realApp -Port 9331)) 'got=False'
+    Check 'D3 MiniMax Code renderer 子进程绝不能被选中' `
+        (-not (Test-IsStaleDaemonProcess -Proc $realRenderer -Port 9331)) 'got=False'
+    Check 'D4 别的端口的 daemon 不能被选中（--port 9351 vs 本次 9331）' `
+        (-not (Test-IsStaleDaemonProcess -Proc $otherDaemonPort -Port 9331)) 'got=False'
+    Check 'D5 同端口但不是 daemon.mjs 的 node 不能被选中' `
+        (-not (Test-IsStaleDaemonProcess -Proc $otherNode -Port 9331)) 'got=False'
+    Check 'D6 没有 --port 的 daemon 不能被选中' `
+        (-not (Test-IsStaleDaemonProcess -Proc $noPort -Port 9331)) 'got=False'
+    Check 'D7 同端口的 e2e.mjs 不能被选中' `
+        (-not (Test-IsStaleDaemonProcess -Proc $sandbox -Port 9331)) 'got=False'
+    Check 'D8 进程名不是 node 的一律不选（即使命令行长得像）' `
+        (-not (Test-IsStaleDaemonProcess -Proc (New-FakeProc 'electron.exe' 'daemon.mjs --port 9331') -Port 9331)) 'got=False'
+    Check 'D9 空命令行不选' `
+        (-not (Test-IsStaleDaemonProcess -Proc (New-FakeProc 'node.exe' '') -Port 9331)) 'got=False'
+    Check 'D10 --port=9331 等号写法也认（红 M 用空格写法，两个都要覆盖）' `
+        (Test-IsStaleDaemonProcess -Proc (New-FakeProc 'node.exe' 'node daemon.mjs --port=9331') -Port 9331) 'got=True'
+
+    # 取证：确认本测试自己没有真的去枚举或结束任何进程
+    $sideEffect = @(Get-CimInstance Win32_Process -Filter "ProcessId=99999" -ErrorAction SilentlyContinue).Count
+    Check 'D11 本组全程没有碰任何真实进程（伪造 PID 99999 不存在于系统）' `
+        ($sideEffect -eq 0) "queried=$sideEffect"
+}
+
 Write-Host ''
 Write-Host ("pass={0} fail={1}" -f $script:pass, $script:fail)
 if ($script:fail -eq 0) { Write-Host 'test-process-filters: ALL GREEN' }

@@ -5,6 +5,9 @@ param(
   [int]$Interval = 2500,
   [switch]$Once,
   [switch]$NoRestart,
+  # 逃生舱：关掉「running 行自动置顶」（daemon 默认开）。
+  # 与 launch-mmx-status.ps1 的同名开关语义一致。
+  [switch]$NoReorder,
   # Skip the interactive confirmation before restarting a running MiniMax Code.
   # Required for unattended/scripted use, because Read-Host reads the console
   # and cannot be fed through a pipeline.
@@ -41,9 +44,15 @@ Write-Host "MiniMax Code: $exe"
 $procName = [System.IO.Path]::GetFileNameWithoutExtension($exe)
 $cdpArgs = @("--remote-debugging-port=$Port", '--remote-debugging-address=127.0.0.1')
 
+# daemon 参数默认不传 reorder 开关，用 daemon 自己的默认值（置顶=开）；
+# 只有 -NoReorder 才追加 --no-reorder。与 launch-mmx-status.ps1 保持一致。
+$daemonArgList = @("$Root\daemon.mjs", '--port', $Port, '--interval', $Interval)
+if ($Once) { $daemonArgList += '--once' }
+if ($NoReorder) { $daemonArgList += '--no-reorder' }
+
 if ($DryRun) {
   Write-Host "[dry-run] `"$exe`" $($cdpArgs -join ' ')"
-  Write-Host "[dry-run] node `"$Root\daemon.mjs`" --port $Port --interval $Interval"
+  Write-Host "[dry-run] node $($daemonArgList -join ' ')"
   exit 0
 }
 
@@ -91,7 +100,5 @@ if (-not $cdpUp) {
 }
 
 Write-Host 'CDP 已就绪，启动注入守护。' -ForegroundColor Green
-$daemonArgs = @("$Root\daemon.mjs", '--port', $Port, '--interval', $Interval)
-if ($Once) { $daemonArgs += '--once' }
-& node @daemonArgs
+& node @daemonArgList
 exit $LASTEXITCODE

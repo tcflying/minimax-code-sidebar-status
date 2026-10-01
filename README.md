@@ -17,7 +17,7 @@
 | 会话行加状态点 | ❌ 无任何 UI 扩展点 | ✅ CDP 注入，已实测 |
 | running 一眼可见 | ❌ 无 | ✅ 四重信号：发光竖条 + 整行淡绿底 + 绿标题 + 呼吸动画 |
 | 一眼看到"有几个在跑" | ❌ 无 | ✅ 顶部「N 个运行中」汇总条 |
-| running 行自动置顶 | ❌ 无 | ✅ **搬 DOM 排序，不改宿主样式**（`--reorder`，默认关，见 15.5） |
+| running 行自动置顶 | ❌ 无 | ✅ **搬 DOM 排序，不改宿主样式**（默认开启，`--no-reorder` 可关，见 15.5） |
 | 侧边栏按状态筛选 | ⚠️ 内置筛选器**不覆盖置顶区** | ✅ 两个区域都覆盖 |
 | 选中行底色加深 | ⚠️ 应用默认 `rgba(10,10,10,0.04)`，很淡 | ✅ 覆盖为 10% + 蓝色左条，可调 |
 | 会话永不自动展开 | ❌ 应用强制行为，无设置 | ✅ 持续无条件折叠守卫 |
@@ -574,8 +574,8 @@ node daemon.mjs
   --show-done       给"已完成"也打灰点（默认关，233 个灰点噪音太大）
   --show-aborted    把"主动取消"也算暂停（默认关）
   --no-collapse     关闭"永不展开"守卫
-  --reorder         开启"running 行置顶"（默认关，见 15.5，事故史必读）
-  --no-reorder      显式关闭（等价于默认行为）
+  --reorder         开启"running 行置顶"（默认已开，写出来只为兼容旧脚本；见 15.5 事故史）
+  --no-reorder      显式关闭（逃生舱，平时不需要传）
   --active-bg <css>       选中行底色（默认 rgba(10,10,10,0.10)）
   --active-bg-hover <css> 选中行 hover 底色（默认 rgba(10,10,10,0.14)）
   --active-bar <css>      选中行左侧色条（默认 rgba(0,148,252,0.90)，传 transparent 关掉）
@@ -943,10 +943,15 @@ indexInSection: 1, prevIsHeader: true, nextIsListGrid: true, visible: true
 
 ---
 
-### 15.5 running 行自动置顶（`--reorder`，默认关）
+### 15.5 running 行自动置顶（默认开启，`--no-reorder` 可关）
 
-> ⚠️ **这个功能有一次把宿主页面搞崩的事故史，读完 15.5 再启用。**
-> 结论是**搬 DOM**，不是改样式；而且**默认关闭**，必须显式 `--reorder`。
+> ⚠️ **这个功能有一次把宿主页面搞崩的事故史，读完 15.5 再决定要不要把它关掉。**
+> 结论是**搬 DOM**，不是改样式。
+>
+> **注：2026-10-02 起改为默认开启。** 它是明确要求的产品功能，藏在显式开关后面
+> 会让红 M 启动器（一个 reorder 参数都不传）永远跑在关闭状态，"running 行没置顶"
+> 于是被当成 bug 报了上来。现在只有显式 `--no-reorder` / `-NoReorder` 才会关掉它。
+> 下面的事故史原样保留——它正是这个逃生舱存在的理由。
 
 #### 它做什么
 
@@ -1037,15 +1042,21 @@ var lastReorderKey = '__mmx_uninitialised__';
   顺序：[amd 华为…][分析 atlas…][查看 jev-skill…] ← 全在最前，且保持原相对顺序
 ```
 
-#### 怎么开
+#### 怎么关
 
 ```powershell
-# 默认关闭
+# 默认开启，什么都不用加
 node daemon.mjs --port 9331
 
-# 显式开启
-node daemon.mjs --port 9331 --reorder
+# 显式关闭（逃生舱：置顶引起侧边栏异常时才用）
+node daemon.mjs --port 9331 --no-reorder
+
+# 启动器同理，平时一个 reorder 参数都不传
+pwsh -NoProfile -File .\src\launch-mmx-status.ps1 -Port 9331
+pwsh -NoProfile -File .\src\launch-mmx-status.ps1 -Port 9331 -NoReorder
 ```
+
+`--reorder` 仍然被接受，但已经等价于默认行为——保留它只是为了让旧脚本不报错。
 
 ---
 
@@ -1192,7 +1203,7 @@ minimax-code-sidebar-status/
 | 端口文件里有 `9331`，但注入不上 | **陈旧残留**。文件存在 ≠ 端口在监听 | `Invoke-RestMethod http://127.0.0.1:9331/json/version` 必须返回 200 | 同上，重启应用 |
 | daemon 跑着但点不变 | daemon 内存里是**旧版 page-script** | 状态点数量正常、但样式是旧的 → 就是没重启 | 杀掉 daemon 重起 |
 | 点了红 M 图标没反应 | 应用已带 CDP 在跑，launcher 正确地什么都不做 | 看 `logs\launch-*.log` 最后两行 | 正常，无需处理 |
-| 侧边栏 CPU 飙高、界面卡死 | 改宿主布局导致重排死循环（见 15.5） | renderer `CPU` 持续上涨，`Runtime.evaluate` 30s 超时 | 只能重启应用；`--reorder` 默认关就是为了防这个 |
+| 侧边栏 CPU 飙高、界面卡死 | 改宿主布局导致重排死循环（见 15.5） | renderer `CPU` 持续上涨，`Runtime.evaluate` 30s 超时 | 只能重启应用；2026-10-02 起置顶默认开启，`--no-reorder` / `-NoReorder` 就是为这个症状准备的逃生舱 |
 | e2e 报「还原后 10 秒不复活」失败 | **daemon 正在运行**，每 2.5s 会把点重新画回来 | `Get-CimInstance ... -like '*mmx-status*daemon*'` | 跑 e2e 前先确认没有 daemon |
 | `.ps1` 双击报错、pwsh 里却正常 | UTF-8 无 BOM + 中文，PS 5.1 按 GBK 解码崩溃 | 用 `powershell.exe`（5.1）解析会报错，pwsh 7 不报 | `.\src\fix-ps1-encoding.ps1 -Dir .\src` |
 

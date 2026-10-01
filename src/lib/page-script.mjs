@@ -543,17 +543,29 @@ export function buildBootstrapExpression(cfg) {
     scope: '',
     showDone: false,
     collapseOnStart: true,
-    // Hoist running rows to the top of their list. Layout-only (the container
-    // becomes a flex column); no node is ever moved, so React never loses a
-    // child.
+    // Hoist running rows to the top of their list. Rows are relocated with
+    // insertBefore and the host's styles are never touched, so React never
+    // loses a child.
     //
-    // DEFAULT OFF. Turning the host's list container into display:flex is not
-    // a local change: measured 2026-10-02, an early loose version of the
-    // container test marked 87 elements (not 1), and forcing 87 nested boxes
-    // into flex column drove the renderer into a reflow loop -- the page
-    // pinned a core at ~56% and stopped answering Runtime.evaluate entirely.
-    // Enable per-run with --reorder, never by default.
-    reorder: false,
+    // DEFAULT ON since 2026-10-02. This is the behaviour the user asked for,
+    // and burying it behind an opt-in flag meant the launcher (which passes no
+    // reorder flag at all) always ran with it off, so "running rows are not
+    // hoisted" got reported as a bug. daemon.mjs owns the real switch;
+    // --no-reorder is the escape hatch.
+    //
+    // This page-side literal is only a fallback for the case where no cfg
+    // arrives. ...cfg is spread AFTER these defaults and the daemon always
+    // sends an explicit boolean, so the daemon's value is what actually runs.
+    //
+    // Why the escape hatch still has to exist: turning the host's list
+    // container into display:flex is not a local change. Measured 2026-10-02,
+    // an early loose version of the container test marked 87 elements (not 1),
+    // and forcing 87 nested boxes into flex column drove the renderer into a
+    // reflow loop -- the page pinned a core at ~56% and stopped answering
+    // Runtime.evaluate entirely. That incident is why the REORDER_MAX_ROOTS
+    // gate in the page function must not be raised. The shipped code never
+    // sets display:flex; it only moves nodes.
+    reorder: true,
     // Selected-row background. The app default is rgba(10,10,10,0.04) which is
     // very faint; these are the deepened / recoloured alternatives.
     activeBg: 'rgba(10, 10, 10, 0.10)',
