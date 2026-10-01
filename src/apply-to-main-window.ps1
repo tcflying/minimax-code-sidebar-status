@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
   [int]$DelaySeconds = 25,
   [int]$Port = 9351,

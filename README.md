@@ -4,7 +4,7 @@
 > 🟢 正在跑 / 🟡 被中断需处理 / 🔴 出错。
 >
 > **不修改 `app.asar` 一个字节**，不改 Agent Runtime、权限和业务逻辑，可一键完全还原。
-> 附赠「永不自动展开」守卫。
+> 附赠「永不自动展开」守卫、重启自愈链路、顶部「N 个运行中」汇总条。
 
 实测环境：MiniMax Code 3.0.74 / Electron 42.8.0 / Chromium 148 / Windows 11 (26200) / Node 24.18.0
 
@@ -15,9 +15,13 @@
 | 需求 | 官方能力能做到吗 | 本方案 |
 |---|---|---|
 | 会话行加状态点 | ❌ 无任何 UI 扩展点 | ✅ CDP 注入，已实测 |
+| running 一眼可见 | ❌ 无 | ✅ 四重信号：发光竖条 + 整行淡绿底 + 绿标题 + 呼吸动画 |
+| 一眼看到"有几个在跑" | ❌ 无 | ✅ 顶部「N 个运行中」汇总条 |
+| running 行自动置顶 | — | ❌ **实测走不通**（`order` 失效 / DOM 被单层 div 包裹），见 15.4 |
 | 侧边栏按状态筛选 | ⚠️ 内置筛选器**不覆盖置顶区** | ✅ 两个区域都覆盖 |
 | 选中行底色加深 | ⚠️ 应用默认 `rgba(10,10,10,0.04)`，很淡 | ✅ 覆盖为 10% + 蓝色左条，可调 |
 | 会话永不自动展开 | ❌ 应用强制行为，无设置 | ✅ 持续无条件折叠守卫 |
+| 重启后还能用 | ❌ 官方更新器会覆盖快捷方式 | ✅ 改名 `mmx-fix` + 四层自愈链路，见 14 |
 | 不改本体 | — | ✅ 零字节改动 |
 
 ---
@@ -368,7 +372,7 @@ requestAnimationFrame(function () {
 
 ---
 
-## 9. 测试里踩的三个坑（方法论价值大于代码价值）
+## 9. 踩过的坑（方法论价值大于代码价值）
 
 ### 9.1 假 PASS：坐标是 (x, 0)
 
@@ -411,6 +415,68 @@ Error: Cannot find module 'G:\mmx-project\fix'
 
 **纪律：只测内层不测入口，等于用内层的绿担保用户的体验。**
 
+### 9.4 UTF-8 无 BOM 的 `.ps1` 在 PowerShell 5.1 下直接解析崩溃
+
+**这是本项目唯一一个会让用户「照 README 跑就炸」的坑**，而且它伪装成语法错误。
+
+`launch-mmx-status.ps1` 里有中文，存成 **UTF-8 无 BOM + LF**。
+用 pwsh 7.6.6 解析：**0 errors**。用 Windows PowerShell 5.1 解析：**6 errors**：
+
+```
+line  16: Missing expression after ','.
+line 100: The Try statement is missing its Catch or Finally block.
+line 106: Unexpected token '}' in expression or statement.
+line 210: The string is missing the terminator: '.
+line 209: Missing closing '}' in statement block or type definition.
+line 158: Missing closing '}' in statement block or type definition.
+```
+
+`line 210` 那行原文是 `Write-Log "CDP 端口 $port 未就绪，启动 daemon 无意义，放弃。" 'ERROR'`
+—— 引号明明配对，却报 `string is missing the terminator`。
+**报错行号是假象**，真正的原因在文件开头：
+
+| PS 版本 | 无 BOM 的读取方式 | 中文 `端口` 的解码 |
+|---|---|---|
+| pwsh 7 | 始终按 UTF-8 | 正确 |
+| PS 5.1 | 无 BOM 时按系统 ANSI 代码页（本机 GBK） | **错位** |
+
+GBK 解码产生的非法字节被解析器当成语法符号，于是从文件开头一路报错下来。
+`line 16` 是 `#>`（注释块结尾）被点炸，就是最早出错的位置。
+
+**判别实验**（三组对照，因果一目了然）：
+
+| 文件 | 含中文 | BOM | PS 5.1 解析 |
+|---|---|---|---|
+| `launch-mmx-status.ps1` | 是 | 无 | **FAIL 6** |
+| `uninstall-launcher.ps1` | 是 | 无 | **FAIL 6** |
+| `start-mmx-status.ps1` | 是 | 无 | **FAIL 2** |
+| `make-mmx-icon.ps1` | 是 | **有** | **OK** |
+| `relaunch-cdp-delayed.ps1` | 是 | **有** | **OK** |
+| `test-launcher.ps1` | 否（纯 ASCII） | 无 | **OK** |
+
+含中文 + 无 BOM → 全挂；含中文 + 有 BOM → 全过；纯 ASCII + 无 BOM → 照过。
+**变量只有 BOM 一个**，因果闭合。
+
+修法是给全部 `.ps1` 补 UTF-8 BOM 并统一 CRLF：
+
+```powershell
+$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+$utf8Bom   = [System.Text.UTF8Encoding]::new($true)
+$text = [System.IO.File]::ReadAllText($path, $utf8NoBom)
+$text = $text -replace "`r`n","`n" -replace "`n","`r`n"   # 幂等，重复跑不叠加
+[System.IO.File]::WriteAllText($path, $text, $utf8Bom)
+```
+
+**不要用 `Get-Content | Set-Content`**：PS 5.1 的那条管道会再写一次 BOM，
+而且会改内容。字节级 `ReadAllText` / `WriteAllText` 才可控。
+
+**怎么证明"只改了编码、没改内容"**：把修好的文件去 BOM、CRLF 转回 LF，
+与修复前的旧副本逐字节比对。本项目 7 个文件全部 `YES`——
+BOM 和行尾变了，**内容一个字节没动**。
+
+> ⚠️ 本项目的 `.ps1` 全部以 **UTF-8 with BOM + CRLF** 提供。
+> 如果你 fork 后用编辑器另存，务必确认这两项——症状就是"在 pwsh 里好好的，双击却报错"。
+
 ---
 
 ## 10. 完整使用手册
@@ -420,6 +486,7 @@ Error: Cannot find module 'G:\mmx-project\fix'
 - Node **22.5+**（需要 `node:sqlite`；本机 24.18.0）
 - MiniMax Code 桌面端
 - 零第三方依赖
+- `.ps1` 脚本为 **UTF-8 with BOM + CRLF**，Windows PowerShell 5.1 与 pwsh 7 均可直接运行
 
 ### 10.2 首次使用
 
@@ -520,19 +587,55 @@ node daemon.mjs --active-bg 'rgba(255,255,255,0.10)'
 ## 11. 测试体系
 
 ```
-node selftest.mjs                              41 项 · 不需要 CDP
-node e2e.mjs --port 9351                       18 项 · 需要已开 CDP 的实例
+node selftest.mjs                              110 项 · 不需要 CDP
+node watchdog-selftest.mjs                     74 项 · 不需要 CDP
+node test-autofix-gates.mjs                    32 项 · 不需要 CDP
+node e2e.mjs --port 9351                       19 项 · 需要已开 CDP 的实例
 pwsh -NoProfile -File test-launcher.ps1        20 项 · 自建一次性实例
 ```
 
 | 套件 | 覆盖 |
 |---|---|
 | `selftest` | 桶映射规则 / 真实库只读 / 注入表达式语法 / **无破坏性 DOM 调用** / dispose 回归 / 反引号守卫 |
+| `watchdog-selftest` | 双路端口发现 / 单实例锁 / 僵尸回收 / 退避节奏 |
+| `test-autofix-gates` | `--fix-app` 三道闸门，**每道都配正例 + 反例** |
 | `e2e` | 真实渲染进程闭环：注入 → 刷新精确删 1 → 归零 → **10 秒不复活** → 重注入幂等 |
 | `test-launcher` | 启动器 DryRun / 冷启动 / 停止三分支，**全程不碰主实例** |
 
 `test-launcher.ps1` 会自建一次性实例（独立 `user-data-dir` + 独立端口），
 测试前后主实例进程数必须一致。
+
+### ⚠️ e2e 有一个环境陷阱：先确认没有 daemon 在跑
+
+`e2e` 的「还原后 10 秒不复活」断言，在**守护进程同时在跑**时必然失败：
+
+```
+FAIL  +4000ms 仍为 0 :: dots=88
+```
+
+这不是产品回归。`daemon.mjs --interval 2500` 每 2.5 秒会把点重新画回来，
+测试刚归零它就补上了。跑 e2e 前先确认没有 `daemon.mjs` 进程：
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
+  Where-Object { $_.CommandLine -like '*mmx-status*daemon*' }
+```
+
+**判据纪律**：环境冲突和真回归长得一模一样（都是「assertion failed」），
+必须先做上面这步**消歧**再下结论，不能直接把失败当成 bug 去改产品代码。
+
+### 反过来的坑：改完 page-script 必须重启 daemon
+
+`daemon.mjs` 在**启动时读一次** `lib/page-script.mjs` 之后常驻内存。
+改了注入脚本不重启守护，它会忠实地把**旧版样式**一遍遍重画回来：
+
+| 观察到的现象 | 真实原因 |
+|---|---|
+| 状态点数量正常（88 个） | 旧版逻辑也在画点 |
+| 但汇总条 `exists: false` | 旧版 page-script 根本不知道汇总条 |
+| running 行退回 6×6 圆点、底色全透明 | 旧版样式 |
+
+**看到"数量对但样式是旧的"，第一反应应该是"守护没重启"，而不是"注入没生效"。**
 
 ---
 
@@ -561,16 +664,17 @@ pwsh -NoProfile -File test-launcher.ps1        20 项 · 自建一次性实例
 
 ## 14. 重启后自愈链路（本轮新增）
 
-"重启 MiniMax Code 后侧边栏又全恢复了" —— 这不是一个 bug，是**三层独立根因同时存在**。
+"重启 MiniMax Code 后侧边栏又全恢复了" —— 这不是一个 bug，是**四层独立根因同时存在**。
 只修任何一层都不会好。
 
-### 14.1 三层根因
+### 14.1 四层根因
 
 | # | 根因 | 现象 | 证据 |
 |---|---|---|---|
 | 1 | 启动入口不带 CDP 参数 | 从开始菜单 / 桌面图标启动，注入器永远接不上 | `.lnk` 的 `Arguments` 为空 |
 | 2 | 守护进程被异步 reject 打死 | 跑了几小时后整个 Node 进程消失 | `Error: CDP 超时(30000ms): Runtime.evaluate` |
 | 3 | 页面重载后永不重连 | 界面闪一下点全没了，守护还活着但空转 | 日志连续 `{"ok":false,"reason":"not-installed"}` |
+| 4 | **官方更新器按名字覆盖快捷方式** | 手工改好的 `.lnk` 过几天自己变回无参数直连 | 见下 |
 
 第 2 条的机制最容易重犯，值得单说：
 
@@ -590,6 +694,27 @@ setInterval(() => {
 守护只把它当一次普通失败记一行，**从不重新 bootstrap**。实测
 `tick 30: ok:true` → `tick 40/50: not-installed`，进程活着但注入永不再回。
 
+第 4 条最阴险，因为它让前三条的修复**看起来是失效的**。
+时间线（实测）：
+
+```
+2026-09-29 22:25   app.asar 被官方更新器替换（426 MB）
+2026-09-30 20:56   桌面 MiniMax Code.lnk 被改回无参数直连
+2026-10-01 02:56   开始菜单 MiniMax Code.lnk 被改回无参数直连
+```
+
+官方更新器**按快捷方式名字**找 `.lnk` 并覆盖。你手工改好，三天后它自己改回去，
+而你会以为是前三条的修复不work。
+
+**治本办法：不要用官方名字。** 唯一命名一个 `mmx-fix.lnk`，
+官方更新器不认识这个名字，就永远碰不到它。
+
+| 入口 | 指向 | 用途 |
+|---|---|---|
+| `mmx-fix.lnk`（红色 M 图标） | `launch-mmx-status.ps1` | ✅ **唯一正确入口**，官方更新不会覆盖 |
+| `MiniMax Code.lnk` | 应用 exe，无参数 | 官方直连（保持原样，不动） |
+| 开始菜单 `MiniMax Code.lnk` | 应用 exe，无参数 | 官方直连（保持原样，不动） |
+
 ### 14.2 解法
 
 ```
@@ -600,20 +725,48 @@ setInterval(() => {
                                        └─ 注入掉了？──► 重新 bootstrap
 ```
 
-- **快捷方式改写**：开始菜单 + 桌面的 `MiniMax Code.lnk` 指向
-  `launch-mmx-status.ps1`（`-WindowStyle Hidden` 无窗口），原图标备份为 `.lnk.bak`
+- **快捷方式改写**：新建 `mmx-fix.lnk` 指向 `launch-mmx-status.ps1`
+  （`-WindowStyle Hidden` 无窗口），配自绘红色 M 图标。**不改官方那两个 `.lnk`**
 - **端口自动发现**：绝不写死。优先读 Electron 自己写的
   `%APPDATA%\<App>\DevToolsActivePort`（内容形如 `9331\n/devtools/browser/<uuid>`，
   取第一行要 `trim`，Windows 上常见 CRLF），再用进程命令行兜底
-- **绝不自动杀应用**：`APP_UP_NO_CDP` 时只告警不动进程；自动修复必须显式加 `--fix-app`
+- **默认不碰任何进程**：`APP_UP_NO_CDP` 时只告警不动进程
 - **不碰官方自启项**：`com.minimax.agent.cn` 只读打印，从不改写
 
-### 14.3 端口写死是隐患
+### 14.3 `--fix-app` 的三道闸门
+
+自动修复应用（杀掉没带 CDP 参数启动的实例并重启）**必须显式加 `--fix-app` 才启用**。
+但光加个开关就动手是危险的——冷启动中的应用会先经历一段"还没开 CDP"的正常窗口，
+`APP_UP_NO_CDP` 在这窗口里是**真实现象**，不是故障。
+
+原实现第一次遇到就动手，实测触发了 12 次修复，**打断过正在进行的编辑**。
+现在加三道闸门，三道全过才动进程：
+
+| 闸门 | 参数 | 含义 | 不加会怎样 |
+|---|---|---|---|
+| 连续未恢复次数 | `fixAppAfter: 6` | 连续 6 次探测失败（约 30 秒）才动手 | 冷启动一个瞬时失败就杀进程 |
+| 启动时长 | `minUptimeMs: 45000` | 应用启动不足 45 秒一律视为冷启动 | 刚双击就杀 |
+| 退避 | `nextFixAt` | 每次修复后按 `backoffDelayMs` 推迟下次尝试 | 修完立刻又判失败，来回杀 |
+
+动手前还会先 `reapStaleDaemons()` 清掉僵尸守护，避免"多个旧 daemon 一起报状态"污染判断。
+通道正常时多余 daemon 只留一个。
+
+```powershell
+# 每天用：纯观察，绝不打断
+node watchdog.mjs --port 9331
+
+# 只有确认自己需要自动修复时才加
+node watchdog.mjs --port 9331 --fix-app
+```
+
+**本项目默认关闭 `--fix-app`**，日常靠 `mmx-fix` 图标启动即可。
+
+### 14.4 端口写死是隐患
 
 实测同一个应用在不同时期跑过 **9351 / 9352 / 9331** 三个端口。
 任何把端口写进配置的做法都会在某次重启后失效。
 
-### 14.4 安装与还原
+### 14.5 安装与还原
 
 ```powershell
 # 先干跑，确认不动任何东西
@@ -627,7 +780,7 @@ pwsh -NoProfile -File .\src\uninstall-launcher.ps1
 `uninstall` 把 `.lnk` 从 `.lnk.bak` 原样拷回，并删掉自己加的 `Run\mmxStatusWatchdog`。
 没有 `.bak` 的图标只跳过不删（保守，避免毁掉官方图标）。
 
-### 14.5 怎么验证"重启后真的能恢复"
+### 14.6 怎么验证"重启后真的能恢复"
 
 ```powershell
 node .\tests\reload-e2e.mjs 9331 45000        # 强制 Page.reload，验证自恢复
@@ -640,7 +793,93 @@ node .\tests\watchdog-heal-e2e.mjs 9331        # 杀掉守护，验证 watchdog 
 
 ---
 
-## 15. 目录结构
+## 15. 视觉增强：让 running 真的看得见（本轮新增）
+
+### 15.1 问题：6px 圆点被噪音淹没
+
+初版给三种状态打同样大小的 6px 圆点。本机实测分布：
+
+```
+running  1 个
+paused   66 个
+error    21 个
+```
+
+**1 个 running 夹在 87 个同级噪音里**，颜色再准也扫不出来。
+"加亮一点"是无效的——问题不是对比度，是**形状和面积没区分**。
+
+### 15.2 解法：running 用形状而非颜色区分
+
+四种信号叠在一起，任意两种失效都还能读出来：
+
+| 通道 | 实现 | 实测值 |
+|---|---|---|
+| 形状 | 左侧 **4px × 24px 竖条**，不是 6px 圆点 | `4px x 24px` |
+| 发光 | `box-shadow: 0 0 6px 1px rgba(34,197,94,.75)` | `rgba(34, 197, 94, 0.75) 0px 0px 6px 1px` |
+| 呼吸 | `__mmxBar 1.6s` 动画 | `__mmxBar 1.6s` |
+| 整行底色 | `rgba(34,197,94,0.10)`，邻居全为 `rgba(0,0,0,0)` | `rgba(34, 197, 94, 0.1)` |
+| 标题色 | `#15803d`（落在 `span.shimmer-text__content` 上，**不是** button 本身） | `rgb(21, 128, 61)` |
+
+error 圆点 6px → 8px；paused 保持 6px；done 不显示。
+**验证时必须打印邻居行的底色**——只看自己那行是 `rgba(34,197,94,0.1)` 说明不了问题，
+证明"没影响到别人"要看 6 个邻居全是 `rgba(0,0,0,0)`。
+
+### 15.3 顶部「N 个运行中」汇总条
+
+需求原话是"把在跑的自动移到置顶最上面"。**实测这条路走不通**，见 15.4。
+改做汇总条：在置顶区标题行正下方插一条胶囊，回答同一个问题——**有几个在跑**。
+
+```
+置顶
+┌──────────────────────────────────┐
+│ ● 2 个运行中                      │  ← #mmx-running-summary
+└──────────────────────────────────┘
+  ○ 对比多个 codex 集成 ChatGPT 的项目
+  ...
+```
+
+**插入位置是算出来的，不是猜的**。置顶区 `[data-pinned-section]` 的子节点结构实测为：
+
+```
+index 0  标题行（30px flex）
+index 1  ← 汇总条插这里
+index 2  折叠动画容器（grid grid-cols-[minmax(0,1fr)] transition-[grid-template-rows,opacity]）
+```
+
+**必须避开 index 2**——那是应用的折叠动画容器，往里插节点会直接搞坏展开动画。
+
+实测断言：
+
+```
+exists: true, text: "2 个运行中", shown: 2, paintedRunning: 2, countMatches: true
+display: flex, height: 22, width: 366, bg: rgba(34, 197, 94, 0.12)
+indexInSection: 1, prevIsHeader: true, nextIsListGrid: true, visible: true
+```
+
+`countMatches: true` 是关键——**条上写的数字必须等于实际 running 行数**，
+不是写死一个数。无 running 时置 `data-mmx-empty="1"` 自动隐藏。
+
+### 15.4 为什么不能让 running 行自动置顶（实测判死）
+
+试过 CSS `order`，判死。完整证据链：
+
+| 尝试 | 结果 |
+|---|---|
+| CSS `order` | 排序容器 `DIV.relative.min-h-[4px].space-y-px` 的 `display` 是 **`block`**，不是 flex/grid → `order` 无效 |
+| 全页面扫描"直接子级是 session 行"的容器 | `containerCount: 0` —— **一个都没有** |
+| `insertBefore` 搬 DOM | 直接吃 `NotFoundError`（行不是置顶区的直接子节点） |
+
+真实结构是：每行都被包在自己的**单层 `div`** 里（实测 29 个单子节点包装器）。
+所以剩余方案只有 C1（搬 DOM）和 C2（绝对定位），**两者都要和 React 抢 DOM 所有权**，
+伴随折叠动画错乱、虚拟列表测高失准的风险。
+
+**判据纪律**："CSS order 不生效"这种结论不能靠 `getComputedStyle` 推断完事——
+必须同时给出"目标容器的 `display` 是什么"和"它有没有满足 order 生效的前提"。
+本例两条都指向否定，才算判死。
+
+---
+
+## 16. 目录结构
 
 ```
 minimax-code-sidebar-status/
@@ -651,21 +890,28 @@ minimax-code-sidebar-status/
 │   ├── 03-status-semantics.md   状态语义与真实数据
 │   ├── 04-never-expand.md       永不展开守卫
 │   ├── 05-bugs.md               三个真 bug 复盘
-│   └── 06-testing.md            测试体系与假 PASS 陷阱
+│   ├── 06-testing.md            测试体系与假 PASS 陷阱
+│   └── update-break-sidebar-injection.md
+│                                    官方更新如何打断注入（第四层根因）
 ├── tests/                       ← 本轮新增：跨进程真实验证
 │   ├── reload-e2e.mjs           强制 Page.reload，验证自恢复（含判据自证）
 │   ├── watchdog-heal-e2e.mjs    杀守护，验证 watchdog 自愈（两种残留态）
 │   ├── check-inject.mjs         独立进程查真实 DOM
 │   ├── check-active.mjs         选中行底色独立复核
 │   └── rebootstrap.mjs          一次性重新注入
+├── assets/
+│   └── mmx-fix.ico              自绘红色 M 图标（7 档尺寸，16~256）
 └── src/
     ├── daemon.mjs               守护主程序（重连 / 重注入 / 致命兜底）
-    ├── watchdog.mjs             常驻看门狗（双路端口发现 + 单实例锁）
+    ├── watchdog.mjs             常驻看门狗（双路端口发现 + 单实例锁 + 三闸门）
     ├── watchdog-selftest.mjs    74 项自测
+    ├── test-autofix-gates.mjs   --fix-app 三闸门测试（32 项，每闸门正例+反例）
     ├── reload-recovery.mjs      重载后自恢复验证
-    ├── launch-mmx-status.ps1    无窗口启动器（快捷方式入口）
-    ├── install-launcher.ps1     安装：改写 .lnk + 加开机自启
+    ├── launch-mmx-status.ps1    无窗口启动器（mmx-fix.lnk 指向它）
+    ├── install-launcher.ps1     安装：建 mmx-fix.lnk + 加开机自启
     ├── uninstall-launcher.ps1   还原
+    ├── relaunch-cdp-delayed.ps1 延迟带 CDP 参数重启
+    ├── make-mmx-icon.ps1        GDI+ 生成 mmx-fix.ico
     ├── start-mmx-status.ps1     原始启动器（带 CDP 参数拉起客户端）
     ├── stop-mmx-status.ps1      还原 + 停守护
     ├── cleanup.mjs              页面侧还原
@@ -676,13 +922,13 @@ minimax-code-sidebar-status/
     ├── verify-guard-causal3.mjs 守卫因果对照
     └── lib/
         ├── cdp.mjs              零依赖 CDP 客户端
-        ├── page-script.mjs      注入脚本（核心）
+        ├── page-script.mjs      注入脚本（核心：状态点 + running 竖条 + 汇总条）
         └── status-db.mjs        只读状态读取 + 桶映射
 ```
 
 ---
 
-## 16. 致谢
+## 17. 致谢
 
 - 第三方项目 [`sqing33/minimax-code-skin`](https://github.com/sqing33/minimax-code-skin)
   首次证明了 CDP 路线在 MiniMax Code 上可行。**但要注意**：它的 subagent 识别在真机上

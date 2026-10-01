@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   安装 mmx-status 快捷方式改写 + 看门狗开机自启。
 

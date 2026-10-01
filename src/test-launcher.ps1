@@ -1,4 +1,4 @@
-# mmx-status :: test-launcher.ps1
+﻿# mmx-status :: test-launcher.ps1
 # Exercises start-mmx-status.ps1 end to end against a DISPOSABLE MiniMax Code
 # instance. Never touches the user's main instance: we only ever point the
 # launcher at a port that a throwaway instance already owns, and every check is

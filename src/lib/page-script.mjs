@@ -11,11 +11,13 @@
 export const MARK = 'data-mmx-dot';
 export const STYLE_ID = 'mmx-status-style';
 export const GLOBAL = '__mmxStatus';
+export const SUMMARY_ID = 'mmx-running-summary';
 
 const PAGE_FN = String.raw`
 function __mmxStatusMain(cfg) {
   var MARK = cfg.mark;
   var GLOBAL = cfg.global;
+  var SUMMARY_ID = cfg.summaryId;
   var previous = window[GLOBAL];
   if (previous && typeof previous.dispose === 'function') previous.dispose();
 
@@ -47,6 +49,10 @@ function __mmxStatusMain(cfg) {
     style = document.createElement('style');
     style.id = cfg.styleId;
     style.textContent = [
+      // ---- base dot (paused / error / done) -------------------------------
+      // Small and quiet on purpose. Measured on the real sidebar: 66 paused +
+      // 21 error against 1 running. When every state is the same shape, the
+      // one row the user actually cares about is outvoted by 87 grey peers.
       '[' + MARK + ']{',
       '  position:absolute;',
       '  left:' + cfg.offsetX + 'px;',
@@ -54,18 +60,77 @@ function __mmxStatusMain(cfg) {
       '  transform:translateY(-50%);',
       '  width:6px;height:6px;border-radius:9999px;',
       '  pointer-events:none;',
-      '  box-shadow:0 0 0 2px var(--bg-bg_grouped_tertiary, transparent);',
       '}',
-      '[' + MARK + '][data-mmx-bucket="running"]{ background:var(--green_400,#22c55e); }',
-      '[' + MARK + '][data-mmx-bucket="running"]::after{',
-      '  content:"";position:absolute;inset:-3px;border-radius:9999px;',
-      '  background:inherit;opacity:.35;',
-      '  animation:__mmxPulse 1.4s ease-in-out infinite;',
-      '}',
-      '@keyframes __mmxPulse{0%,100%{transform:scale(.7);opacity:.45}50%{transform:scale(1.25);opacity:.08}}',
       '[' + MARK + '][data-mmx-bucket="paused"]{ background:var(--orange_400,#f59e0b); }',
-      '[' + MARK + '][data-mmx-bucket="error"]{ background:var(--red_400,#ef4444); }',
+      '[' + MARK + '][data-mmx-bucket="error"]{ background:var(--red_400,#ef4444); width:8px;height:8px; }',
       '[' + MARK + '][data-mmx-bucket="done"]{ background:var(--gray_400,#9ca3af); }',
+
+      // ---- RUNNING: a different SHAPE, not just a different colour --------
+      // A full-height glowing bar on the row's left edge. Shape difference is
+      // what makes it separable in a 500-row list; colour alone is not, because
+      // the neighbouring rows are already full of saturated yellow stars.
+      '[' + MARK + '][data-mmx-bucket="running"]{',
+      '  width:4px;height:calc(100% - 6px);',
+      '  top:3px;transform:none;',
+      '  border-radius:9999px;',
+      '  background:linear-gradient(180deg,#4ade80,#16a34a);',
+      '  box-shadow:0 0 6px 1px rgba(34,197,94,.75);',
+      '  animation:__mmxBar 1.6s ease-in-out infinite;',
+      // The selected-row rule paints its own 3px inset blue bar on the button.
+      // When the selected row is ALSO running, that blue covers the green bar
+      // and hides the one signal the user most needs. Lift the green above it.
+      '  z-index:3;',
+      '}',
+      '[' + MARK + '][data-mmx-bucket="running"]::after{',
+      '  content:"";position:absolute;inset:-2px -1px;border-radius:9999px;',
+      '  background:inherit;opacity:.30;',
+      '  animation:__mmxBar 1.6s ease-in-out infinite;',
+      '}',
+      '@keyframes __mmxBar{0%,100%{opacity:.55}50%{opacity:1}}',
+
+      // ---- RUNNING row: tinted background + tinted title ------------------
+      // Second, independent signal: it survives when the bar is scrolled to the
+      // edge, and it is readable when the sidebar is collapsed to titles only.
+      // Only :has() targets the row itself. A sibling selector such as
+      // [MARK][running] ~ * would tint every later sibling in the same
+      // container and light up unrelated rows.
+      '[data-session-id]:has(> [' + MARK + '][data-mmx-bucket="running"]){',
+      '  background-color:rgba(34,197,94,.10);',
+      '}',
+      // The row is a wrapper; the tappable element is a BUTTON nested inside
+      // .mavis-dropdown, i.e. a DESCENDANT, not a direct child. A
+      // "> ... button" or a shallow match leaves the title colour untouched,
+      // which is exactly what the live measurement showed before this fix.
+      '[data-session-id]:has(> [' + MARK + '][data-mmx-bucket="running"]) button,' +
+      '[data-session-id]:has(> [' + MARK + '][data-mmx-bucket="running"]) button *{',
+      '  color:#15803d;',
+      '}',
+      '[data-session-id]:has(> [' + MARK + '][data-mmx-bucket="running"]) button:hover{',
+      '  background-color:rgba(34,197,94,.16);',
+      '}',
+
+      // ---- running summary bar (count, without reordering anything) -------
+      // Reordering the sidebar was evaluated and REJECTED: the list container
+      // is display:block (not flex/grid) and every row is wrapped in its own
+      // single-child div, so the CSS order property cannot reach it, and moving
+      // nodes fights React over a virtualised, grid-animated tree. A count gives
+      // the same "how much is running" answer without touching list order.
+      '#' + SUMMARY_ID + '{',
+      '  display:flex;align-items:center;gap:6px;',
+      '  height:22px;margin:0 0 2px 6px;padding:0 8px;',
+      '  border-radius:6px;',
+      '  background:rgba(34,197,94,.12);',
+      '  box-shadow:inset 0 0 0 1px rgba(34,197,94,.35);',
+      '  color:#15803d;font-size:11px;font-weight:600;',
+      '  pointer-events:none;white-space:nowrap;',
+      '}',
+      '#' + SUMMARY_ID + '[data-mmx-empty="1"]{ display:none; }',
+      '#' + SUMMARY_ID + ' i{',
+      '  width:6px;height:6px;border-radius:9999px;',
+      '  background:#22c55e;flex:none;',
+      '  animation:__mmxBar 1.6s ease-in-out infinite;',
+      '}',
+      '#' + SUMMARY_ID + ' b{ font-weight:700; }',
 
       // ---- selected (active) session row background override ----
       // The app marks the selected row by putting a BARE class
@@ -110,12 +175,65 @@ function __mmxStatusMain(cfg) {
     return dot;
   }
 
+  // ---------------------------------------------------------------------
+  // Running summary bar.
+  //
+  // Inserted directly after the pinned section's HEADER row, never inside the
+  // grid/collapse container: that container is a display:grid whose height is
+  // driven by transition-[grid-template-rows,opacity], so a child added there
+  // corrupts the collapse animation.
+  //
+  // Rows can be re-rendered at any time, so the node is re-found by id on
+  // every pass instead of being cached.
+  // ---------------------------------------------------------------------
+  function ensureSummary() {
+    var sec = document.querySelector('[data-pinned-section]');
+    if (!sec) return null;
+    var bar = document.getElementById(SUMMARY_ID);
+    if (bar && bar.parentElement === sec) return bar;
+    if (bar) bar.remove();
+    // Header is the first child (30px flex row); the list is the grid that
+    // follows. Insert between them.
+    var header = sec.firstElementChild;
+    bar = document.createElement('div');
+    bar.id = SUMMARY_ID;
+    // No innerHTML: the selftest bans destructive DOM writes, and assigning
+    // innerHTML to a node inside a React-owned tree is exactly the kind of
+    // thing that gets silently reverted on the next render.
+    var pip = document.createElement('i');
+    var label = document.createElement('span');
+    var num = document.createElement('b');
+    num.textContent = '0';
+    label.appendChild(num);
+    label.appendChild(document.createTextNode(' 个运行中'));
+    bar.appendChild(pip);
+    bar.appendChild(label);
+    if (header && header.nextSibling) {
+      sec.insertBefore(bar, header.nextSibling);
+    } else {
+      sec.appendChild(bar);
+    }
+    return bar;
+  }
+
+  function updateSummary(runningOnScreen) {
+    var bar = ensureSummary();
+    if (!bar) return;
+    // Count only what the user can actually see right now, not the database
+    // total: a running session scrolled out of the virtualised list is not
+    // something they can act on by looking.
+    var n = runningOnScreen || 0;
+    var b = bar.querySelector('b');
+    if (b && b.textContent !== String(n)) b.textContent = String(n);
+    bar.setAttribute('data-mmx-empty', n === 0 ? '1' : '0');
+  }
+
   function apply() {
     if (disposed) return { rows: 0, painted: 0, matched: 0, removed: 0, skipped: 'disposed' };
     var map = cfg.status || {};
     var scope = cfg.scope ? document.querySelectorAll(cfg.scope) : null;
     var rows = document.querySelectorAll('[data-session-id]');
-    var stats = { rows: 0, painted: 0, matched: 0, removed: 0, unknownIds: 0 };
+    var stats = { rows: 0, painted: 0, matched: 0, removed: 0, unknownIds: 0, runningOnScreen: 0 };
 
     for (var i = 0; i < rows.length; i++) {
       var row = rows[i];
@@ -145,7 +263,10 @@ function __mmxStatusMain(cfg) {
         dot.setAttribute('data-mmx-bucket', bucket);
         stats.painted++;
       }
+      if (bucket === 'running') stats.runningOnScreen++;
     }
+
+    updateSummary(stats.runningOnScreen);
 
     // The sidebar is virtualised, so rows are constantly created and destroyed.
     // Drop detached rows from the bookkeeping Set, otherwise a long-running
@@ -264,6 +385,8 @@ function __mmxStatusMain(cfg) {
       pending = false;
       var dots = document.querySelectorAll('[' + MARK + ']');
       for (var i = 0; i < dots.length; i++) dots[i].remove();
+      var summary = document.getElementById(SUMMARY_ID);
+      if (summary) summary.remove();
       var st = document.getElementById(cfg.styleId);
       if (st) st.remove();
       var restored = 0;
@@ -288,6 +411,7 @@ export function buildBootstrapExpression(cfg) {
     mark: MARK,
     styleId: STYLE_ID,
     global: GLOBAL,
+    summaryId: SUMMARY_ID,
     offsetX: 4,
     intervalMs: 3000,
     scope: '',

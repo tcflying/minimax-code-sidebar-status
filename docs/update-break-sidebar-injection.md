@@ -139,11 +139,26 @@ New-Item -ItemType File -Path $log -Force
 
 ### 5.4 第三步：带 CDP 参数重启
 
+**先查出你自己机器上的真实路径，不要照抄任何硬编码路径**——
+安装位置因机器而异（默认每用户安装在 `%LOCALAPPDATA%\Programs\`，也可以装到其他盘）：
+
 ```powershell
-$exe = 'C:\Users\Administrator\AppData\Local\Programs\MiniMax Code\MiniMax Code.exe'
+# 从正在运行的进程反查 exe 绝对路径 —— 这一定是你这台机器上真实在跑的那个
+(Get-CimInstance Win32_Process -Filter "Name='MiniMax Code.exe'" |
+  Select-Object -First 1).ExecutablePath
+```
+
+拿到路径再启动：
+
+```powershell
+$exe = '<上面查到的真实路径>'
 $args = @('--remote-debugging-port=9331', '--remote-debugging-address=127.0.0.1')
 Start-Process -FilePath $exe -ArgumentList $args
 ```
+
+> ⚠️ 如果 `$exe` 路径里含空格，`Start-Process -ArgumentList` 会把命令行**按空格切开**。
+> 含空格时必须手工加引号：`$args = '"' + $exe + '"'`。
+> 这是本项目踩过三次的坑，症状是 `Cannot find module 'G:\...\fix'`（路径被从空格处截断）。
 
 **安全提示：`--remote-debugging-address=127.0.0.1` 务必保留。**
 不限制绑定地址时，调试端口可能对局域网开放，等于把应用控制权暴露出去。
@@ -179,13 +194,27 @@ Start-Process -FilePath $exe -ArgumentList $args
 2. 查 `app.asar` 的 mtime，确认是否刚被替换
 3. 若为 `APP_UP_NO_CDP` → 按第 5 节重启
 
-### 7.2 建议改进（尚未实施）
+### 7.2 长期改进（第一、二条已实施）
 
-- **给应用建一个带 CDP 参数的专用快捷方式**，日常从它启动，
-  可最大程度避免"更新后通道丢失"。
-- **给 `watchdog.log` 加大小上限或轮转**，避免单文件无限增长
-  （本次 736 条同质告警就占了 4 MB）。
-- **修 `findDaemonPids` 的历史匹配问题**，从源头消除 daemon 堆积，
+- ✅ **已实施：快捷方式必须改名，不能叫官方名字。**
+  这一条比"建个专用快捷方式"更严格，原因见下面的时间线——
+  **官方更新器按名字找 `.lnk` 并覆盖它**：
+
+  ```
+  2026-09-29 22:25   app.asar 被替换（426 MB）
+  2026-09-30 20:56   桌面 MiniMax Code.lnk 被改回无参数直连
+  2026-10-01 02:56   开始菜单 MiniMax Code.lnk 被改回无参数直连
+  ```
+
+  手工改好的 `.lnk` 过几天自己变回去，而你会误以为是修复不work。
+  唯一解法是**不与官方重名**：建 `mmx-fix.lnk`（配自绘图标），
+  官方更新器不认识这个名字，就永远碰不到。官方那两个 `.lnk` 保持原样不动。
+
+- ✅ **已实施：`watchdog.log` 轮转。** 改名备份不删除，本次 5.6 MB 已处理。
+- ✅ **已实施：`--fix-app` 三道闸门。** 连续 6 次未恢复 + 启动满 45 秒 + 退避，
+  三道全过才动进程。原实现第一次 `APP_UP_NO_CDP` 就动手，实测触发过 12 次修复。
+  详见 README 第 14.3 节。
+- ⬜ 仍待做：**修 `findDaemonPids` 的历史匹配问题**，从源头消除 daemon 堆积，
   而不是靠定期清理。
 
 ### 7.3 监控 daemon 堆积的正确姿势
@@ -217,8 +246,9 @@ $daemons | ForEach-Object { [int](($now - $_.CreationDate).TotalMinutes) } |
 | `src/watchdog.mjs` | 自愈守护；`--fix-app` 才允许结束并重启应用 |
 | `src/daemon.mjs` | 实际执行 CDP 注入的常驻进程 |
 | `src/launch-mmx-status.ps1` | 启动器；无 CDP 时会结束进程并带参重启 |
+| `src/relaunch-cdp-delayed.ps1` | 延迟带参重启（不打断当前会话） |
 | `src/lib/cdp.mjs` | CDP 连接封装 |
-| `src/lib/page-script.mjs` | 注入到页面的脚本（选中底色 / 蓝标 / 禁止展开） |
+| `src/lib/page-script.mjs` | 注入到页面的脚本（状态点 / running 竖条 / 汇总条 / 选中底色 / 禁止展开） |
 | `src/logs/watchdog.log` | 状态判读第一现场 |
 | `src/logs/watchdog.lock` | watchdog 单实例锁 |
-| `C:\Users\Administrator\AppData\Local\Temp\mmx-relaunch-cdp.log` | 本次重启记录 |
+| `$env:TEMP\mmx-relaunch-cdp.log` | 本次重启记录（用 `$env:TEMP` 取，别写死用户名路径） |

@@ -51,6 +51,12 @@ export function parseArgs(argv) {
     heal: true,
     stopDaemonOnExit: false,
     daemon: DEFAULT_DAEMON,
+    // Auto-repair must not fire on the FIRST no-CDP observation: the app is
+    // often still cold-starting, and killing a booting app to "repair" it turns
+    // a 2-second wait into a kill/restart cycle. Require N consecutive misses.
+    fixAppAfter: 6,
+    // Never auto-repair an app that has been up for less than this. Same reason.
+    minUptimeMs: 45000,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -62,12 +68,16 @@ export function parseArgs(argv) {
     else if (a === '--app-process-name') out.appProcessName = argv[++i];
     else if (a === '--daemon') out.daemon = argv[++i];
     else if (a === '--fix-app') out.fixApp = true;
+    else if (a === '--fix-app-after') out.fixAppAfter = Number(argv[++i]);
+    else if (a === '--min-uptime-ms') out.minUptimeMs = Number(argv[++i]);
     else if (a === '--once') out.once = true;
     else if (a === '--no-heal') out.heal = false;
     else if (a === '--stop-daemon-on-exit') out.stopDaemonOnExit = true;
   }
   if (!Number.isInteger(out.port) || out.port <= 0) out.port = null;
   if (!Number.isFinite(out.interval) || out.interval <= 0) out.interval = DEFAULT_INTERVAL;
+  if (!Number.isFinite(out.fixAppAfter) || out.fixAppAfter < 1) out.fixAppAfter = 1;
+  if (!Number.isFinite(out.minUptimeMs) || out.minUptimeMs < 0) out.minUptimeMs = 0;
   return out;
 }
 
@@ -500,12 +510,49 @@ async function runOnce(args, log, state) {
     const hint = p.port
       ? 'CDP 端口 ' + p.port + ' 已发现（' + p.source + '）但不响应；可能端口被非 CDP 进程占用，或应用仍在冷启动。'
       : '未发现 CDP 端口：应用是以无参数方式启动的（图标/开始菜单/官方自启），注入器接不上。';
-    log.warn('  APP_UP_NO_CDP #' + state.consecutiveNoCdp + '：' + hint + ' 默认只记录，不动应用。');
+    log.warn('  APP_UP_NO_CDP #' + state.consecutiveNoCdp + '：' + hint);
     if (!args.fixApp) {
-      log.warn('    需要自动修复请显式加 --fix-app（会结束正在运行的 MiniMax Code 并带 CDP 参数重启，中断当前会话）。');
+      log.warn('    默认只记录，不动应用。需要自动修复请显式加 --fix-app。');
       return p;
     }
-    log.warn('    --fix-app 已启用：即将结束 PID ' + (p.appPid || '?') + ' 并重启 MiniMax Code（会话会被中断）。');
+
+    // Gate 1: wait out a cold start. A booting app answers nothing yet; killing
+    // it here would restart the boot loop forever.
+    if (state.consecutiveNoCdp < args.fixAppAfter) {
+      const left = args.fixAppAfter - state.consecutiveNoCdp;
+      log.warn(
+        '    --fix-app 宽限：还需连续 ' + left + ' 次未恢复（约 ' +
+          Math.round((left * args.interval) / 1000) + 's）才动手，避免误杀冷启动中的应用。'
+      );
+      return p;
+    }
+
+    // Gate 2: an app that just started is still booting, not broken.
+    const uptimeMs = await appUptimeMs(args);
+    if (uptimeMs !== null && uptimeMs < args.minUptimeMs) {
+      log.warn(
+        '    --fix-app 跳过：应用才启动 ' + Math.round(uptimeMs / 1000) + 's，' +
+          '低于 ' + Math.round(args.minUptimeMs / 1000) + 's 启动宽限，按冷启动处理。'
+      );
+      return p;
+    }
+
+    // Gate 3: back off between real repair attempts, so a repair that fails to
+    // take cannot turn into a kill/restart loop.
+    const now = Date.now();
+    if (state.nextFixAt && now < state.nextFixAt) {
+      log.warn(
+        '    --fix-app 退避中：' + Math.round((state.nextFixAt - now) / 1000) + 's 后再试。'
+      );
+      return p;
+    }
+
+    log.warn(
+      '    --fix-app 触发：即将结束 PID ' + (p.appPid || '?') + ' 并带 CDP 参数重启' +
+        '（当前会话会被中断）。'
+    );
+    state.fixAttempts = (state.fixAttempts || 0) + 1;
+    state.nextFixAt = now + backoffDelayMs(state.fixAttempts);
     await fixApp(args, log, p);
     return p;
   }
@@ -517,6 +564,20 @@ async function runOnce(args, log, state) {
     return p;
   }
   const pids = await findDaemonPids(p.port);
+  if (pids.length > 1) {
+    // More than one daemon on the same port means earlier repairs or manual
+    // launches left strays. Keep exactly one so the pile cannot grow again.
+    log.warn('  发现 ' + pids.length + ' 个 daemon，只保留 ' + pids[0] + '，其余为冗余。');
+    for (const extra of pids.slice(1)) {
+      try {
+        process.kill(extra);
+      } catch (e) {
+        log.warn('    结束冗余 daemon pid=' + extra + ' 失败: ' + e.message);
+      }
+    }
+    state.daemonPids = [pids[0]];
+    return p;
+  }
   if (pids.length > 0) {
     if (state.failures > 0) {
       log.info('  daemon 已在运行 pid=' + pids.join(',') + '，失败计数清零。');
@@ -544,6 +605,59 @@ async function runOnce(args, log, state) {
   return p;
 }
 
+// How long the MAIN app process has been up, or null when it cannot be read.
+// Only the main process owns the command line flags, so a booting app is
+// identified by the main process age, not by the CDP port alone.
+// MUST be awaited: process enumeration is async, and a Promise compared against
+// a number silently evaluates to false, which would make the uptime gate dead.
+export async function appUptimeMs(args = {}, execImpl = execFileAsync) {
+  let list;
+  try {
+    list = await listProcesses(args.appProcessName, execImpl);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(list)) return null;
+  const mains = list.filter((x) => isMainProcessCommandLine(x && x.CommandLine));
+  if (mains.length === 0) return null;
+  let oldest = Infinity;
+  for (const m of mains) {
+    const started = processStartMs(m);
+    if (started !== null && started < oldest) oldest = started;
+  }
+  if (oldest === Infinity) return null;
+  return Math.max(0, Date.now() - oldest);
+}
+
+function processStartMs(p) {
+  const raw = p && (p.CreationDate || p.StartTime || p.CreationTime);
+  if (!raw) return null;
+  const t = raw instanceof Date ? raw.getTime() : new Date(raw).getTime();
+  return Number.isFinite(t) ? t : null;
+}
+
+// Kill daemons that are still connected to a port the app no longer serves.
+// They cannot recover on their own (their CDP socket is dead) and they accumulate
+// one per repair cycle, so a repair must clear them first or the pile returns.
+export async function reapStaleDaemons(port, log) {
+  let pids = [];
+  try {
+    pids = await findDaemonPids(port);
+  } catch {
+    return 0;
+  }
+  if (pids.length === 0) return 0;
+  log.warn('  清理僵尸 daemon ' + pids.length + ' 个（它们连的端口已无响应）: ' + pids.join(','));
+  for (const pid of pids) {
+    try {
+      process.kill(pid);
+    } catch (e) {
+      log.warn('    结束 daemon pid=' + pid + ' 失败: ' + e.message);
+    }
+  }
+  return pids.length;
+}
+
 async function fixApp(args, log, p) {
   const appName = args.appProcessName;
   let list = [];
@@ -559,6 +673,10 @@ async function fixApp(args, log, p) {
     return;
   }
   const port = p.port || p.cmdPort || 9331;
+  // Reap first: a repair that leaves the old daemons behind re-creates the pile
+  // it was supposed to clear, one per attempt.
+  const reaped = await reapStaleDaemons(port, log);
+  if (reaped > 0) log.warn('  已清理 ' + reaped + ' 个僵尸 daemon。');
   for (const m of mains) {
     log.warn('  结束 ' + appName + ' pid=' + m.ProcessId);
     try {
@@ -626,7 +744,7 @@ export async function main(argv = process.argv.slice(2)) {
   }
   log.info('获得单实例锁 ' + args.lock);
 
-  const state = { failures: 0, nextAttemptAt: 0, consecutiveNoCdp: 0 };
+  const state = { failures: 0, nextAttemptAt: 0, consecutiveNoCdp: 0, fixAttempts: 0, nextFixAt: 0 };
   let stopped = false;
 
   const stop = async (sig) => {
