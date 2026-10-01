@@ -13,6 +13,21 @@ export async function listTargets(port) {
     if (!res.ok) throw new Error(`CDP HTTP ${res.status}`);
     const data = await res.json();
     return Array.isArray(data) ? data : [];
+  } catch (e) {
+    // Surface one actionable sentence instead of a raw undici TypeError with a
+    // four-frame cause chain. Every caller (probes, daemon, launchers) already
+    // relies on this throwing, so the contract is preserved -- only the message
+    // changes. The DevToolsActivePort hint matters: that file routinely outlives
+    // the browser it names, so "the file exists" is not "the port is listening".
+    if (e && typeof e.message === 'string' && e.message.startsWith('CDP HTTP ')) throw e;
+    if (e && e.name === 'AbortError') {
+      throw new Error(`CDP 127.0.0.1:${port} 3 秒内无响应（超时）`);
+    }
+    const why = e && e.message ? e.message : String(e);
+    throw new Error(
+      `连不上 CDP 127.0.0.1:${port}：${why}。` +
+        `该端口的实例可能已退出——注意 DevToolsActivePort 文件存在不代表端口在监听。`
+    );
   } finally {
     clearTimeout(timer);
   }

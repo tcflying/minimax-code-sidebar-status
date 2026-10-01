@@ -1098,6 +1098,16 @@ node .\tests\watchdog-heal-e2e.mjs 9331        # 杀掉守护，验证 watchdog 
 `window.__probeMark` 标记，reload 后必须确认标记已消失；否则判定"reload 根本没发生"、
 这次 PASS 是假的。没有这条，一个还没被换掉的旧文档就能骗出满分。
 
+`fix-coldstart.ps1` / `restart-cold.ps1` / `restart-e2e.ps1` 在动完进程之后还会再跑一遍
+"注入验收"——`verify-summary.mjs`（汇总条数字是否与实际 running 行一致）、
+`verify-dot-sizes.mjs`（状态点实测尺寸）+ `verify-pip.mjs`（竖条样式）。
+
+**这些验收探针在仓库内的 `tests\` 下**，脚本用 `$PSScriptRoot` 的父目录派生路径，
+所以 clone 下来直接能跑，不依赖仓库以外的任何目录。截图落 `logs\shots\`
+（`logs/` 已被 `.gitignore` 忽略）。同属这套探针的 `verify-reorder.mjs` /
+`verify-running-visual.mjs` 不接 ps1，可单独 `node .\tests\verify-reorder.mjs 9331` 跑
+（前者会 `Page.reload`，属破坏性）。
+
 ---
 
 ## 15. 视觉增强：让 running 真的看得见（本轮新增）
@@ -1403,12 +1413,20 @@ minimax-code-sidebar-status/
 │   ├── 06-testing.md            测试体系与假 PASS 陷阱
 │   └── update-break-sidebar-injection.md
 │                                    官方更新如何打断注入（第四层根因）
-├── tests/                       ← 本轮新增：跨进程真实验证
+├── tests/                       ← 跨进程真实验证 + 冷启动/重启验收探针
 │   ├── reload-e2e.mjs           强制 Page.reload，验证自恢复（含判据自证）
 │   ├── watchdog-heal-e2e.mjs    杀守护，验证 watchdog 自愈（两种残留态）
 │   ├── check-inject.mjs         独立进程查真实 DOM
 │   ├── check-active.mjs         选中行底色独立复核
-│   └── rebootstrap.mjs          一次性重新注入
+│   ├── rebootstrap.mjs          一次性重新注入
+│   │
+│   │  ── 注入验收探针（由 fix-coldstart / restart-cold / restart-e2e 调用）──
+│   ├── verify-summary.mjs       汇总条：存在 / 位置 / 数字与实际 running 行一致
+│   ├── verify-dot-sizes.mjs     状态点实测渲染尺寸（配 dot-sizes.js）
+│   ├── dot-sizes.js             ↑ 上面那个的页面侧表达式，不是模块，不会被 import
+│   ├── verify-pip.mjs           汇总条前缀竖条：尺寸 / 渐变 / 发光 / 闪烁
+│   ├── verify-reorder.mjs       running 行是否真排到非 running 行之前
+│   └── verify-running-visual.mjs running 行实测样式 + 截图（落 logs/shots/）
 ├── logs/                         ← 运行时日志与安装状态（git 忽略）
 │   └── mmx-fix-lnk-backup.json   红 M 原始快捷方式配置备份（见 9.6）
 ├── assets/

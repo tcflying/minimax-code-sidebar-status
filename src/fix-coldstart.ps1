@@ -144,7 +144,7 @@ foreach ($x in $d) { L "  PID $($x.ProcessId) 起于 $((Get-Process -Id $x.Proce
 Flush
 
 # ---- 5. 注入验证 ----
-$probe = 'G:\mmx-project\fix mmx\_probe4'
+$probe = Join-Path (Split-Path -Parent $Root) 'tests'   # 验收探针已随仓库进 tests/，不再依赖项目外目录
 foreach ($s in @('verify-summary.mjs','verify-pip.mjs')) {
     $f = Join-Path $probe $s
     if (-not (Test-Path -LiteralPath $f)) { continue }

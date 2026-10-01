@@ -107,7 +107,7 @@ foreach ($d in $daemons) { L "  PID $($d.ProcessId) 起于 $((Get-Process -Id $d
 Flush
 
 # ---- 5. 验证（关键：改过的样式必须活过冷启动）----
-$probe = 'G:\mmx-project\fix mmx\_probe4'
+$probe = Join-Path (Split-Path -Parent $Root) 'tests'   # 验收探针已随仓库进 tests/，不再依赖项目外目录
 foreach ($s in @('verify-summary.mjs','verify-dot-sizes.mjs','verify-pip.mjs')) {
     $f = Join-Path $probe $s
     if (-not (Test-Path -LiteralPath $f)) { L "跳过 $s（不存在）"; continue }
