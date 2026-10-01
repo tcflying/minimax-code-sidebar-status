@@ -477,6 +477,52 @@ BOM 和行尾变了，**内容一个字节没动**。
 > ⚠️ 本项目的 `.ps1` 全部以 **UTF-8 with BOM + CRLF** 提供。
 > 如果你 fork 后用编辑器另存，务必确认这两项——症状就是"在 pwsh 里好好的，双击却报错"。
 
+### 9.5 测试全绿，功能却是坏的：WMI 过滤器 + Electron 单实例锁
+
+**这是本项目最隐蔽的一个 bug，而且所有测试都是绿的。**
+
+用户报的现象只有一句：**「双击快捷方式没反应」**。
+
+`launch-mmx-status.ps1` 的逻辑本来是对的——应用在跑但没 CDP 就杀掉重开。
+但它从来没数对过进程：
+
+```powershell
+$name = [System.IO.Path]::GetFileNameWithoutExtension($ExePath)   # 'MiniMax Code'
+return @(Get-CimInstance Win32_Process -Filter "Name='$name'")    # 永远 0 条
+```
+
+**`Win32_Process.Name` 是带扩展名的**（`'MiniMax Code.exe'`），
+而 `Get-Process -Name` 匹配的是**不带扩展名的映像名**。同一个字符串，两种 API 语义不同：
+
+| 写法 | 实测返回 |
+|---|---|
+| `Get-CimInstance -Filter "Name='MiniMax Code'"` | **0** ← bug |
+| `Get-Process -Name 'MiniMax Code'` | **10** |
+| `Get-CimInstance -Filter "Name='MiniMax Code.exe'"` | **10** |
+
+于是 `$runningCount` 恒为 0 → 脚本永远认为"应用没跑" →
+**跳过了"杀掉无 CDP 实例"这一步** → 直接启动第二个实例。
+
+**放大器是 Electron 的单实例锁**：第二个实例带着 `--remote-debugging-port=9331`
+起来的一瞬间就被判定为"重复启动"，参数丢弃、秒退，旧的无参数实例继续活着。
+CDP 参数从头到尾没生效过。
+
+**判别式证据（不靠猜）**：日志里出现了「以 --remote-debugging-port=9331 启动」，
+却**缺少**它上一行本该有的「检测到 N 个进程在跑且无 CDP」。
+这两行必须成对出现，少了上面那行 = 过滤器失效。
+
+**为什么测试没抓到**：`test-launcher.ps1` 自建的是**一次性独立实例**，
+那一刻 `$runningCount` 真的是 0，坏写法和好写法结果**碰巧相同**。
+测试场景和故障场景不是同一个，这个盲区靠"正例 + 反例"才补得上。
+
+`test-process-filters.ps1`（7 项）锁死这个形态：
+A1 坏写法恒为 0 / A2·A3 两种好写法都 >0 / A4 两者数量一致 /
+B1 两种好写法的 PID 集合完全相同 / C1·C2 源码里不再有坏过滤器。
+
+**同族排查**：全项目 grep `GetFileNameWithoutExtension` + `Get-CimInstance -Filter "Name="`，
+只有这一处中招——`start-mmx-status.ps1` 做同样的事却用了 `Get-Process`，所以是好的。
+**同一个项目里两份做同一件事的脚本，一对一错，最能说明"别靠直觉抄自己"**。
+
 ---
 
 ## 10. 完整使用手册
@@ -590,6 +636,7 @@ node daemon.mjs --active-bg 'rgba(255,255,255,0.10)'
 node selftest.mjs                              110 项 · 不需要 CDP
 node watchdog-selftest.mjs                     74 项 · 不需要 CDP
 node test-autofix-gates.mjs                    32 项 · 不需要 CDP
+pwsh -File test-process-filters.ps1              7 项 · 需要应用在跑
 node e2e.mjs --port 9351                       19 项 · 需要已开 CDP 的实例
 pwsh -NoProfile -File test-launcher.ps1        20 项 · 自建一次性实例
 ```
@@ -599,6 +646,7 @@ pwsh -NoProfile -File test-launcher.ps1        20 项 · 自建一次性实例
 | `selftest` | 桶映射规则 / 真实库只读 / 注入表达式语法 / **无破坏性 DOM 调用** / dispose 回归 / 反引号守卫 |
 | `watchdog-selftest` | 双路端口发现 / 单实例锁 / 僵尸回收 / 退避节奏 |
 | `test-autofix-gates` | `--fix-app` 三道闸门，**每道都配正例 + 反例** |
+| `test-process-filters` | WMI 与 Get-Process 的过滤器语义差异（详见 9.5） |
 | `e2e` | 真实渲染进程闭环：注入 → 刷新精确删 1 → 归零 → **10 秒不复活** → 重注入幂等 |
 | `test-launcher` | 启动器 DryRun / 冷启动 / 停止三分支，**全程不碰主实例** |
 
@@ -932,6 +980,7 @@ minimax-code-sidebar-status/
     ├── capture.mjs              截图 + 状态探针
     ├── selftest.mjs             110 项自测
     ├── e2e.mjs                  19 项端到端
+    ├── test-process-filters.ps1  7 项进程过滤器回归（9.5 那个 bug 的看门狗）
     ├── test-launcher.ps1        20 项启动器测试
     ├── verify-guard-causal3.mjs 守卫因果对照
     └── lib/

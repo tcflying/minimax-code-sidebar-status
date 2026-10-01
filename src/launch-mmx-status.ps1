@@ -146,7 +146,15 @@ function Resolve-TargetPort {
 function Get-MiniMaxProcesses {
   param([string]$ExePath)
   $name = [System.IO.Path]::GetFileNameWithoutExtension($ExePath)
-  return @(Get-CimInstance Win32_Process -Filter "Name='$name'" -ErrorAction SilentlyContinue)
+  # Get-Process, NOT Get-CimInstance -Filter "Name='...'".
+  # Win32_Process.Name carries the extension ('MiniMax Code.exe'), so a
+  # filter built from the extension-less name matches 0 rows and $runningCount
+  # stays 0 forever -- the launcher then believes the app is closed, skips the
+  # "kill the no-CDP instance" branch, and the second Electron instance is
+  # swallowed by the single-instance lock. The CDP flag never takes effect.
+  # Get-Process matches on the extension-less image name, which is what we
+  # already have. Verified 2026-10-02: filter form -> 0 rows, Get-Process -> 9.
+  return @(Get-Process -Name $name -ErrorAction SilentlyContinue)
 }
 
 # --------------------------------------------------------------- main
