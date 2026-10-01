@@ -17,7 +17,7 @@
 | 会话行加状态点 | ❌ 无任何 UI 扩展点 | ✅ CDP 注入，已实测 |
 | running 一眼可见 | ❌ 无 | ✅ 四重信号：发光竖条 + 整行淡绿底 + 绿标题 + 呼吸动画 |
 | 一眼看到"有几个在跑" | ❌ 无 | ✅ 顶部「N 个运行中」汇总条 |
-| running 行自动置顶 | — | ❌ **实测走不通**（`order` 失效 / DOM 被单层 div 包裹），见 15.4 |
+| running 行自动置顶 | ❌ 无 | ✅ **搬 DOM 排序，不改宿主样式**（`--reorder`，默认关，见 15.5） |
 | 侧边栏按状态筛选 | ⚠️ 内置筛选器**不覆盖置顶区** | ✅ 两个区域都覆盖 |
 | 选中行底色加深 | ⚠️ 应用默认 `rgba(10,10,10,0.04)`，很淡 | ✅ 覆盖为 10% + 蓝色左条，可调 |
 | 会话永不自动展开 | ❌ 应用强制行为，无设置 | ✅ 持续无条件折叠守卫 |
@@ -574,6 +574,8 @@ node daemon.mjs
   --show-done       给"已完成"也打灰点（默认关，233 个灰点噪音太大）
   --show-aborted    把"主动取消"也算暂停（默认关）
   --no-collapse     关闭"永不展开"守卫
+  --reorder         开启"running 行置顶"（默认关，见 15.5，事故史必读）
+  --no-reorder      显式关闭（等价于默认行为）
   --active-bg <css>       选中行底色（默认 rgba(10,10,10,0.10)）
   --active-bg-hover <css> 选中行 hover 底色（默认 rgba(10,10,10,0.14)）
   --active-bar <css>      选中行左侧色条（默认 rgba(0,148,252,0.90)，传 transparent 关掉）
@@ -649,6 +651,11 @@ pwsh -NoProfile -File test-launcher.ps1        20 项 · 自建一次性实例
 | `test-process-filters` | WMI 与 Get-Process 的过滤器语义差异（详见 9.5） |
 | `e2e` | 真实渲染进程闭环：注入 → 刷新精确删 1 → 归零 → **10 秒不复活** → 重注入幂等 |
 | `test-launcher` | 启动器 DryRun / 冷启动 / 停止三分支，**全程不碰主实例** |
+
+> ⚠️ `selftest` 有一个隐藏依赖：**仓库里每个 `.ps1` 都必须是 UTF-8 BOM + CRLF**。
+> 漏掉一个，它就会在"脚本语法检查"那组用 PS 5.1 解析时报
+> `MODULE_NOT_FOUND` 之类的怪错，而不是告诉你哪个文件有问题。
+> 一次性修好：`pwsh -NoProfile -File .\src\fix-ps1-encoding.ps1 -Dir .\src`
 
 `test-launcher.ps1` 会自建一次性实例（独立 `user-data-dir` + 独立端口），
 测试前后主实例进程数必须一致。
@@ -921,9 +928,9 @@ indexInSection: 1, prevIsHeader: true, nextIsListGrid: true, visible: true
 建节点逻辑一行没改，所以 React 冲突面为零。无 running 时置
 `data-mmx-empty="1"` 自动隐藏。
 
-### 15.4 为什么不能让 running 行自动置顶（实测判死）
+### 15.4 为什么不能让 running 行自动置顶（早期判死，后来推翻）
 
-试过 CSS `order`，判死。完整证据链：
+先试过 CSS `order`，判死。完整证据链：
 
 | 尝试 | 结果 |
 |---|---|
@@ -931,17 +938,195 @@ indexInSection: 1, prevIsHeader: true, nextIsListGrid: true, visible: true
 | 全页面扫描"直接子级是 session 行"的容器 | `containerCount: 0` —— **一个都没有** |
 | `insertBefore` 搬 DOM | 直接吃 `NotFoundError`（行不是置顶区的直接子节点） |
 
-真实结构是：每行都被包在自己的**单层 `div`** 里（实测 29 个单子节点包装器）。
-所以剩余方案只有 C1（搬 DOM）和 C2（绝对定位），**两者都要和 React 抢 DOM 所有权**，
-伴随折叠动画错乱、虚拟列表测高失准的风险。
-
-**判据纪律**："CSS order 不生效"这种结论不能靠 `getComputedStyle` 推断完事——
-必须同时给出"目标容器的 `display` 是什么"和"它有没有满足 order 生效的前提"。
-本例两条都指向否定，才算判死。
+真实结构是：每行都被包在自己的**单层 `div`** 里（实测 509/509 全中）。
+**但"order 无效"只证明 CSS 那条路不通，不等于搬 DOM 也不行。** 下面 15.5 是修正后的结论。
 
 ---
 
-## 16. 目录结构
+### 15.5 running 行自动置顶（`--reorder`，默认关）
+
+> ⚠️ **这个功能有一次把宿主页面搞崩的事故史，读完 15.5 再启用。**
+> 结论是**搬 DOM**，不是改样式；而且**默认关闭**，必须显式 `--reorder`。
+
+#### 它做什么
+
+某个会话**刚开始运行**时，把它在本列表内的位置移到最前。**只动这一次**——
+不是每轮刷新都重排。
+
+```
+用户：每个开始后移动一次就好了，后面新开始的会不断移到最上面
+实现：只在 running 集合发生变化时搬一次，集合不变就完全不碰 DOM
+```
+
+#### 为什么必须搬 DOM 而不是改样式
+
+第一版是这么做的，也是**把页面搞崩的那一版**：
+
+```js
+// ❌ 第一版：把宿主容器强制改成 flex column，再用 CSS order
+listEl.style.setProperty('display', 'flex', 'important');
+listEl.style.setProperty('flex-direction', 'column', 'important');
+runningWrapper.style.setProperty('order', '-1', 'important');
+```
+
+事故过程（全部有实测数据）：
+
+| 阶段 | 观测值 |
+|---|---|
+| 容器识别判据太松（"子节点里 >1 个含行"） | 匹配到 **87 个容器**，而不是 1 个 |
+| 87 个嵌套盒子被强制 `display:flex !important` | 渲染进程进入无限重排 |
+| 10 分钟后 | renderer `CPU=684s` `内存=722MB` |
+| `Runtime.evaluate` | 连续 30 秒超时，**JS 线程完全不响应** |
+| 能否用 CDP 清理 | **不能**，页面已死，只能重启应用 |
+
+**教训：改宿主的 `display` 不是"局部改动"，它会重排整棵子树。**
+把同一个手段用到 87 个元素上，就是一颗炸弹。
+
+#### 现在的做法
+
+```js
+// ✅ 修正版：只用 insertBefore 搬节点，宿主样式一个字节都不改
+root.insertBefore(wrapper, root.firstElementChild);
+```
+
+`insertBefore` 不触发宿主布局重算，只改变节点顺序。这是两种方案的本质区别。
+
+#### 容器识别：容差，不是相等
+
+置顶区那个列表实测是 **`kids=7 / withRow=6`**——第 7 个直接子节点是折叠控件，不是会话行。
+
+```js
+if (withRow >= kids - 1) { /* 这才是列表容器 */ }
+```
+
+用 `===` 会**静默漏掉用户唯一在意的那个列表**（实测：漏掉置顶区，只匹配到各项目分组下的子列表）。
+
+#### 两道独立的闸门
+
+它们防的不是同一件事，所以不能合并：
+
+| 闸门 | 值 | 防什么 |
+|---|---|---|
+| `REORDER_MAX_ROOTS` | 128 | 容器识别是否又错了。侧边栏**真的**有很多列表——实测 72~30 个，全是各项目分组 |
+| `REORDER_MAX_MOVES` | 16 | 单次搬多少节点。匹配到 100 个容器但只有 3 个有 running，就只搬 3 个节点 |
+
+#### 状态判据必须用哨兵值
+
+```js
+// ❌ 初始值用空串是错的
+var lastReorderKey = '';
+// "没有 running"时算出的 key 也是空串 → 第一次变化被当成没变化 → 永远不动
+// ✅ 哨兵值
+var lastReorderKey = '__mmx_uninitialised__';
+```
+
+这个 bug 在沙箱里被实测抓到：把一行标成 running、`refresh()` 也跑了，
+结果 `reorder: { unchanged: true, moved: 0 }`——**因为它根本没看见"变化"**。
+
+#### 沙箱实测数据
+
+```
+造 1 个 running：
+  reorder: { moved: 1, roots: 30, runningLists: 1 }
+  movedFromIndex: 5 → movedToIndex: 0
+  topBefore: 447 → topAfter: 318   （第一个非 running 行在 349）
+  沙箱 renderer CPU 增量 = 1s
+
+造 3 个 running（验证多行相对顺序）：
+  reorder: { moved: 3, runningLists: 1 }
+  顺序：[amd 华为…][分析 atlas…][查看 jev-skill…] ← 全在最前，且保持原相对顺序
+```
+
+#### 怎么开
+
+```powershell
+# 默认关闭
+node daemon.mjs --port 9331
+
+# 显式开启
+node daemon.mjs --port 9331 --reorder
+```
+
+---
+
+## 16. 沙箱工作流：绝不拿用户正在用的实例做实验
+
+> 这不是可选项。本项目开发期间**两次把用户的窗口搞没了**：
+> 一次是排程的"自动修复"脚本 `taskkill` 了整棵进程树，
+> 一次是 15.5 那个 `display:flex` 事故把渲染进程搞进重排死循环。
+> **凡是会改变宿主状态的动作，先开独立实例。**
+
+### 16.1 怎么开一个沙箱
+
+```powershell
+# 复制主实例的 user-data-dir 保留登录态，用独立端口
+pwsh -NoProfile -File .\src\open-sandbox-instance.ps1 -Port 9355 -Profile main
+```
+
+两条关键参数：
+
+| 参数 | 为什么是它 |
+|---|---|
+| `--user-data-dir=<独立目录>` | **Electron 的单实例锁是按 user-data-dir 划分的**。换个目录就能绕开，所以不必、也不该去动用户那个实例 |
+| `--remote-debugging-port=9355` | 独立调试端口，两边 CDP 互不干扰 |
+
+`-Profile blank` 用全新空目录，起得最快（几秒），**但没有登录态**：
+实测会卡在初始化，renderer CPU 烧到 174s 而**我们什么都没往它上面注入**。
+要测真实侧边栏必须用 `-Profile main`。
+
+实测：复制 1202 MB 的 user-data-dir 只需 **2.9 秒**（robocopy，排除
+`Cache` / `Code Cache` / `GPUCache`），拿到 481 个可用会话行。
+
+### 16.2 怎么关
+
+```powershell
+pwsh -NoProfile -File .\src\close-sandbox-instance.ps1 -Port 9355
+```
+
+**判据刻意不用端口。** 端口是可以被复用的普通数字，哪天主实例也起了 9355，
+按端口匹配就会误杀用户正在用的窗口。沙箱独有的是 `%TEMP%\mmx-sandbox-*` 这个
+**路径**，主实例的命令行里永远不会出现它。
+
+同理，`open-sandbox-instance.ps1` 里**一条 `taskkill` 都没有**——
+沙箱靠自己的 user-data-dir 标识清理，不靠杀进程。
+
+### 16.3 一个必须自己踩过的坑：度量要排除沙箱
+
+关沙箱的脚本第一版这样数主实例进程数：
+
+```powershell
+$mainBefore = @(Get-Process -Name 'MiniMax Code').Count   # ❌ 把沙箱也算进去了
+```
+
+结果：开沙箱后 16，关闭后 9，脚本大喊"**主实例进程数下降了！**"。
+实际上 16 里有 7 个是沙箱的，**用户的实例一个没少**。
+
+正确写法是排除沙箱路径：
+
+```powershell
+@(Get-CimInstance Win32_Process -Filter "Name='MiniMax Code.exe'" |
+  Where-Object { $_.CommandLine -notlike "*$sandboxRoot*" }).Count
+```
+
+**这类假警报会让人做出错误的紧急决策**，比没有度量更危险。
+
+### 16.4 带熔断的沙箱实验
+
+改宿主行为时，`reorder-sandbox-test.ps1` 演示了正确的实验姿势：
+
+```
+1. 记 CPU 基线（只统计沙箱的 renderer）
+2. 启动只连沙箱端口的 daemon（--port 9355）
+3. 每 8 秒采一次 CPU
+4. 增量 > 40s 立即判定为死循环 → 杀 daemon → 熔断
+5. 收尾必须核对「主实例 daemon 仍在运行」
+```
+
+第 4 步的阈值是硬的。**实验失败时要有自动刹车，不能靠人肉盯着。**
+
+---
+
+## 17. 目录结构
 
 ```
 minimax-code-sidebar-status/
@@ -968,30 +1153,85 @@ minimax-code-sidebar-status/
     ├── watchdog.mjs             常驻看门狗（双路端口发现 + 单实例锁 + 三闸门）
     ├── watchdog-selftest.mjs    74 项自测
     ├── test-autofix-gates.mjs   --fix-app 三闸门测试（32 项，每闸门正例+反例）
+    ├── test-process-filters.ps1  7 项进程过滤器回归（9.5 那个 bug 的看门狗）
     ├── reload-recovery.mjs      重载后自恢复验证
     ├── launch-mmx-status.ps1    无窗口启动器（mmx-fix.lnk 指向它）
     ├── install-launcher.ps1     安装：建 mmx-fix.lnk + 加开机自启
     ├── uninstall-launcher.ps1   还原
     ├── relaunch-cdp-delayed.ps1 延迟带 CDP 参数重启
     ├── make-mmx-icon.ps1        GDI+ 生成 mmx-fix.ico
+    ├── fix-ps1-encoding.ps1     批量补 UTF-8 BOM + 统一 CRLF（见 9.4）
+    ├── push-retry.ps1           测连通性后再 push（见 18.x 网络不通时的用法）
     ├── start-mmx-status.ps1     原始启动器（带 CDP 参数拉起客户端）
-    ├── stop-mmx-status.ps1      还原 + 停守护
+    ├── stop-mmx-status.ps1      清注入 + 停守护（**不关应用**）
     ├── cleanup.mjs              页面侧还原
     ├── capture.mjs              截图 + 状态探针
     ├── selftest.mjs             110 项自测
     ├── e2e.mjs                  19 项端到端
-    ├── test-process-filters.ps1  7 项进程过滤器回归（9.5 那个 bug 的看门狗）
-    ├── test-launcher.ps1        20 项启动器测试
+    ├── test-launcher.ps1        20 项启动器测试（自建一次性实例）
+    ├── open-sandbox-instance.ps1   开独立沙箱实例（第 16 章）
+    ├── close-sandbox-instance.ps1  关沙箱（只认沙箱路径，不认端口）
+    ├── reorder-sandbox-test.ps1    带 CPU 熔断的沙箱实验
+    ├── fix-coldstart.ps1        一键修复：换成带 CDP 的启动
+    ├── restart-cold.ps1         真杀应用的冷启动验收
+    ├── restart-e2e.ps1          端到端重启验收
     ├── verify-guard-causal3.mjs 守卫因果对照
     └── lib/
         ├── cdp.mjs              零依赖 CDP 客户端
-        ├── page-script.mjs      注入脚本（核心：状态点 + running 竖条 + 汇总条）
+        ├── page-script.mjs      注入脚本（核心：状态点 + running 竖条 + 汇总条 + 置顶）
         └── status-db.mjs        只读状态读取 + 桶映射
 ```
 
 ---
 
-## 17. 致谢
+## 18. 故障排查速查表
+
+| 症状 | 最可能的原因 | 怎么确认 | 怎么修 |
+|---|---|---|---|
+| **侧边栏一个状态点都没有** | 用官方 `MiniMax Code.lnk` 启动的（没带 CDP 参数） | `Get-CimInstance Win32_Process -Filter "Name='MiniMax Code.exe'" \| Where-Object { $_.CommandLine -notlike '*--type=*' }` 看命令行有没有 `--remote-debugging-port` | 关掉，用 **`mmx-fix`**（红 M 图标）重开；或跑 `.\src\fix-coldstart.ps1` |
+| 端口文件里有 `9331`，但注入不上 | **陈旧残留**。文件存在 ≠ 端口在监听 | `Invoke-RestMethod http://127.0.0.1:9331/json/version` 必须返回 200 | 同上，重启应用 |
+| daemon 跑着但点不变 | daemon 内存里是**旧版 page-script** | 状态点数量正常、但样式是旧的 → 就是没重启 | 杀掉 daemon 重起 |
+| 点了红 M 图标没反应 | 应用已带 CDP 在跑，launcher 正确地什么都不做 | 看 `logs\launch-*.log` 最后两行 | 正常，无需处理 |
+| 侧边栏 CPU 飙高、界面卡死 | 改宿主布局导致重排死循环（见 15.5） | renderer `CPU` 持续上涨，`Runtime.evaluate` 30s 超时 | 只能重启应用；`--reorder` 默认关就是为了防这个 |
+| e2e 报「还原后 10 秒不复活」失败 | **daemon 正在运行**，每 2.5s 会把点重新画回来 | `Get-CimInstance ... -like '*mmx-status*daemon*'` | 跑 e2e 前先确认没有 daemon |
+| `.ps1` 双击报错、pwsh 里却正常 | UTF-8 无 BOM + 中文，PS 5.1 按 GBK 解码崩溃 | 用 `powershell.exe`（5.1）解析会报错，pwsh 7 不报 | `.\src\fix-ps1-encoding.ps1 -Dir .\src` |
+
+### 最常用的一条命令
+
+```powershell
+# 一键把状态恢复到"应用带 CDP + daemon 在跑 + 注入正常"
+pwsh -NoProfile -File .\src\fix-coldstart.ps1 -DelaySec 0
+```
+
+它会：杀掉所有没带 CDP 的实例 → 用 `mmx-fix` 重开 → 轮询确认端口真通 →
+验证注入。**全程会关闭应用**，动手前请确认当前没有正在进行的会话。
+
+### 推不上去时：先测连通性，别对着死出口反复重试
+
+```powershell
+pwsh -NoProfile -File .\src\push-retry.ps1
+```
+
+它先测 `api.github.com` 通不通，**通了才 push**，不通就直接告诉你本地领先几个
+提交、提交安全存在本地。
+
+2026-10-02 遇到的真实故障长这样（`GIT_CURL_VERBOSE=1` 才看得到）：
+
+```
+== Info: Establishing HTTP proxy tunnel to github.com:443
+== Info: CONNECT phase completed for HTTP proxy
+== Info: TLSv1.3 (OUT), TLS handshake, Client hello (1):
+== Info: TLS alert, decode error (562)          ← 5 秒后出口把连接掐了
+fatal: TLS connect error: error:0A000126:SSL routines::unexpected eof
+```
+
+**判别要点**：本机网络是好的（baidu 直连 200），代理隧道也建成了，
+挂在 TLS 握手之后的 5 秒——这是**代理出口对 github 的线路问题**，不是 git 配置、
+不是仓库问题、也不是代码问题。换节点或重启代理即可。
+
+---
+
+## 19. 致谢
 
 - 第三方项目 [`sqing33/minimax-code-skin`](https://github.com/sqing33/minimax-code-skin)
   首次证明了 CDP 路线在 MiniMax Code 上可行。**但要注意**：它的 subagent 识别在真机上

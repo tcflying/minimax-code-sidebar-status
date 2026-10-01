@@ -42,6 +42,7 @@ function parseArgs(argv) {
     showDone: false,
     showAborted: false,
     collapse: true,
+    reorder: false,
     activeBg: null,
     activeBgHover: null,
     activeBar: null,
@@ -56,6 +57,8 @@ function parseArgs(argv) {
     else if (a === '--show-done') out.showDone = true;
     else if (a === '--show-aborted') out.showAborted = true;
     else if (a === '--no-collapse') out.collapse = false;
+    else if (a === '--no-reorder') out.reorder = false;
+    else if (a === '--reorder') out.reorder = true;
     else if (a === '--active-bg') out.activeBg = argv[++i];
     else if (a === '--active-bg-hover') out.activeBgHover = argv[++i];
     else if (a === '--active-bar') out.activeBar = argv[++i];
@@ -448,6 +451,7 @@ async function main() {
     offsetX: args.offsetX,
     showDone: args.showDone,
     collapseOnStart: args.collapse,
+    reorder: args.reorder,
     ...(args.activeBg ? { activeBg: args.activeBg } : {}),
     ...(args.activeBgHover ? { activeBgHover: args.activeBgHover } : {}),
     ...(args.activeBar ? { activeBar: args.activeBar } : {}),
@@ -465,6 +469,7 @@ async function main() {
   if (args.activeBg) log('选中行底色:', args.activeBg); else log('选中行底色: rgba(10,10,10,0.10) + 蓝色左条（默认）');
   log('done 点显示:', args.showDone ? '开' : '关（默认，只有绿/黄/红）');
   log('启动时折叠展开组:', args.collapse ? '开（主上要求：任何时候不自动展开）' : '关');
+  log('running 行置顶:', args.reorder ? '开（--reorder 显式开启；已知副作用，见 page-script 注释）' : '关（默认。历史原因：过宽判据会让页面陷入重排死循环）');
   if (boot && boot.collapse) log('折叠结果:', JSON.stringify(boot.collapse));
 
   if (args.once) {

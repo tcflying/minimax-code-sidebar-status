@@ -234,12 +234,128 @@ function __mmxStatusMain(cfg) {
     bar.setAttribute('data-mmx-empty', n === 0 ? '1' : '0');
   }
 
+  // ---------------------------------------------------------------------
+  // Hoist running rows.
+  //
+  // Requirement (measured from the user): it is enough to move a row once,
+  // when it STARTS running. Not to keep re-sorting every pass. So this is
+  // event-shaped, not state-shaped: we hash which wrappers currently hold a
+  // running row, and do nothing at all while that hash is unchanged.
+  //
+  // Two safety properties, both learned the hard way on 2026-10-02:
+  //  1. We move nodes with insertBefore. An earlier version instead forced
+  //     display:flex onto the container and used CSS order. That is far more
+  //     invasive -- it relayouts the host's whole subtree -- and a loose
+  //     container test marked 87 elements instead of 1, which pinned a core
+  //     in a reflow loop and froze the page. No host layout is touched now.
+  //  2. A hard ceiling on how many containers we will act on. If the
+  //     container test ever goes wrong again, we refuse to touch anything
+  //     instead of wrecking the page.
+  // ---------------------------------------------------------------------
+  // Two independent ceilings, because they guard different things:
+  //  - ROOTS guards "did I misidentify the structure?" The sidebar really
+  //    does contain many per-project sub-lists: measured 72 of them, all
+  //    class "space-y-px", all outside the viewport. So a small root ceiling
+  //    is not a safety feature, it is just wrong.
+  //  - MOVES guards "am I about to churn the DOM?" That is the real risk, and
+  //    it scales with how many nodes we relocate in one pass, not with how
+  //    many lists exist.
+  var REORDER_MAX_ROOTS = 128;
+  var REORDER_MAX_MOVES = 16;
+  // Sentinel, NOT ''. The key is empty when nothing is running, so seeding
+  // this with '' made "nothing running" and "never looked yet" the same
+  // value, and the very first transition (idle -> first session starts)
+  // was swallowed as "unchanged". Verified in the sandbox: a row flipped to
+  // running, apply() ran, and the hoister reported unchanged:true and moved
+  // nothing.
+  var lastReorderKey = '__mmx_uninitialised__';
+
+  function findListRoots() {
+    var rows = document.querySelectorAll('[data-session-id]');
+    var roots = [];
+    for (var i = 0; i < rows.length; i++) {
+      var n = rows[i].parentElement;
+      for (var d = 0; n && d < 6; d++) {
+        var kids = n.children.length;
+        if (kids > 3) {
+          var withRow = 0;
+          for (var k = 0; k < kids; k++) {
+            var c = n.children[k];
+            if (c.hasAttribute && c.hasAttribute('data-session-id')) withRow++;
+            else if (c.querySelector && c.querySelector('[data-session-id]')) withRow++;
+          }
+          // Tolerance, not equality. The pinned section's list measured
+          // kids=7 / withRow=6: one extra direct child is the collapse
+          // control, not a row. A strict "every child is a row" test silently
+          // skipped the ONE list the user actually cares about, and the
+          // reordered containers were only the per-project sub-lists.
+          //
+          // Allowing one non-row child is safe precisely because the move
+          // budget below caps how many nodes we ever relocate, and because
+          // we only ever touch containers that actually contain a running
+          // row -- 100 matched containers with 3 running rows still means
+          // 3 node moves, not a layout-wide change.
+          if (withRow >= kids - 1) { if (roots.indexOf(n) < 0) roots.push(n); break; }
+        }
+        n = n.parentElement;
+      }
+    }
+    return roots;
+  }
+
+  function applyReorder() {
+    if (!cfg.reorder) return { moved: 0, roots: 0, skipped: 'disabled' };
+    var roots = findListRoots();
+    if (roots.length > REORDER_MAX_ROOTS) {
+      return { moved: 0, roots: roots.length, aborted: 'too-many-roots' };
+    }
+
+    var key = '';
+    var plans = [];
+    for (var r = 0; r < roots.length; r++) {
+      var root = roots[r];
+      var wrappers = [];
+      for (var k = 0; k < root.children.length; k++) {
+        var w = root.children[k];
+        var row = w.querySelector && w.querySelector('[data-session-id]');
+        if (row && row.querySelector('[' + MARK + '][data-mmx-bucket="running"]')) wrappers.push(w);
+      }
+      if (!wrappers.length) continue;
+      key += r + ':' + Array.prototype.map.call(wrappers, function (w) {
+        return Array.prototype.indexOf.call(root.children, w);
+      }).join(',') + ';';
+      plans.push({ root: root, wrappers: wrappers });
+    }
+
+    // Nothing started or stopped since last pass -- do not touch the DOM.
+    if (key === lastReorderKey) return { moved: 0, roots: roots.length, unchanged: true };
+    lastReorderKey = key;
+
+    var moved = 0;
+    for (var p = 0; p < plans.length; p++) {
+      var root = plans[p].root;
+      var ws = plans[p].wrappers;
+      // Back to front, so the original relative order of several running rows
+      // is preserved once they are all at the head.
+      for (var i = ws.length - 1; i >= 0; i--) {
+        if (moved >= REORDER_MAX_MOVES) {
+          return { moved: moved, roots: roots.length, runningLists: plans.length, aborted: 'move-budget-exhausted' };
+        }
+        var w = ws[i];
+        if (root.firstElementChild === w) continue;
+        root.insertBefore(w, root.firstElementChild);
+        moved++;
+      }
+    }
+    return { moved: moved, roots: roots.length, runningLists: plans.length };
+  }
+
   function apply() {
     if (disposed) return { rows: 0, painted: 0, matched: 0, removed: 0, skipped: 'disposed' };
     var map = cfg.status || {};
     var scope = cfg.scope ? document.querySelectorAll(cfg.scope) : null;
     var rows = document.querySelectorAll('[data-session-id]');
-    var stats = { rows: 0, painted: 0, matched: 0, removed: 0, unknownIds: 0, runningOnScreen: 0 };
+    var stats = { rows: 0, painted: 0, matched: 0, removed: 0, unknownIds: 0, runningOnScreen: 0, reorder: null };
 
     for (var i = 0; i < rows.length; i++) {
       var row = rows[i];
@@ -273,6 +389,9 @@ function __mmxStatusMain(cfg) {
     }
 
     updateSummary(stats.runningOnScreen);
+    // Must run AFTER the dots are painted: the hoister keys off the bucket
+    // attribute the loop above just set.
+    stats.reorder = applyReorder();
 
     // The sidebar is virtualised, so rows are constantly created and destroyed.
     // Drop detached rows from the bookkeeping Set, otherwise a long-running
@@ -400,6 +519,7 @@ function __mmxStatusMain(cfg) {
         if (row && row.isConnected) { row.style.position = ''; restored++; }
       });
       touched.clear();
+      lastReorderKey = '__mmx_uninitialised__';
       delete window[GLOBAL];
       return { removed: dots.length, restored: restored, disposed: true };
     },
@@ -423,6 +543,17 @@ export function buildBootstrapExpression(cfg) {
     scope: '',
     showDone: false,
     collapseOnStart: true,
+    // Hoist running rows to the top of their list. Layout-only (the container
+    // becomes a flex column); no node is ever moved, so React never loses a
+    // child.
+    //
+    // DEFAULT OFF. Turning the host's list container into display:flex is not
+    // a local change: measured 2026-10-02, an early loose version of the
+    // container test marked 87 elements (not 1), and forcing 87 nested boxes
+    // into flex column drove the renderer into a reflow loop -- the page
+    // pinned a core at ~56% and stopped answering Runtime.evaluate entirely.
+    // Enable per-run with --reorder, never by default.
+    reorder: false,
     // Selected-row background. The app default is rgba(10,10,10,0.04) which is
     // very faint; these are the deepened / recoloured alternatives.
     activeBg: 'rgba(10, 10, 10, 0.10)',
