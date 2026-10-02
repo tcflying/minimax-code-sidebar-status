@@ -198,6 +198,14 @@ if ($runningCount -gt 0 -and -not $cdpUp) {
   # 非交互：直接结束并重启，不做 Read-Host 确认。
   Write-Log "检测到 $runningCount 个进程在跑且无 CDP，结束它们并带 CDP 参数重启（当前会话会被中断）。" 'WARN'
   foreach ($p in $procs) {
+    # 枚举到的进程可能在我们拿列表和动手之间恰好退出（Electron 父进程死后
+    # 子进程还在陆续退出），$p.ProcessId 属性读取为 $null。Stop-Process -Id $null
+    # 抛参数绑定错误（2026-10-02 冷启动实测：结束 pid= 失败：无法将参数绑定
+    # 到参数"Id"）。跳过即可：它已经死了，无需我们动手。
+    if (-not $p -or -not $p.ProcessId) {
+      Write-Log "跳过一个枚举瞬间消失的进程（已自行退出，无需结束）。" 'WARN'
+      continue
+    }
     try { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
     catch { Write-Log "结束 pid=$($p.ProcessId) 失败：$($_.Exception.Message)" 'WARN' }
   }

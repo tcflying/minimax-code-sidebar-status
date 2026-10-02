@@ -121,7 +121,12 @@ function Invoke-LegacyDispose {
       if ($cp.ExitCode -eq 0) {
         Write-DaemonLog "已用 cleanup.mjs 还原旧 daemon 留下的注入（exit=0）。"
       } else {
-        Write-DaemonLog "cleanup.mjs 返回 exit=$($cp.ExitCode)，旧注入可能没还原干净（不影响启动，新 daemon 会重新注入）。" 'WARN'
+        # 0xC0000409 (-1073740791) = STATUS_STACK_BUFFER_OVERRUN：node 进程自身
+        # 崩溃，不是 cleanup 的业务判断失败。2026-10-02 冷启动实测发生在
+        # 「app 刚被 -Force 全灭、CDP target 瞬间消失」的窗口里，属环境性崩溃；
+        # cleanup 是尽力而为（新 daemon 会重新注入），崩了也不阻断启动。
+        $crash = if ($cp.ExitCode -eq -1073740791) { '（node 进程崩溃 0xC0000409，常见于 app 刚被强杀、CDP target 消失的瞬间）' } else { '' }
+        Write-DaemonLog "cleanup.mjs 返回 exit=$($cp.ExitCode)$crash，旧注入可能没还原干净（不影响启动，新 daemon 会重新注入）。" 'WARN'
       }
     }
   } catch {
