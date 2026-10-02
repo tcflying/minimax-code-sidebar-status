@@ -485,7 +485,7 @@ async function main() {
 
   if (args.once) {
     const counts = db.counts();
-    log(`一次性模式结束。running=${counts.running} paused=${counts.paused} error=${counts.error} done=${counts.done}`);
+    log(`一次性模式结束。running=${counts.running} waiting=${counts.waiting} paused=${counts.paused} error=${counts.error} done=${counts.done}`);
     await session.evaluate(buildDisposeExpression());
     session.close();
     db.close();

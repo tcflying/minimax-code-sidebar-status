@@ -337,7 +337,25 @@ function __mmxStatusMain(cfg) {
   //    it scales with how many nodes we relocate in one pass, not with how
   //    many lists exist.
   var REORDER_MAX_ROOTS = 128;
-  var REORDER_MAX_MOVES = 16;
+  // 16 -> 32. Adding the waiting bucket widened the selected set from
+  // "running only" to "running + waiting", so the same ceiling is now reached
+  // by roughly twice as many sessions.
+  //
+  // Known and accepted: the budget is enforced *during* the move loop, so
+  // exhausting it returns mid-pass and leaves the list partially reordered --
+  // measured at 18 selected rows: moved=16, aborted='move-budget-exhausted',
+  // and the resulting order is scrambled rather than merely incomplete. It
+  // cannot corrupt data and the aborted field reports it honestly, but the
+  // order is wrong until the next pass succeeds.
+  //
+  // Not fixed here on purpose. An all-or-nothing pre-check (simulate the
+  // back-to-front insertBefore sequence before mutating anything) is the real
+  // fix, but it means rewriting the move loop itself -- the most fragile code
+  // in this file, and the one place where a mistake visibly wrecks the user's
+  // sidebar. The ceiling only trips at 33+ simultaneously active sessions
+  // (measured peak on this machine: 5), so the risk is documented rather than
+  // paid for. Revisit if a burst that large ever shows up in the logs.
+  var REORDER_MAX_MOVES = 32;
   // Sentinel, NOT ''. The key is empty when nothing is running, so seeding
   // this with '' made "nothing running" and "never looked yet" the same
   // value, and the very first transition (idle -> first session starts)

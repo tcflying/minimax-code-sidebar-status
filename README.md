@@ -1,10 +1,10 @@
 # MiniMax Code 侧边栏会话状态点 —— 完整实现教程
 
 > 给 MiniMax Code 桌面端侧边栏的每个会话加一个状态小圆点：
-> 🟢 正在跑 / 🟡 被中断需处理 / 🔴 出错。
+> 🟢 正在跑 / 🟠 被中断需处理 / 🟡 在等子 agent / 🔴 出错。
 >
 > **不修改 `app.asar` 一个字节**，不改 Agent Runtime、权限和业务逻辑，可一键完全还原。
-> 附赠「永不自动展开」守卫、重启自愈链路、顶部「N 个运行中」汇总条。
+> 附赠「永不自动展开」守卫、重启自愈链路、顶部「N 个运行中 · M 个在等子任务」汇总条。
 
 实测环境：MiniMax Code 3.0.74 / Electron 42.8.0 / Chromium 148 / Windows 11 (26200) / Node 24.18.0
 
@@ -17,6 +17,7 @@
 | 会话行加状态点 | ❌ 无任何 UI 扩展点 | ✅ CDP 注入，已实测 |
 | running 一眼可见 | ❌ 无 | ✅ 四重信号：发光竖条 + 整行淡绿底 + 绿标题 + 呼吸动画 |
 | 一眼看到"有几个在跑" | ❌ 无 | ✅ 顶部「N 个运行中」汇总条 |
+| 等子 agent 的会话也看得见 | ❌ 无 | ✅ 新增 `waiting` 黄色桶，本行同样置顶（见 15.6） |
 | running 行自动置顶 | ❌ 无 | ✅ **搬 DOM 排序，不改宿主样式**（默认开启，`--no-reorder` 可关，见 15.5） |
 | 侧边栏按状态筛选 | ⚠️ 内置筛选器**不覆盖置顶区** | ✅ 两个区域都覆盖 |
 | 选中行底色加深 | ⚠️ 应用默认 `rgba(10,10,10,0.04)`，很淡 | ✅ 覆盖为 10% + 蓝色左条，可调 |
@@ -193,30 +194,136 @@ MiniMax Code 是 Electron/Chromium 应用。启动时加：
 `local_runtime_turn_ingress`：`status` ∈ `completed` / `failed` / `aborted` / `accepted`
 （注意表名带 `local_runtime_` 前缀，代码里 import 的别名会骗人）
 
-### 5.2 真实分布（本机 1527 个会话）
+### 5.2 真实分布（2026-10-02 实测，本机 1712 个会话）
+
+用 `node:sqlite` 以 **`readOnly: true`** 打开 `runtime-state.sqlite` 现场统计（见 5.5）：
 
 ```
-status:  idle 1181 / aborted 168 / interrupted 112 / error 64 / started 2
-outcome: completed 673 / aborted 149 / NULL / failed 48
-child:   parent_session_id 非空 404 条（子代理）
+status:  idle 1342 / aborted 173 / interrupted 122 / error 71 / started 4
+outcome: completed 861 / aborted 154 / NULL 111 / failed 57
+child:   parent_session_id 非空 517 条（子代理）；另有 archived<>0 共 205 条
 ```
+
+`local_runtime_background_tasks` 的 `kind × status` 分布：
+
+| kind | succeeded | failed | canceled | lost | **running** | 合计 |
+|---|---|---|---|---|---|---|
+| `bash` | 7026 | 636 | 59 | 31 | **5** | 7757 |
+| `subagent` | 338 | 13 | 17 | 16 | **2** | 386 |
+
+> 这是**活库快照**，`bash` 那一列随时间持续增长（复测时已到 7763）；
+> 终态几列基本不再变。真正有意义的是最后两列——
+> **同一时刻正在跑的是 5 个 shell + 2 个子 agent，量级差 2.5 倍，全表累计量级差 20 倍。**
+> 这个比例就是 5.3 里 `kind='subagent'` 过滤必须存在的全部理由。
 
 ### 5.3 关键设计判断
 
-**`aborted` 不算"暂停"。** 168 个 `aborted` 是用户主动取消的，属**终态**；
-把它们标黄会淹掉 112 个真正需要关注的 `interrupted`（运行时重启导致 turn 未完成）。
+**`aborted` 不算"暂停"。** 173 个 `aborted` 是用户主动取消的，属**终态**；
+把它们标橙会淹掉 122 个真正需要关注的 `interrupted`（运行时重启导致 turn 未完成）。
 
 | 桶 | 判定 | 颜色 |
 |---|---|---|
 | running | `status = 'started'` | 🟢 绿（带呼吸动画） |
-| paused | `status = 'interrupted'` | 🟡 黄 |
+| waiting | 有子会话或子 agent 后台任务在跑（**判据不要求**父会话自己是 `started`，见 5.4） | 🟡 黄（带慢呼吸动画） |
+| paused | `status = 'interrupted'` | 🟠 橙点 |
 | error | `status = 'error'` 或 `outcome = 'failed'` | 🔴 红 |
 | done | `status='idle'` 且 `outcome='completed'` | 无点（默认） |
 | idle | 其余（含 aborted） | 无点 |
 
+> ⚠️ **颜色重新分配过，别照着旧文档认。** `paused` 原来是 🟡 黄，
+> 现在让给了 `waiting`，`paused` 改成 🟠 橙。两套语义必须分开：
+> 看到**橙点**想到 paused（这行需要我处理），看到**黄底**想到 waiting（这行在等我）。
+> 同一份文档里两个都叫黄会直接导致误读。橙色沿用应用自己的
+> `var(--orange_400,#f59e0b)`，黄色见 15.6。
+
 `--show-done` / `--show-aborted` 两个开关可以放宽。
 
-### 5.4 只读打开很重要
+### 5.4 waiting 为什么必须查第二张表
+
+`local_runtime_sessions` 只能覆盖"**子会话已经建起来之后**"。判据 A 是
+"存在一行 `parent_session_id = X` 且 `status='started'`"，可子 agent 在被写成
+独立会话行之前，`local_runtime_background_tasks` 里**已经**有一行在跑了——
+这中间有个时间窗，只查子会话表会漏掉。判据 B 补的就是这个窗。
+
+#### 三条判据
+
+```sql
+-- A：存在正在跑的子会话
+SELECT 1 FROM local_runtime_sessions
+ WHERE parent_session_id = X AND status = 'started' AND archived = 0
+
+-- B：存在正在跑的子 agent 后台任务
+SELECT 1 FROM local_runtime_background_tasks
+ WHERE owner_session_id = X AND status = 'running'
+   AND ended_at_ms IS NULL AND kind = 'subagent'
+```
+
+A 或 B 任一成立即判 `waiting`。
+
+#### 但判据命中 ≠ 一定染黄：还有一道优先级
+
+判据只是"这个会话名下有活"。真正决定**画不画黄**的是 overlay 的优先级：
+
+```
+error  >  running  >  paused  >  waiting  >  done / idle
+```
+
+只有**当前不是更高级信号**的会话才会被 waiting 接走。这条守卫是**实测加上去的**：
+
+| 做法 | 实测后果 |
+|---|---|
+| ❌ 无条件 overlay | 根会话 `mvs_743fa8` 自身 `status='started'` 且有 2 个活着的子 agent，**用户自己那一行整个工作期间一直是黄的** |
+| ✅ 加优先级守卫 | 自己 turn 还在跑就是 `running`（绿），只有**已经把控制权交还**的会话才转黄 |
+
+根会话干活时**几乎总是**有子 agent，所以不设守卫的话 `waiting` 会变成一个常亮颜色，
+绿色 `running` 也就失去了意义。上游三个桶一个都不许被盖，理由各不相同：
+
+| 桶 | 为什么不能被 waiting 盖掉 |
+|---|---|
+| `error` | **失败不能被一个更平静的颜色盖掉**——红是最高优先级 |
+| `running` | turn 还在执行，它**根本没在等任何东西** |
+| `paused` | 中断态是**等用户处理**的，涂成"在等子任务"等于**把待办抹掉** |
+| `done` / `idle` | 无信息可遮蔽，**允许**被 waiting 接走（这才轮到黄出场） |
+
+> ⚠️ "不要求父会话是 `started`"和"`started` 被忽略"**是两句话**。
+> 前者说的是 waiting **不排斥**非 started 的会话；后者说的是 started **优先**。
+> 把两者混为一谈，正是上面那个"用户自己那行一直黄着"的 bug 的成因。
+>
+> 优先级顺序写在 `status-db.mjs` 的注释里，并由 `test-waiting-bucket.mjs` 逐条断言：
+> `error 优先于 waiting（红不被黄盖掉）`、
+> `paused 优先于 waiting（橙色中断态是待用户处理，不该被盖）`、
+> `running 优先于 waiting`、
+> `done 可被 waiting 接走（最低优先级，无信息可遮蔽）`。
+> 改这个顺序等于改产品语义，**先看测试**。
+
+#### 判据里绝不要求父会话自己是 `started`
+
+这是**最容易写错的一条**。实测抓到两个自身 `status='idle'` 的会话被判为 waiting：
+它们的 turn 已经结束、回到空闲态，但子 agent 还在跑——**而这正是用户提这个需求的场景**。
+如果按直觉加上 `AND status='started'`，这类会话会**全部漏判**，
+功能等于只覆盖了用户根本不需要的那一半。
+
+#### `kind='subagent'` 是必须项，不是性能优化
+
+独立审查 agent 实测：去掉这个过滤，5 个 started 会话里有 4 个被判为 waiting，
+其中 **3 个是纯误判**——它们只是留了个后台 shell 命令在跑，并没有子 agent。
+本机复测（5.2 那张表）同样是 **4 个候选里 3 个是 bash**。
+`bash` 与 `subagent` 全表累计 7631 : 377（约 20 倍），
+不过滤等于"**任何长时间 shell 都会把一行染黄**"，误报率 75%。
+（本机复测的绝对数字会随"此刻谁在跑"浮动，但**比例稳定落在 75%~80% 区间**。）
+
+#### 不加 TTL，因为子 agent 没有心跳
+
+实测 `kind='subagent'` 的 running 行**没有心跳**：连续 24 秒采样，
+它的 `updated_at_ms` 纹丝不动，而同表 `bash` 行持续跳动。由此三条推论：
+
+| 推论 | 原因 |
+|---|---|
+| **绝不能用 `updated_at_ms` 判断任务是否还新鲜** | 它不更新，拿它当心跳会把活着的任务判死 |
+| **不能加 TTL 兜底** | 会误杀"主 agent 合法地等一个子 agent 十几分钟" |
+| **孤儿 running 行会永远显示黄色** | 宿主崩溃留下的行不会自愈——但这是**更安全的失败方向**：宁可多显示，不可漏显示 |
+
+### 5.5 只读打开很重要
 
 客户端正在运行时用普通模式打开会被 `SQLITE_BUSY` 锁住（这也是上游 issue #282 报告的 bug）。
 `node:sqlite` 的 `readOnly: true` 走 `SQLITE_OPEN_READONLY`，实测与运行中的客户端零冲突。
@@ -846,25 +953,38 @@ node daemon.mjs --active-bg 'rgba(255,255,255,0.10)'
 node .\src\selftest.mjs                      110 项 · 不需要 CDP
 node .\src\watchdog-selftest.mjs             74 项 · 不需要 CDP
 node .\src\test-autofix-gates.mjs            32 项 · 不需要 CDP
-node .\src\test-reorder-defaults.mjs          38 项 · 不需要 CDP
-pwsh -NoProfile -File .\src\test-process-filters.ps1   19 项 · 需要应用在跑
+node .\src\test-reorder-defaults.mjs          40 项 · 不需要 CDP
+node .\src\test-waiting-bucket.mjs            49 项 · 不需要 CDP
+pwsh -NoProfile -File .\src\test-process-filters.ps1   28 项 · 需要应用在跑（但**不需要 CDP**）
 node .\src\e2e.mjs --port 9331               19 项 · 需要已开 CDP 的实例
 pwsh -NoProfile -File .\src\test-launcher.ps1        20 项 · 自建一次性实例
 ```
 
-> 上面 5 个**不需要 CDP** 的套件可以随时跑。后两个会**连真实实例**
+> 上面 6 个**不需要 CDP** 的套件可以随时跑。唯一的环境前提是
+> `test-process-filters.ps1`——它的 A2/A3/A4/B1 断言要数**真实**进程，
+> 所以**应用得开着**（但不需要 CDP 端口）。
+> 最后两个会**连真实实例**
 > （`e2e.mjs` 连已开 CDP 的端口、`test-launcher.ps1` 自建实例），
 > **在用户正在使用主实例时不要执行**——见 16 章「绝不拿用户正在用的实例做实验」。
 
 | 套件 | 覆盖 |
 |---|---|
-| `selftest` | 桶映射规则 / 真实库只读 / 注入表达式语法 / **无破坏性 DOM 调用** / dispose 回归 / 反引号守卫 |
+| `selftest` | 桶映射规则（含 waiting overlay 优先级，见 5.4）/ 真实库只读 / 注入表达式语法 / **无破坏性 DOM 调用** / dispose 回归 / 反引号守卫 |
 | `watchdog-selftest` | 双路端口发现 / 单实例锁 / 僵尸回收 / 退避节奏 |
 | `test-autofix-gates` | `--fix-app` 三道闸门，**每道都配正例 + 反例** |
 | `test-reorder-defaults` | reorder 默认值为 **true** / `--no-reorder` 逃生舱 / 启动器参数构造（dry-run 打印的和真跑的是同一个数组）/ **杀旧 daemon 的筛选**（含"启动器源码里没有任何针对 MiniMax Code / Electron 的 taskkill 或按名批量杀"这条静态断言） |
+| `test-waiting-bucket` | 6 组：`isWaiting` 纯判定 / overlay 规则（**全用合成数据**，不依赖真实库状态，因此任何机器上结果都一样）/ `bucketFor` 没被污染 / 真实库只读时 overlay 接得上 / **`kind='subagent'` 过滤是回归锁**（直接断言 SQL 文本含 `kind = 'subagent'`、断言**没有**用 `updated_at_ms`、断言**没有** TTL）/ 页面侧样式与置顶（含「waiting 未复用 orange」） |
 | `test-process-filters` | WMI 与 Get-Process 的过滤器语义差异（详见 9.5）；**另加** `Test-IsStaleDaemonProcess` 筛选逻辑 **D0-D11 共 12 条**：同端口旧 daemon 要选、**Electron 主实例和 renderer 子进程绝不能选**、不同端口不选、非 daemon 的 node 不选、同端口的 `e2e.mjs` 不选、进程名不是 `node` 的一律不选、空命令行不选、`--port=9331` 等号写法也认 |
 | `e2e` | 真实渲染进程闭环：注入 → 刷新精确删 1 → 归零 → **10 秒不复活** → 重注入幂等 |
 | `test-launcher` | 启动器 DryRun / 冷启动 / 停止三分支，**全程不碰主实例** |
+
+> 💡 **`selftest` 里有一条断言被改写过，值得单独记一笔。**
+> 它原来叫「存在 running 会话」，断言 `counts.running > 0`。
+> 这条断言**写的其实是"能不能看见任何活跃状态"**，
+> 但在 `waiting` 桶出现之前它字面上就是在赌**这台机器此刻正好有会话在跑**——
+> 空闲机器上会假失败，而且失败信息会指向错误的方向。
+> 现在改成「存在活跃会话（running 或 waiting）」，断言 `running + waiting > 0`。
+> **教训：断言要断言你想问的问题，不要断言某个瞬时状态碰巧为真。**
 
 > ⚠️ `selftest` 有一个隐藏依赖：**仓库里每个 `.ps1` 都必须是 UTF-8 BOM + CRLF**。
 > 漏掉一个，它就会在"脚本语法检查"那组用 PS 5.1 解析时报
@@ -1141,6 +1261,32 @@ error 圆点 6px → 8px；paused 保持 6px；done 不显示。
 **验证时必须打印邻居行的底色**——只看自己那行是 `rgba(34,197,94,0.1)` 说明不了问题，
 证明"没影响到别人"要看 6 个邻居全是 `rgba(0,0,0,0)`。
 
+#### waiting 行的视觉（15.6 的新桶）
+
+竖条几何与 running **完全相同**（4px × `calc(100% - 6px)`、圆角 9999px），
+只有色相和节奏换掉：
+
+| 通道 | running | waiting | 为什么 |
+|---|---|---|---|
+| 形状 | 4px 竖条 | **4px 竖条（一致）** | 一眼读作"同类重要"，不新增需要学习的形状 |
+| 渐变 | `linear-gradient(180deg,#4ade80,#16a34a)` | `linear-gradient(180deg,#fde047,#eab308)` | yellow-300 → yellow-500 |
+| 整行底色 | `rgba(34,197,94,0.10)` | **`rgba(234,179,8,.10)`** | **同 alpha**，视觉重量一致 |
+| 标题色 | `#15803d`（硬编码） | `var(--yellow_700,#a16207)` | 走主题变量 |
+| 呼吸 | `__mmxBar 1.6s` | **`__mmxBar 2.2s`** | 刻意更慢：这行自己没在干活，只是占位 |
+
+⚠️ **黄色是刻意挑的，不是随手拿的。** `paused` 用的是 `var(--orange_400,#f59e0b)`，
+那是**琥珀色**，和朴素黄（`#facc15` / `#eab308`）色相几乎重合。两个桶都画黄色竖条
+在侧边栏上分不出来。所以 waiting 的渐变和底色**都往 yellow-500 偏**，
+和 paused 拉开距离。这一点必须写进文档，否则下一个人会以为作者随便挑了个黄。
+
+> ⚠️ **既有局限（不是本次引入，但既然记录视觉就该记下）：**
+> 上表 running 的标题文字色是**硬编码 `#15803d`**（深绿），直接写在 CSS 里，
+> 而整个 `src/` **没有任何 `prefers-color-scheme` 主题适配**。
+> 后果是**深色主题下这个深绿文字基本读不出来**（浅底深字的设计被反过来用）。
+> waiting 的标题色走 `var(--yellow_700,#a16207)` 主题变量，没有这个问题。
+> 要修就得给两桶都补主题分支，属于独立的待办，**不要在改 waiting 时顺手改它**——
+> 那会同时动到 running 的既有像素。
+
 ### 15.3 顶部「N 个运行中」汇总条
 
 需求原话是"把在跑的自动移到置顶最上面"。**实测这条路走不通**，见 15.4。
@@ -1190,6 +1336,25 @@ indexInSection: 1, prevIsHeader: true, nextIsListGrid: true, visible: true
 建节点逻辑一行没改，所以 React 冲突面为零。无 running 时置
 `data-mmx-empty="1"` 自动隐藏。
 
+#### 汇总条现在也计入 waiting
+
+条上是**两段**，不是两行：
+
+```
+┌──────────────────────────────────────────────┐
+│ ▎ 2 个运行中 · 3 个在等子任务                │  ← #mmx-running-summary
+└──────────────────────────────────────────────┘
+```
+
+- 两段数的是**屏幕上真正画出来的行**（`runningOnScreen` / `waitingOnScreen`），
+  和 running 那段一样，滚出虚拟列表的不算。
+- **M = 0 时 waiting 整段 `display:none`**，不占位、不显示"0 个在等子任务"——
+  只有一个 running 时不该拖着一句废话在侧边栏上晃。
+- ⚠️ 与上面那句"没有新增任何 DOM 节点"**不矛盾，但要说清**：running 那段确实一个节点没加；
+  waiting 段是在**同一个 `ensureSummary()` 里一次性建好的一个 `<span data-mmx-wait>`**，
+  之后只改 `textContent` 和 `display`，**任何时候都不碰 `innerHTML`**
+  （`selftest` 本身就禁止破坏性 DOM 写入）。计数没变时连 `textContent` 都不写。
+
 ### 15.4 为什么不能让 running 行自动置顶（早期判死，后来推翻）
 
 先试过 CSS `order`，判死。完整证据链：
@@ -1202,6 +1367,9 @@ indexInSection: 1, prevIsHeader: true, nextIsListGrid: true, visible: true
 
 真实结构是：每行都被包在自己的**单层 `div`** 里（实测 509/509 全中）。
 **但"order 无效"只证明 CSS 那条路不通，不等于搬 DOM 也不行。** 下面 15.5 是修正后的结论。
+
+`waiting` 行走的是**同一套机制、同一份代码路径**（只是桶名不同），
+所以这张判死表对它同样成立——它也不靠 CSS `order`。
 
 ---
 
@@ -1224,6 +1392,16 @@ indexInSection: 1, prevIsHeader: true, nextIsListGrid: true, visible: true
 用户：每个开始后移动一次就好了，后面新开始的会不断移到最上面
 实现：只在 running 集合发生变化时搬一次，集合不变就完全不碰 DOM
 ```
+
+**`waiting` 同样置顶。** 置顶集合是 `running ∪ waiting`，落地顺序固定为：
+
+```
+[所有 running 行][所有 waiting 行]     ← 各自保持各自的原相对顺序
+```
+
+两组是**分开收集再拼接**的（`runW` / `waitW`），不是混在一起排——
+因为后面的搬移循环是**从后往前**执行的，同组倒着搬才会在聚到队首后还原成原顺序。
+一次遍历同时完成两组的置顶，不额外增加一轮 DOM 写。
 
 #### 为什么必须搬 DOM 而不是改样式
 
@@ -1277,6 +1455,21 @@ if (withRow >= kids - 1) { /* 这才是列表容器 */ }
 | `REORDER_MAX_ROOTS` | 128 | 容器识别是否又错了。侧边栏**真的**有很多列表——实测 72~30 个，全是各项目分组 |
 | `REORDER_MAX_MOVES` | 16 | 单次搬多少节点。匹配到 100 个容器但只有 3 个有 running，就只搬 3 个节点 |
 
+> 🚫 **新增 `waiting` 桶时，这两行常量一个字节都没有动，也不许动。**
+>
+> `waiting` 加入后单次需要搬的节点数**变多了**（running 和 waiting 两组都搬），
+> 这正是最容易产生"那就调大一点 MOVE 上限"念头的时刻。**不要调。**
+>
+> 上面那张事故表就是这个决定的理由：容器识别一旦放松，
+> **87 个嵌套盒子被强制 `display:flex !important`**，渲染进程进入无限重排，
+> `CPU=684s`、`Runtime.evaluate` 连续 30 秒不响应、**页面彻底卡死且无法用 CDP 清理**。
+> 护栏不是"跑得慢就调大"的性能参数，是**唯一拦住那次事故的东西**。
+>
+> 正确做法是让新桶复用现有两个闸门（现在就是这么做的）：
+> 需要搬的节点变多，触发的是 `move-budget-exhausted` **提前中止**，
+> 表现为一两行没排上去，而不是整个侧边栏被拖死。
+> **把"少排几行"当成可接受的降级，把"卡死页面"当成不可接受。**
+
 #### 状态判据必须用哨兵值
 
 ```js
@@ -1319,6 +1512,85 @@ pwsh -NoProfile -File .\src\launch-mmx-status.ps1 -Port 9331 -NoReorder
 ```
 
 `--reorder` 仍然被接受，但已经等价于默认行为——保留它只是为了让旧脚本不报错。
+
+---
+
+### 15.6 waiting：等子 agent 的会话也要看得见
+
+#### 现象
+
+用户提的需求原话是"等子 agent 的会话也要看得见"。具体场景是：
+**主 agent 派了子 agent，然后自己的 turn 就结束了**（回答完了，回到空闲），
+但子 agent 还在后台跑。这时候侧边栏那一行：
+
+- 不是 `running`（turn 已结束，`status` 已经退回 `idle`）
+- 不是 `done`（子 agent 还没回来）
+- 不是任何"看得见"的状态
+
+**结果就是彻底消失在一堆灰行里。** 用户不知道有个 agent 还在替自己干活，
+只能等它自己结束才知道。
+
+#### 根因
+
+不是"少画了一个点"，是**判据选错了数据源**。
+`status='started'` 描述的是**这个会话自己这一轮 turn 在不在跑**，
+而用户想知道的是"**这个会话名下还有没有活**"。两者在派子 agent 的场景下**必然分叉**。
+
+所以新开一个 `waiting` 桶，用**两个 owner 维度的查询**去覆盖它（判据见 5.4）：
+
+```
+local_runtime_sessions         → 有没有 status='started' 的子会话
+local_runtime_background_tasks → 有没有 status='running' 的子 agent 任务
+```
+
+两条都按**会话 id** 索引（`idx_local_runtime_sessions_parent_recency_v3`、
+`idx_local_runtime_background_tasks_owner_status_delivery`），
+`refresh()` 每 2.5 秒跑在**用户的活库**上，全是覆盖索引查，**不扫表、不加索引**
+（库是 `readOnly` 打开的，本来也加不了）。
+
+#### 证据
+
+实测抓到**两个自身 `status='idle'` 的会话被判为 waiting**——
+它们的 turn 已经结束、回到空闲态，但子 agent 还在跑。
+**这正是用户提这个需求的场景。** 判据里加不加父会话的 `status`，
+差别就是"功能可用"和"功能没用"。
+
+`kind='subagent'` 过滤的必要性（独立审查 agent 实测）：
+
+| 条件 | 判为 waiting 的 started 会话 | 其中纯误判（只有后台 shell） |
+|---|---|---|
+| 加 `kind='subagent'`（**已发布**） | 1 | 0 |
+| 不加（反例） | 4 | **3** |
+
+无心跳的实测：连续 24 秒采样 `kind='subagent'` 的 running 行，
+`updated_at_ms` **纹丝不动**，同表 `bash` 行持续跳动。
+
+#### 判别要点
+
+做这个功能时踩过 / 确认过的四条，每条都是"照直觉写就会错"：
+
+1. **判据里不要写 `status='started'` 这个准入条件。**
+   写上就漏掉了用户真正要的那一半场景（turn 已结束、子 agent 还在跑）。
+   ⚠️ 但这**不等于**"`started` 被忽略"——`running` 在优先级里**排在 waiting 前面**，
+   正在跑的会话保持绿色。**"判据不要求"和"优先级不覆盖"是两件事**，
+   只做前一半不做后一半，就会得到"用户自己干活时那行一直黄着"。
+2. **`kind='subagent'` 是语义过滤，不是性能优化。**
+   `bash` : `subagent` 全表累计 7631 : 377；不过滤的误报率是 75%。
+   用户要的是"我在等子 agent"，不是"我留了个 build 在跑"。
+3. **不要加 TTL，不要用 `updated_at_ms`。**
+   子 agent running 行没有心跳，两个都会误杀长任务。孤儿行永远黄着是可接受的失败方向。
+4. **置顶护栏 `REORDER_MAX_ROOTS=128` / `REORDER_MAX_MOVES=16` 一个字都没改，也不许改。**
+   新桶让单次搬移节点数变多，这是最容易想"调大一点"的时刻——
+   详见 15.5 的两道闸门，新桶复用它们，超预算就提前中止、少排几行。
+
+#### 一个已知边界
+
+`applyWaitingOverlay` 只对**当前查询结果里确实存在**的会话行改桶。
+如果判据命中的会话 id 不在 `local_runtime_sessions` 的结果集里
+（实测遇到过一次：owner 有一行 running 的 subagent 任务，但该 session 行不在表内），
+这一行**不会被画成黄色**——`if (!cur) continue;` 直接跳过。
+这是刻意的：画一个侧边栏上根本不存在、也点不进去的行没有意义。
+但它意味着"waiting 的行数"可能少于"判据命中的会话数"，排查时别把这当成 bug。
 
 ---
 
@@ -1431,15 +1703,16 @@ minimax-code-sidebar-status/
 │   └── mmx-fix-lnk-backup.json   红 M 原始快捷方式配置备份（见 9.6）
 ├── assets/
 │   └── mmx-fix.ico              自绘红色 M 图标（7 档尺寸，16~256）
-└── src/                          ← 24 个 .mjs（21 + lib/ 3）+ 18 个 .ps1
+└── src/                          ← 25 个 .mjs（22 + lib/ 3）+ 19 个 .ps1
     ├── daemon.mjs               守护主程序（重连 / 重注入 / 致命兜底）
     ├── watchdog.mjs             常驻看门狗（双路端口发现 + 单实例锁 + 三闸门；⚠️ 能 kill/重启应用，见 9.6.2）
     │
-    │  ── 测试（5 个不需要 CDP，随时可跑）──
+    │  ── 测试（6 个不需要 CDP，随时可跑）──
     ├── selftest.mjs             110 项自测
     ├── watchdog-selftest.mjs    74 项自测
     ├── test-autofix-gates.mjs   --fix-app 三闸门测试（32 项，每闸门正例+反例）
-    ├── test-reorder-defaults.mjs reorder 默认值 / 逃生舱 / 启动器参数构造 / 杀旧 daemon 筛选（38 项）
+    ├── test-reorder-defaults.mjs reorder 默认值 / 逃生舱 / 启动器参数构造 / 杀旧 daemon 筛选（40 项）
+    ├── test-waiting-bucket.mjs  waiting 判据 / overlay 优先级锁 / kind 过滤回归锁 / 页面侧样式与置顶（49 项，见 15.6）
     ├── test-process-filters.ps1 进程过滤器回归（D 组 Test-IsStaleDaemonProcess + 端口参数形态，见 9.5）
     │
     │  ── 启动 / 安装 ──
@@ -1487,11 +1760,11 @@ minimax-code-sidebar-status/
     │
     └── lib/
         ├── cdp.mjs              零依赖 CDP 客户端
-        ├── page-script.mjs      注入脚本（核心：状态点 + running 竖条 + 汇总条 + 置顶，reorder 默认 true）
+        ├── page-script.mjs      注入脚本（核心：状态点 + running/waiting 竖条 + 汇总条 + 置顶，reorder 默认 true）
         └── status-db.mjs        只读状态读取 + 桶映射
 ```
 
-> 📌 `src\` 下 24 个 `.mjs` + 18 个 `.ps1` 全部列在此。
+> 📌 `src\` 下 25 个 `.mjs` + 19 个 `.ps1` 全部列在此。
 > **新增文件时务必同步更新这棵树**——它就是"真源在哪"的唯一书面记录，
 > 而 9.6 那个坑正是"改了一份、跑的是另一份"造成的。
 

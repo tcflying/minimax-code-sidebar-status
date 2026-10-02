@@ -53,9 +53,16 @@ export const BUCKET = {
   // kill long but perfectly legitimate waits. An orphan row left by a crashed
   // host would show yellow forever; that is the safer failure direction.
   //
-  // Deliberately NOT gated on the parent being 'started': the case the user
-  // actually asked for is the turn having ENDED and the sub agent still going,
-  // where the parent reads as 'idle' and the work is invisible.
+  // Deliberately NOT gated on REQUIRING the parent to be 'started': the case the
+  // user actually asked for is the turn having ENDED and the sub agent still
+  // going, where the parent reads as 'idle' and the work is invisible. Two such
+  // sessions were measured on the live data; requiring 'started' would drop
+  // exactly the rows this bucket was added to expose.
+  //
+  // It IS gated on the parent NOT BEING 'started' -- see applyWaitingOverlay.
+  // "Not required to be started" is not the same claim as "started is ignored",
+  // and reading it as the latter is what made the root session paint yellow
+  // while it was actively working.
   waiting: 'waiting',
   paused: 'paused', // interrupted
   error: 'error', // error | failed
@@ -139,7 +146,7 @@ export class StatusDb {
    * Kept separate from bucketFor() on purpose: bucketFor is a pure function
    * over a single row (and is unit-tested as one), while this needs two extra
    * queries. The overlay is applied afterwards in refresh(), which is what
-   * makes `waiting` win over `running`.
+   * lets it reconsider rows that bucketFor() already mapped.
    */
   collectWaiting() {
     const detail = new Map();
@@ -172,13 +179,34 @@ export class StatusDb {
    * exported so the rule can be tested without a database, without a live app,
    * and without depending on what happens to be running on the machine.
    *
-   * `waiting` deliberately wins over `running`: a session that is dispatching a
-   * sub agent is `started` AND owns live work, and "it is waiting on something"
-   * is the more useful of the two facts to show.
+   * The overlay only applies to a session that is NOT already showing a
+   * higher-urgency signal. Precedence, strongest first:
    *
-   * Note what is NOT a condition here: the session's own status. The case this
-   * bucket exists for is a turn that has already returned to `idle` while its
-   * sub agent keeps working, which is invisible without it.
+   *     error  >  running  >  paused  >  waiting  >  done / idle
+   *
+   * `waiting` is a statement about a turn that has already handed control back
+   * -- "nothing is happening here right now, but something I own is". None of
+   * the three above it say that, so none of them may be repainted:
+   *
+   *   - `running`  the turn is executing; it is not waiting on anything.
+   *   - `error`    a failure must not be buried under a calmer colour.
+   *   - `paused`   an interrupted turn is a state the user has to act on;
+   *                overwriting it with "waiting" erases the call to action.
+   *
+   * The running guard was added after measuring the live database (2026-10-02):
+   * the root session `mvs_743fa8` read status='started' with 2 live sub agents,
+   * so an unguarded overlay painted the user's OWN row yellow for the entire
+   * time the agent was working. The root session almost always has sub agents
+   * while it works, so that made "waiting" effectively a constant colour and
+   * cost the green `running` state any meaning.
+   *
+   * Note what is NOT a condition here: the parent is NOT required to be
+   * `started`. The case this bucket exists for is a turn that has already
+   * returned to `idle` while its sub agent keeps working, and two such sessions
+   * were measured on the live data. Requiring `started` would drop exactly the
+   * rows the bucket was added to expose. "Not required to be started" and
+   * "started is ignored" are different claims, and conflating them is what
+   * produced the bug above.
    */
   static applyWaitingOverlay(map, detail) {
     for (const [id, d] of detail) {
@@ -187,6 +215,9 @@ export class StatusDb {
       // Unknown id = archived, or not in the unarchived set. Painting it would
       // be a phantom row that can never be acted on.
       if (!cur) continue;
+      // Already saying something more urgent than "waiting" -- leave it alone.
+      if (cur.bucket === BUCKET.error || cur.bucket === BUCKET.running
+        || cur.bucket === BUCKET.paused) continue;
       cur.bucket = BUCKET.waiting;
       cur.waiting = d;
     }

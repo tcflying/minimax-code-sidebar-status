@@ -56,10 +56,38 @@ const D = (subagent, bash) => ({ subagent, bash });
   check('无关会话不受影响', m.get('live-parent').bucket === BUCKET.running, `got=${m.get('live-parent').bucket}`);
 }
 {
-  // waiting must win over running
+  // A session that is ACTIVELY running must stay green, even while it owns live
+  // sub agents. This assertion used to read the opposite ("waiting 覆盖 running").
+  //
+  // Why it was wrong, measured on the live database (2026-10-02): the user's own
+  // root session read status='started' with 2 live sub agents, so the unguarded
+  // overlay painted the user's OWN row yellow for the whole time the agent was
+  // working. The root almost always has sub agents while it works, which made
+  // "waiting" a constant colour and cost green `running` any meaning.
   const m = new Map([['x', row('x', 'started')]]);
-  StatusDb.applyWaitingOverlay(m, new Map([['x', D(0, 2)]]));
-  check('waiting 覆盖 running', m.get('x').bucket === BUCKET.waiting, `got=${m.get('x').bucket}`);
+  StatusDb.applyWaitingOverlay(m, new Map([['x', D(2, 0)]]));
+  check('父会话自身在跑(有子 agent) -> 仍是 running，不被染黄',
+    m.get('x').bucket === BUCKET.running, `got=${m.get('x').bucket}`);
+  check('未被染黄时也不挂 waiting 明细', m.get('x').waiting === undefined,
+    JSON.stringify(m.get('x').waiting));
+}
+{
+  // Precedence lock: error > running > paused > waiting. None of the three may
+  // be repainted -- a failure, a live turn, and an interrupted turn all say
+  // something more urgent (and more actionable) than "waiting".
+  const m = new Map([
+    ['e', row('e', 'error')],
+    ['p', row('p', 'interrupted')],
+    ['r', row('r', 'started')],
+    ['d', { id: 'd', status: 'idle', bucket: BUCKET.done, title: 'd' }],
+  ]);
+  StatusDb.applyWaitingOverlay(m, new Map([['e', D(1, 0)], ['p', D(1, 0)], ['r', D(1, 0)], ['d', D(1, 0)]]));
+  check('error 优先于 waiting（红不被黄盖掉）', m.get('e').bucket === BUCKET.error, `got=${m.get('e').bucket}`);
+  check('paused 优先于 waiting（橙色中断态是待用户处理，不该被盖）',
+    m.get('p').bucket === BUCKET.paused, `got=${m.get('p').bucket}`);
+  check('running 优先于 waiting', m.get('r').bucket === BUCKET.running, `got=${m.get('r').bucket}`);
+  check('done 可被 waiting 接走（最低优先级，无信息可遮蔽）',
+    m.get('d').bucket === BUCKET.waiting, `got=${m.get('d').bucket}`);
 }
 {
   // A finished sub agent (detail counts at zero) must NOT light anything up.
@@ -76,8 +104,9 @@ const D = (subagent, bash) => ({ subagent, bash });
   check('已知 id 正常判 waiting', m.get('known').bucket === BUCKET.waiting);
 }
 {
-  // The detail is attached for the UI, so assert it survives.
-  const m = new Map([['x', row('x', 'started')]]);
+  // The detail is attached for the UI, so assert it survives. The parent is
+  // 'idle' on purpose: a 'started' parent is no longer overlaid at all.
+  const m = new Map([['x', row('x', 'idle')]]);
   StatusDb.applyWaitingOverlay(m, new Map([['x', D(2, 1)]]));
   check('waiting 明细被挂到行上', JSON.stringify(m.get('x').waiting) === JSON.stringify(D(2, 1)),
     JSON.stringify(m.get('x').waiting));
