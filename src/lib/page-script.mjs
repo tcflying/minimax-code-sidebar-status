@@ -109,6 +109,51 @@ function __mmxStatusMain(cfg) {
       '  background-color:rgba(34,197,94,.16);',
       '}',
 
+      // ---- WAITING: the turn is over, but something it owns is still going -
+      // Same bar geometry as running, so the eye reads it as the same kind of
+      // important; different hue, so it is never confused with the paused
+      // bucket. (NB: no backticks anywhere in this comment -- this block lives
+      // inside a String.raw template, and one stray backtick ends it. That is
+      // not a style preference, it is a syntax error.)
+      //
+      // The hue choice is forced: the paused bucket is var(--orange_400,
+      // #f59e0b), an amber. A naive yellow (#facc15 / #eab308) sits right next
+      // to it. So the gradient runs yellow-300 -> yellow-500 while the row tint
+      // and the glow use the yellow-500 hue (rgb(234,179,8)) at the SAME
+      // 10%/16% alpha as running green, keeping the two equally weighted.
+      //
+      // Theme awareness: the title colour goes through var(--yellow_700,...)
+      // the same way the other dots go through var(--orange_400,...), so it
+      // follows the app's own palette instead of hardcoding for one theme. The
+      // tints are semi-transparent, so they composite on both backgrounds.
+      '[' + MARK + '][data-mmx-bucket="waiting"]{',
+      '  width:4px;height:calc(100% - 6px);',
+      '  top:3px;transform:none;',
+      '  border-radius:9999px;',
+      '  background:linear-gradient(180deg,#fde047,#eab308);',
+      '  box-shadow:0 0 6px 1px rgba(234,179,8,.70);',
+      // Slower than running on purpose: this row is not doing anything itself,
+      // it is only holding a placeholder while a child works. It should read
+      // as a steady beacon, not as urgent as a row that is actively working.
+      '  animation:__mmxBar 2.2s ease-in-out infinite;',
+      '  z-index:3;',
+      '}',
+      '[' + MARK + '][data-mmx-bucket="waiting"]::after{',
+      '  content:"";position:absolute;inset:-2px -1px;border-radius:9999px;',
+      '  background:inherit;opacity:.30;',
+      '  animation:__mmxBar 2.2s ease-in-out infinite;',
+      '}',
+      '[data-session-id]:has(> [' + MARK + '][data-mmx-bucket="waiting"]){',
+      '  background-color:rgba(234,179,8,.10);',
+      '}',
+      '[data-session-id]:has(> [' + MARK + '][data-mmx-bucket="waiting"]) button,' +
+      '[data-session-id]:has(> [' + MARK + '][data-mmx-bucket="waiting"]) button *{',
+      '  color:var(--yellow_700,#a16207);',
+      '}',
+      '[data-session-id]:has(> [' + MARK + '][data-mmx-bucket="waiting"]) button:hover{',
+      '  background-color:rgba(234,179,8,.16);',
+      '}',
+
       // ---- running summary bar (count, without reordering anything) -------
       // Reordering the sidebar was evaluated and REJECTED: the list container
       // is display:block (not flex/grid) and every row is wrapped in its own
@@ -137,6 +182,16 @@ function __mmxStatusMain(cfg) {
       '}',
       '@keyframes __mmxBlink{ 0%,55%{opacity:1} 56%,100%{opacity:.2} }',
       '#' + SUMMARY_ID + ' b{ font-weight:700; }',
+      // The waiting counter is a second segment in the same bar. It is tinted
+      // with the same yellow as the row itself so the number, the row and the
+      // bar all read as one signal. It keeps the bar's own font metrics and
+      // only changes colour, so nothing shifts when the counts change.
+      '#' + SUMMARY_ID + ' [data-mmx-wait]{',
+      '  display:inline-flex;align-items:center;gap:4px;',
+      '  margin-left:9px;padding-left:9px;',
+      '  border-left:1px solid rgba(234,179,8,.45);',
+      '  color:var(--yellow_700,#a16207);',
+      '}',
 
       // ---- selected (active) session row background override ----
       // The app marks the selected row by putting a BARE class
@@ -212,8 +267,18 @@ function __mmxStatusMain(cfg) {
     num.textContent = '0';
     label.appendChild(num);
     label.appendChild(document.createTextNode(' 个运行中'));
+    // Second segment for the waiting bucket. Built once and reused, never
+    // innerHTML (the selftest bans destructive DOM writes).
+    var wait = document.createElement('span');
+    wait.setAttribute('data-mmx-wait', '1');
+    var waitNum = document.createElement('b');
+    waitNum.textContent = '0';
+    wait.appendChild(waitNum);
+    wait.appendChild(document.createTextNode(' 个在等子任务'));
+    wait.style.display = 'none';
     bar.appendChild(pip);
     bar.appendChild(label);
+    bar.appendChild(wait);
     if (header && header.nextSibling) {
       sec.insertBefore(bar, header.nextSibling);
     } else {
@@ -222,16 +287,27 @@ function __mmxStatusMain(cfg) {
     return bar;
   }
 
-  function updateSummary(runningOnScreen) {
+  function updateSummary(runningOnScreen, waitingOnScreen) {
     var bar = ensureSummary();
     if (!bar) return;
     // Count only what the user can actually see right now, not the database
     // total: a running session scrolled out of the virtualised list is not
     // something they can act on by looking.
     var n = runningOnScreen || 0;
+    var w = waitingOnScreen || 0;
     var b = bar.querySelector('b');
     if (b && b.textContent !== String(n)) b.textContent = String(n);
-    bar.setAttribute('data-mmx-empty', n === 0 ? '1' : '0');
+    // Only touch the waiting segment when its value actually changed, and keep
+    // it out of the layout entirely when zero so a single running session does
+    // not drag a stray "0 个在等子任务" along the sidebar.
+    var seg = bar.querySelector('[data-mmx-wait]');
+    if (seg) {
+      var wb = seg.querySelector('b');
+      if (wb && wb.textContent !== String(w)) wb.textContent = String(w);
+      var want = w === 0 ? 'none' : '';
+      if (seg.style.display !== want) seg.style.display = want;
+    }
+    bar.setAttribute('data-mmx-empty', n === 0 && w === 0 ? '1' : '0');
   }
 
   // ---------------------------------------------------------------------
@@ -314,12 +390,23 @@ function __mmxStatusMain(cfg) {
     var plans = [];
     for (var r = 0; r < roots.length; r++) {
       var root = roots[r];
-      var wrappers = [];
+      // Running rows first, then waiting rows; each group keeps its own
+      // original relative order, because the move loop below runs
+      // back-to-front. Concatenating the two groups in that order is what
+      // produces [all running][all waiting] at the head in a single pass.
+      var runW = [];
+      var waitW = [];
       for (var k = 0; k < root.children.length; k++) {
         var w = root.children[k];
         var row = w.querySelector && w.querySelector('[data-session-id]');
-        if (row && row.querySelector('[' + MARK + '][data-mmx-bucket="running"]')) wrappers.push(w);
+        if (!row) continue;
+        if (row.querySelector('[' + MARK + '][data-mmx-bucket="running"]')) {
+          runW.push(w);
+        } else if (row.querySelector('[' + MARK + '][data-mmx-bucket="waiting"]')) {
+          waitW.push(w);
+        }
       }
+      var wrappers = runW.concat(waitW);
       if (!wrappers.length) continue;
       key += r + ':' + Array.prototype.map.call(wrappers, function (w) {
         return Array.prototype.indexOf.call(root.children, w);
@@ -355,7 +442,7 @@ function __mmxStatusMain(cfg) {
     var map = cfg.status || {};
     var scope = cfg.scope ? document.querySelectorAll(cfg.scope) : null;
     var rows = document.querySelectorAll('[data-session-id]');
-    var stats = { rows: 0, painted: 0, matched: 0, removed: 0, unknownIds: 0, runningOnScreen: 0, reorder: null };
+    var stats = { rows: 0, painted: 0, matched: 0, removed: 0, unknownIds: 0, runningOnScreen: 0, waitingOnScreen: 0, reorder: null };
 
     for (var i = 0; i < rows.length; i++) {
       var row = rows[i];
@@ -386,9 +473,10 @@ function __mmxStatusMain(cfg) {
         stats.painted++;
       }
       if (bucket === 'running') stats.runningOnScreen++;
+      if (bucket === 'waiting') stats.waitingOnScreen++;
     }
 
-    updateSummary(stats.runningOnScreen);
+    updateSummary(stats.runningOnScreen, stats.waitingOnScreen);
     // Must run AFTER the dots are painted: the hoister keys off the bucket
     // attribute the loop above just set.
     stats.reorder = applyReorder();

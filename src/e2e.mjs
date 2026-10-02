@@ -58,7 +58,9 @@ if (probe.totalRows > 0) {
   check('有会话行被发现并上色', s1.dots > 0, `dots=${s1.dots}`);
   check('painted 不超过 DB 非 idle 规模',
     boot.initial.painted > 0 &&
-      boot.initial.painted <= db.counts().running + db.counts().paused + db.counts().error + 5,
+      boot.initial.painted <=
+        db.counts().running + db.counts().waiting +
+        db.counts().paused + db.counts().error + 5,
     `painted=${boot.initial.painted}`);
 } else {
   console.log('  (跳过上色断言：侧边栏为空)');

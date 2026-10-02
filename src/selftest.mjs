@@ -52,7 +52,19 @@ const db = new StatusDb(DEFAULT_DB);
 const counts = db.counts();
 console.log('  分布:', JSON.stringify(counts));
 check('读到了会话', db._map.size > 0, `${db._map.size} 条`);
-check('存在 running 会话', counts.running > 0, `running=${counts.running}`);
+// Was: '存在 running 会话' (counts.running > 0). That assertion was really
+// asking "can we see live activity at all", but it was written before the
+// `waiting` bucket existed and it silently became a dependency on the machine
+// happening to have a session that is started AND owns nothing. A session that
+// is started while dispatching a sub agent is `waiting`, not `running`, so on a
+// busy machine running can legitimately be 0. The mapping itself is still
+// covered exhaustively and hermetically in section 1 above; this line is about
+// the live read, so it now asserts on active work as a whole.
+check(
+  '存在活跃会话（running 或 waiting）',
+  counts.running + counts.waiting > 0,
+  `running=${counts.running} waiting=${counts.waiting}`
+);
 check('bucket 总数守恒', Object.values(counts).reduce((a, b) => a + b, 0) === db._map.size);
 
 const snap = db.snapshot();
