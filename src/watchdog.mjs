@@ -313,15 +313,35 @@ export async function probeOnce(args) {
 
   let port = null;
   let source = null;
+  let filePortDead = false;
   if (args.port) {
     port = args.port;
     source = 'cli';
   } else if (fileRes.port) {
-    port = fileRes.port;
-    source = 'DevToolsActivePort';
-  } else if (cmdRes.port) {
+    // The file is written by Electron at startup, so a port sitting in it is
+    // only a claim, not a fact: if the instance that wrote it has since died,
+    // the file keeps naming a port nobody listens on. Latching onto it forever
+    // is what produced the 500+ consecutive reconnect failures against 9331 on
+    // 2026-10-02 while the live instance was on 9333 the whole time. So the
+    // file port now has to answer before it wins, exactly as the launcher's
+    // Resolve-TargetPort already did.
+    if (await isCdpOk(fileRes.port)) {
+      port = fileRes.port;
+      source = 'DevToolsActivePort';
+    } else {
+      filePortDead = true;
+    }
+  }
+  if (port === null && cmdRes.port) {
     port = cmdRes.port;
     source = 'process-command-line';
+  }
+  // Last resort: the file port is dead AND the command line gave us nothing.
+  // Report it anyway so the APP_UP_NO_CDP branch can name a concrete port for
+  // --fix-app. Same value the pre-fallback code would have used.
+  if (port === null && fileRes.port) {
+    port = fileRes.port;
+    source = 'DevToolsActivePort';
   }
 
   const cdpOk = await isCdpOk(port);
@@ -334,6 +354,7 @@ export async function probeOnce(args) {
     port,
     source,
     cdpOk,
+    filePortDead,
     fileReport: fileRes.report,
     filePort: fileRes.port,
     cmdPort: cmdRes.port || null,
@@ -508,6 +529,23 @@ async function runOnce(args, log, state) {
   const portTag = 'port=' + (p.port || '-') + ' src=' + (p.source || '-') + ' cdpOk=' + p.cdpOk;
   log.info(tag + ' ' + portTag);
   log.info('  端口发现 文件路径=' + describeFileReport(p.fileReport) + ' 进程命令行=' + (p.cmdPort || 'none'));
+  if (p.filePortDead) {
+    // Say it out loud: the port in the file is a dead instance's leftover.
+    // Which of the two follow-ups actually happened depends on what the
+    // process command line had to offer, so the message must not claim a
+    // fallback that did not happen. Logged on TRANSITION only: a stale file
+    // stays stale for the app's whole lifetime, and this probe runs every
+    // interval -- warning every round would write ~34k lines a day saying the
+    // same thing.
+    if (state.lastFilePortDead !== true) {
+      if (p.source === 'process-command-line') {
+        log.warn('  DevToolsActivePort 里的端口 ' + p.filePort + ' 不响应（陈旧文件），已改用进程命令行端口 ' + p.port + '。（后续轮次静默沿用，不再重复报）');
+      } else {
+        log.warn('  DevToolsActivePort 里的端口 ' + p.filePort + ' 不响应（陈旧文件），进程命令行也未给出端口；保留该端口仅用于诊断（APP_UP_NO_CDP）。（后续轮次静默沿用，不再重复报）');
+      }
+    }
+  }
+  state.lastFilePortDead = Boolean(p.filePortDead);
 
   if (p.state === 'APP_ABSENT') {
     state.consecutiveNoCdp = 0;
