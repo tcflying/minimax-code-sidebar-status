@@ -80,6 +80,13 @@ function New-Shortcut {
     $sc.WorkingDirectory = $Root
     $sc.IconLocation = $IconLocation
     $sc.Description = 'MiniMax Code (mmx-status 启动入口，红 M)'
+    # 7 = minimized. -WindowStyle Hidden in the arguments only hides the
+    # console AFTER powershell.exe has created it, so a WindowStyle of 1
+    # (normal) still flashes a black cmd window on every launch (user-visible
+    # 2026-10-02). 7 makes the window START minimized: no flash, no focus steal.
+    # Not 7-to-Invisible (no such value exists); this is the closest Windows
+    # .lnk semantics allow.
+    $sc.WindowStyle = 7
     $sc.Save()
   } finally {
     [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($shell)
