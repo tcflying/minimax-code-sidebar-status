@@ -263,17 +263,39 @@ if (-not $nodeExe) {
   exit 5
 }
 
-# 拉新 daemon 之前先干掉占用同一端口的旧 daemon（见 Stop-StaleDaemon 注释）。
-Stop-StaleDaemon -Port $port
-Invoke-LegacyDispose -NodeExe $nodeExe -Port $port
+# ---------------------------------------------------------------------------
+# Launcher handshake: while the kill->cleanup->start sequence below is running
+# there is a ~10s window with NO daemon, and the watchdog (5s poll) used to
+# heal right into it, racing us to the page (live: 2026-10-03 00:48:59, two
+# daemons, ours died). The file tells the watchdog to stand down for this
+# window; watchdog.mjs ignores it once stale (60s), so a launcher crash
+# between write and delete cannot wedge healing forever.
+$HandshakeFile = Join-Path $LogDir 'launcher-in-progress.json'
+try {
+  # -Encoding ascii, NOT UTF8: PS 5.1's UTF8 writes a BOM, and the watchdog's
+  # JSON.parse must survive the file even so (it strips BOMs), but writing
+  # clean ASCII in the first place keeps both sides honest. Content is pure
+  # ASCII (pid + ISO date).
+  Set-Content -LiteralPath $HandshakeFile -Encoding ascii -Value (
+    '{"pid":' + $PID + ',"at":"' + (Get-Date).ToUniversalTime().ToString('o') + '"}'
+  )
 
-# detached 启动 daemon，本脚本立即退出，不留控制台窗口。
-$daemonLog = Join-Path $LogDir "daemon-$port-$Stamp.log"
-$daemonErr = Join-Path $LogDir "daemon-$port-$Stamp.err"
-Write-Log "拉起 daemon：node $daemonArgs（日志 $daemonLog）"
-# Start-Process 使用 ShellExecute=false 时默认继承当前进程环境；
-# 这里刻意不手工拼 Machine/User 环境变量（踩过 chcp 找不到的坑）。
-$p = Start-Process -FilePath $nodeExe -ArgumentList $daemonArgs -WindowStyle Hidden `
-  -RedirectStandardOutput $daemonLog -RedirectStandardError $daemonErr -PassThru
-Write-Log "daemon pid=$($p.Id)，启动器退出。"
+  # 拉新 daemon 之前先干掉占用同一端口的旧 daemon（见 Stop-StaleDaemon 注释）。
+  Stop-StaleDaemon -Port $port
+  Invoke-LegacyDispose -NodeExe $nodeExe -Port $port
+
+  # detached 启动 daemon，本脚本立即退出，不留控制台窗口。
+  $daemonLog = Join-Path $LogDir "daemon-$port-$Stamp.log"
+  $daemonErr = Join-Path $LogDir "daemon-$port-$Stamp.err"
+  Write-Log "拉起 daemon：node $daemonArgs（日志 $daemonLog）"
+  # Start-Process 使用 ShellExecute=false 时默认继承当前进程环境；
+  # 这里刻意不手工拼 Machine/User 环境变量（踩过 chcp 找不到的坑）。
+  $p = Start-Process -FilePath $nodeExe -ArgumentList $daemonArgs -WindowStyle Hidden `
+    -RedirectStandardOutput $daemonLog -RedirectStandardError $daemonErr -PassThru
+  Write-Log "daemon pid=$($p.Id)，启动器退出。"
+} finally {
+  # Daemon started (or something threw): release the handshake so the watchdog
+  # resumes normal healing on its next probe.
+  Remove-Item -LiteralPath $HandshakeFile -Force -ErrorAction SilentlyContinue
+}
 exit 0

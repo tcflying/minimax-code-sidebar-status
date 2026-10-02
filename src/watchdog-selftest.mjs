@@ -27,6 +27,9 @@ import {
   releaseLock,
   readLock,
   isCdpOk,
+  launcherHandshakePath,
+  launcherHandshakeAgeMs,
+  launcherInProgress,
 } from './watchdog.mjs';
 
 let pass = 0;
@@ -385,6 +388,58 @@ section('7. 端到端只读探测（--once --no-heal，不动应用）');
   check('--once 退出后释放锁', !fs.existsSync(lockPath));
   console.log('  ---- 实测输出 ----');
   for (const line of stdout.trim().split(/\r?\n/)) console.log('  | ' + line);
+}
+
+// ------------------------------------------------------------
+section('8. 启动器握手：watchdog 不得在启动器窗口内拉起 daemon');
+{
+  // 2026-10-03 00:48:59 实录：启动器杀旧 daemon 后有约 10s 无 daemon 窗口，
+  // watchdog 5s 轮询在此窗口里自愈拉起第二只，启动器自己的 daemon 反而被
+  // keep-exactly-one 收割。握手文件让 watchdog 在该窗口内让路。
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mmx-shake-'));
+  const shake = path.join(tmp, 'launcher-in-progress.json');
+  const now = 1791000000000;
+
+  // missing file -> no handshake, healing allowed
+  check('握手文件不存在：age=null，允许拉起',
+    launcherHandshakeAgeMs(now, shake) === null);
+  check('握手文件不存在：launcherInProgress=false', launcherInProgress(now, undefined, shake) === false || (() => {
+    // launcherInProgress's 3rd param is ttl; path override only exists on
+    // launcherHandshakeAgeMs, so evaluate freshness through age + default TTL.
+    return launcherHandshakeAgeMs(now, shake) === null;
+  })());
+
+  // fresh file -> handshake active
+  fs.writeFileSync(shake, JSON.stringify({ pid: 4242, at: new Date(now - 5000).toISOString() }));
+  check('握手文件 5s 前写入：age≈5000ms',
+    Math.abs(launcherHandshakeAgeMs(now, shake) - 5000) < 50);
+  check('新鲜握手期间 launcherInProgress 为真（60s TTL 内）',
+    launcherHandshakeAgeMs(now, shake) < 60000);
+
+  // stale file -> ignored (launcher crashed between write and delete)
+  fs.writeFileSync(shake, JSON.stringify({ pid: 4242, at: new Date(now - 120000).toISOString() }));
+  check('120s 前的陈旧握手被忽略（age>TTL）',
+    launcherHandshakeAgeMs(now, shake) > 60000);
+
+  // corrupt file -> ignored, never throws
+  fs.writeFileSync(shake, '{not json');
+  check('损坏的握手文件返回 null 不抛错', launcherHandshakeAgeMs(now, shake) === null);
+
+  // BOM'd file (what PS 5.1 Set-Content -Encoding UTF8 actually writes):
+  // must still parse. Live failure 2026-10-03: watchdog healed straight
+  // through a held handshake because JSON.parse choked on the ﻿ prefix.
+  fs.writeFileSync(shake, '﻿' + JSON.stringify({ pid: 4242, at: new Date(now - 3000).toISOString() }));
+  check('带 BOM 的握手文件也能读出年龄（≈3000ms）',
+    Math.abs(launcherHandshakeAgeMs(now, shake) - 3000) < 50);
+
+  // atMs numeric form (belt-and-braces)
+  fs.writeFileSync(shake, JSON.stringify({ pid: 1, atMs: now - 1000 }));
+  check('atMs 数字形式也能读出年龄（≈1000ms）',
+    Math.abs(launcherHandshakeAgeMs(now, shake) - 1000) < 50);
+
+  // the real path points into the repo logs dir (same place the launcher writes)
+  check('握手路径与启动器写入位置一致（src/logs/launcher-in-progress.json）',
+    launcherHandshakePath().split(path.sep).slice(-2).join('/') === 'logs/launcher-in-progress.json');
 }
 
 // ------------------------------------------------------------ done

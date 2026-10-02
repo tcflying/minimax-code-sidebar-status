@@ -81,12 +81,13 @@ function New-Shortcut {
     $sc.IconLocation = $IconLocation
     $sc.Description = 'MiniMax Code (mmx-status 启动入口，红 M)'
     # 7 = minimized. -WindowStyle Hidden in the arguments only hides the
-    # console AFTER powershell.exe has created it, so a WindowStyle of 1
-    # (normal) still flashes a black cmd window on every launch (user-visible
-    # 2026-10-02). 7 makes the window START minimized: no flash, no focus steal.
-    # Not 7-to-Invisible (no such value exists); this is the closest Windows
-    # .lnk semantics allow.
-    $sc.WindowStyle = 7
+    # WindowStyle 7 was the 2026-10-02 attempt to stop the black "mmx-fix"
+    # console from flashing; it did NOT work (minimized still shows in the
+    # taskbar and RDP briefly shows the window). The real fix moved the .lnk
+    # to wscript.exe + launch-mmx-status.vbs, which has no console at all.
+    # Style is kept at 1 (irrelevant for wscript) so nobody reads a stale 7
+    # and concludes minimizing was ever the mechanism.
+    $sc.WindowStyle = 1
     $sc.Save()
   } finally {
     [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($shell)
@@ -95,6 +96,19 @@ function New-Shortcut {
 
 $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $launcherArgs = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $Launcher + '"'
+# The .lnk must NOT point at powershell.exe directly, not even with
+# -WindowStyle Hidden in the arguments and WindowStyle=7 on the .lnk itself:
+# powershell.exe still CREATES the console window first and hides it after,
+# so every red-M click flashed a visible black "mmx-fix" console (reported
+# 2026-10-02 with a screenshot; reproduced with a window recorder). wscript.exe
+# has no console at all, and the VBS runs powershell with a hidden window from
+# the very first instruction -- same proven pattern as this machine's
+# ocx-patch-guard fix (2026-10-01).
+$wscriptExe = Join-Path $env:SystemRoot 'System32\wscript.exe'
+$vbsLauncher = Join-Path $Root 'launch-mmx-status.vbs'
+if (-not (Test-Path -LiteralPath $vbsLauncher)) {
+  throw "VBS hidden launcher not found: $vbsLauncher"
+}
 $changes = New-Object System.Collections.Generic.List[string]
 $backups = New-Object System.Collections.Generic.List[string]
 
@@ -128,14 +142,16 @@ if (-not $OnlyAutostart) {
 
   if ($DryRun) {
     Write-Host "[dry-run] 创建/覆盖 $lnk" -ForegroundColor Yellow
-    Write-Host "           Target = $psExe"
-    Write-Host "           Args   = $launcherArgs"
+    Write-Host "           Target = $wscriptExe"
+    Write-Host "           Args   = `"$vbsLauncher`""
     Write-Host "           Icon   = $icon"
   } else {
-    New-Shortcut -Path $lnk -Target $psExe -Arguments $launcherArgs -IconLocation $icon
+    # wscript + VBS: no console exists to flash. WindowStyle is irrelevant
+    # for wscript but kept at 1 (normal) -- the VBS itself hides everything.
+    New-Shortcut -Path $lnk -Target $wscriptExe -Arguments ('"' + $vbsLauncher + '"') -IconLocation $icon
     Write-Host "已创建: $lnk" -ForegroundColor Green
   }
-  $changes.Add("快捷方式 $lnk -> powershell -WindowStyle Hidden -File `"$Launcher`"")
+  $changes.Add("快捷方式 $lnk -> wscript `"$vbsLauncher`"（无控制台，不闪黑窗）")
 }
 
 # ---- 3. 开机自启 ----

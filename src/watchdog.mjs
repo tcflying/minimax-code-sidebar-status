@@ -451,6 +451,51 @@ export function readLock(lockPath) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Launcher handshake. launch-mmx-status.ps1 kills the old daemon, runs
+// cleanup.mjs (up to 8s), then starts the new one -- a window of ~10s in which
+// NO daemon exists. The watchdog polls every 5s and used to heal right into
+// that window, spawning its own daemon; the launcher's daemon then lost the
+// race for the page and got reaped by the watchdog's keep-exactly-one pass
+// (live evidence 2026-10-03 00:48:59: watchdog pid=49600 spawned 50564 while
+// the launcher was mid-flight, launcher's 41020 died quietly). So while the
+// handshake file is FRESH the watchdog must NOT heal -- the launcher is
+// already bringing a daemon up. Staleness bounds the damage of a launcher
+// that crashed between writing and deleting the file.
+// ---------------------------------------------------------------------------
+const LAUNCHER_HANDSHAKE_TTL_MS = 60 * 1000;
+export function launcherHandshakePath() {
+  return path.join(HERE, 'logs', 'launcher-in-progress.json');
+}
+// Age of the handshake in ms, or null when there is no (readable) one.
+export function launcherHandshakeAgeMs(nowMs = Date.now(), handshakePath = launcherHandshakePath()) {
+  let text;
+  try {
+    text = fs.readFileSync(handshakePath, 'utf8');
+  } catch {
+    return null;
+  }
+  // The launcher is PowerShell 5.1, whose `Set-Content -Encoding UTF8` writes
+  // a UTF-8 BOM. JSON.parse chokes on the leading \ufeff and the handshake
+  // would read as absent -- exactly the failure the live test caught on
+  // 2026-10-03 (watchdog healed straight through a held handshake). Strip any
+  // BOM before parsing, whoever wrote the file.
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  const at = data && (data.atMs || Date.parse(data.at || ''));
+  if (!Number.isFinite(at)) return null;
+  return nowMs - at;
+}
+export function launcherInProgress(nowMs = Date.now(), ttlMs = LAUNCHER_HANDSHAKE_TTL_MS) {
+  const age = launcherHandshakeAgeMs(nowMs);
+  return age !== null && age >= 0 && age < ttlMs;
+}
+
 // Atomic create; if a live owner holds it, return { acquired:false } and the
 // caller exits quietly. A stale lock (dead PID) is taken over.
 export function acquireLock(lockPath, selfPid = process.pid) {
@@ -632,6 +677,30 @@ async function runOnce(args, log, state) {
       state.failures = 0;
     }
     state.daemonPids = pids;
+    state.daemonMisses = 0;
+    return p;
+  }
+  // Launcher handshake first: a fresh file means launch-mmx-status.ps1 is in
+  // its kill->cleanup->start window RIGHT NOW and will bring a daemon up
+  // itself. Healing here is how the double-daemon race happened (see
+  // launcherHandshakeAgeMs for the live trace). Logged on transition only --
+  // the launcher window spans one or two probes.
+  if (launcherInProgress()) {
+    if (!state.handshakeSeen) {
+      const age = Math.round((launcherHandshakeAgeMs() || 0) / 1000);
+      log.info('  启动器进行中（握手文件 ' + age + 's 前写入），本轮不拉起 daemon，让启动器完成它自己的启动。');
+    }
+    state.handshakeSeen = true;
+    state.daemonMisses = 0;
+    return p;
+  }
+  state.handshakeSeen = false;
+  // Two-probe confirmation. findDaemonPids shells out to tasklist; one
+  // transient failure must not heal into a running launcher or a daemon that
+  // simply has not shown up in the list yet.
+  state.daemonMisses = (state.daemonMisses || 0) + 1;
+  if (state.daemonMisses < 2) {
+    log.info('  daemon 未运行（第 ' + state.daemonMisses + '/2 次确认，连续两次才拉起）。');
     return p;
   }
   const now = Date.now();
