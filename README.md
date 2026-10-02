@@ -18,6 +18,7 @@
 | running 一眼可见 | ❌ 无 | ✅ 四重信号：发光竖条 + 整行淡绿底 + 绿标题 + 呼吸动画 |
 | 一眼看到"有几个在跑" | ❌ 无 | ✅ 顶部「N 个运行中」汇总条 |
 | 等子 agent 的会话也看得见 | ❌ 无 | ✅ 新增 `waiting` 黄色桶，本行同样置顶（见 15.6） |
+| **云端会话也有状态点** | ❌ 云端行 id 不在本地库，永无状态 | ✅ 订阅宿主事件总线累积状态，**倒序重放防复活**（见 15.7） |
 | running 行自动置顶 | ❌ 无 | ✅ **搬 DOM 排序，不改宿主样式**（默认开启，`--no-reorder` 可关，见 15.5） |
 | 侧边栏按状态筛选 | ⚠️ 内置筛选器**不覆盖置顶区** | ✅ 两个区域都覆盖 |
 | 选中行底色加深 | ⚠️ 应用默认 `rgba(10,10,10,0.04)`，很淡 | ✅ 覆盖为 10% + 蓝色左条，可调 |
@@ -480,6 +481,8 @@ requestAnimationFrame(function () {
 
 **不设任何例外**——包括"用户主动点箭头"也压回去。想要应用原本行为用 `--no-collapse`。
 
+（rAF 这条路径在一处场景下仍慢一帧——本地↔云端视图切换，见 8.4 的第二只 observer。）
+
 ### 8.3 因果对照（决定性证据）
 
 同一处真实鼠标点击，**只变守卫开关**：
@@ -488,6 +491,34 @@ requestAnimationFrame(function () {
 [守卫关闭] +300ms=EXPANDED(h120) +900ms=EXPANDED(h120) +2000ms=EXPANDED(h120) => 展开
 [守卫开启] +300ms=collapsed(h30)  +900ms=collapsed(h30)  +2000ms=collapsed(h30)  => 折叠
 ```
+
+### 8.4 视图切换的展开闪烁归零（attribute observer，2026-10-02）
+
+用户报：**切到云端再切回本地，置顶区"最下面多出来一片、又折叠回去"**。逐帧测量还原了全程：
+
+- 宿主切回本地时把置顶行连同**已展开的 caret** 一起 commit，展开布局
+  （392px）画出 **2 帧**后才被 rAF 守卫折回 270px——那 2 帧就是用户看到的闪烁。
+- rAF 路径物理上慢一帧：`MutationObserver(childList) → rAF` 只能在宿主
+  commit 的**下一帧**响应。
+
+三版修法里两版被真机数据否决，教训值得留下：
+
+| 方案 | 真机结果 | 判决 |
+|---|---|---|
+| 按行记 350/600ms 再折抑制窗 | 宿主两波展开 dt=348/823ms，窗口没盖住或让第二波拖到 1551ms | ❌ 净伤害 |
+| 行数变动后 1.2s 静默再收尾（"风暴门门"） | 对抗 2→1，但展开态持续 2 秒（展开帧 2→99+） | ❌ 更差 |
+| **attribute observer 同帧折叠** | 三轮展开帧全部归零 | ✅ |
+
+终版原理：展开标记是 caret 图标 `-rotate-90` **class 的移除**——是 attribute
+变化，原来的 childList observer 根本看不见。新增一只只盯
+`attributes: ['class']` 的 `MutationObserver`，它的回调是**微任务、在本帧
+paint 之前执行**，回调内同步 `clickCaret` 折叠——展开布局从未到达屏幕。
+
+语义全部真机复验不回退：「更多」列表展开不被压（35 行稳定 2.9s+）；
+手动点箭头仍被压回（策略不变，只是从下一帧升级为同帧）；组级「置顶」
+折叠开关不在守卫目标选择器内。回归锁在 `test-cloud-bucket.mjs` 第 9 节
+（4 条：observer 存在 / 只认 transition-transform / dispose 断开 / 时间窗
+方案不得回潮）。
 
 ---
 
@@ -782,23 +813,33 @@ log.warn('  重启 ' + exe + ' --remote-debugging-port=' + port);
 ### 10.2 首次使用
 
 **日常入口是桌面上那个自绘的红色 M 图标 `mmx-fix.lnk`**，不是任何 `.ps1` 脚本。
-先把仓库拉下来，然后确认红 M 指向的是**这一个 git 仓库**（见 9.6，两份副本会全盘失效）：
+先把仓库拉下来，跑安装器，它会创建红 M 并装好开机自启：
 
 ```powershell
 git clone https://github.com/tcflying/minimax-code-sidebar-status.git
 cd minimax-code-sidebar-status
+pwsh -NoProfile -File .\src\install-launcher.ps1 -DryRun   # 先看要改什么
+pwsh -NoProfile -File .\src\install-launcher.ps1           # 真跑
+```
 
-# 确认红 M 指向的是当前这个仓库，而不是别处的副本
+安装器只做两件事：**创建 `mmx-fix.lnk`**（指向 `wscript.exe` + 
+`src\launch-mmx-status.vbs`，无控制台、点开零黑窗，见 14.8）和**写入
+`HKCU\...\Run\mmxStatusWatchdog`** 开机自启（写后回读校验）。
+官方桌面/开始菜单的 `MiniMax Code.lnk` 一个字节都不动（原因见 14.1/14.2）。
+
+装完可以验证红 M 的指向（`Arguments` 里必须是**本仓库**的 `.vbs`，
+旧副本路径 = 全盘失效）：
+
+```powershell
 $sh = New-Object -ComObject WScript.Shell
 $sh.CreateShortcut("$env:USERPROFILE\Desktop\mmx-fix.lnk") |
   Select-Object TargetPath, Arguments, WorkingDirectory
+# 期望：TargetPath = ...\wscript.exe
+#       Arguments  = "...\minimax-code-sidebar-status\src\launch-mmx-status.vbs"
 ```
 
-`Arguments` 里必须出现 `...\minimax-code-sidebar-status\src\launch-mmx-status.ps1`。
-不对就按 9.6 的"修复：让 git 仓库成为唯一真源"手工改一次——**这一步是全套里唯一必须手工的**，
-因为仓库里**没有**创建 `mmx-fix.lnk` 的安装脚本（`install-launcher.ps1` 改的是**官方**那两个
-`.lnk`，与 14.2「不改官方 `.lnk`」相冲突，别拿它当红 M 的安装器用）。
-图标本身用 `.\src\make-mmx-icon.ps1` 生成。
+图标用仓库自带的 `assets\mmx-fix.ico`（安装器自动选）；要重画跑
+`.\src\make-mmx-icon.ps1`。
 
 装好之后**日常就双击红 M**，不再碰任何脚本。
 
@@ -950,9 +991,10 @@ node daemon.mjs --active-bg 'rgba(255,255,255,0.10)'
 `MODULE_NOT_FOUND`，因为根目录没有这些 `.mjs`）：
 
 ```
-node .\src\selftest.mjs                      110 项 · 不需要 CDP
-node .\src\watchdog-selftest.mjs             74 项 · 不需要 CDP
-node .\src\test-autofix-gates.mjs            32 项 · 不需要 CDP
+node .\src\selftest.mjs                      116 项 · 不需要 CDP
+node .\src\test-cloud-bucket.mjs             119 项 · 不需要 CDP
+node .\src\watchdog-selftest.mjs              83 项 · 不需要 CDP
+node .\src\test-autofix-gates.mjs             32 项 · 不需要 CDP
 node .\src\test-reorder-defaults.mjs          40 项 · 不需要 CDP
 node .\src\test-waiting-bucket.mjs            49 项 · 不需要 CDP
 pwsh -NoProfile -File .\src\test-process-filters.ps1   28 项 · 需要应用在跑（但**不需要 CDP**）
@@ -960,7 +1002,7 @@ node .\src\e2e.mjs --port 9331               19 项 · 需要已开 CDP 的实�
 pwsh -NoProfile -File .\src\test-launcher.ps1        20 项 · 自建一次性实例
 ```
 
-> 上面 6 个**不需要 CDP** 的套件可以随时跑。唯一的环境前提是
+> 上面 7 个**不需要 CDP** 的套件可以随时跑。唯一的环境前提是
 > `test-process-filters.ps1`——它的 A2/A3/A4/B1 断言要数**真实**进程，
 > 所以**应用得开着**（但不需要 CDP 端口）。
 > 最后两个会**连真实实例**
@@ -969,8 +1011,9 @@ pwsh -NoProfile -File .\src\test-launcher.ps1        20 项 · 自建一次性�
 
 | 套件 | 覆盖 |
 |---|---|
-| `selftest` | 桶映射规则（含 waiting overlay 优先级，见 5.4）/ 真实库只读 / 注入表达式语法 / **无破坏性 DOM 调用** / dispose 回归 / 反引号守卫 |
-| `watchdog-selftest` | 双路端口发现 / 单实例锁 / 僵尸回收 / 退避节奏 |
+| `selftest` | 桶映射规则（含 waiting overlay 优先级，见 5.4）/ 真实库只读 / 注入表达式语法 / **无破坏性 DOM 调用** / dispose 回归 / 反引号守卫 / **daemon 僵尸上限**（6b：240 次重连失败必须自退）/ 环境 probe 改 skip 语义 |
+| `test-cloud-bucket` | **云端会话状态点全套**：bucket 映射 / 键空间隔离（mvs_ vs 纯数字）/ 前插窗口重放（2026-10-02 倒序重放回归锁 8 条）/ 滚动窗口不受 store 200 条影响 / 泄漏上限计数 / 8.4 的 attribute observer 回归锁 4 条 / 模板串反引号计数=10 守卫 |
+| `watchdog-selftest` | 双路端口发现（含陈旧 DevToolsActivePort 探活回退）/ 单实例锁 / 僵尸回收 / 退避节奏 / **启动器握手**（fresh/stale/缺失/损坏/带 BOM 共 8 条） |
 | `test-autofix-gates` | `--fix-app` 三道闸门，**每道都配正例 + 反例** |
 | `test-reorder-defaults` | reorder 默认值为 **true** / `--no-reorder` 逃生舱 / 启动器参数构造（dry-run 打印的和真跑的是同一个数组）/ **杀旧 daemon 的筛选**（含"启动器源码里没有任何针对 MiniMax Code / Electron 的 taskkill 或按名批量杀"这条静态断言） |
 | `test-waiting-bucket` | 6 组：`isWaiting` 纯判定 / overlay 规则（**全用合成数据**，不依赖真实库状态，因此任何机器上结果都一样）/ `bucketFor` 没被污染 / 真实库只读时 overlay 接得上 / **`kind='subagent'` 过滤是回归锁**（直接断言 SQL 文本含 `kind = 'subagent'`、断言**没有**用 `updated_at_ms`、断言**没有** TTL）/ 页面侧样式与置顶（含「waiting 未复用 orange」） |
@@ -1100,7 +1143,7 @@ setInterval(() => {
 
 | 入口 | 指向 | 用途 |
 |---|---|---|
-| `mmx-fix.lnk`（红色 M 图标） | `launch-mmx-status.ps1` | ✅ **唯一正确入口**，官方更新不会覆盖 |
+| `mmx-fix.lnk`（红色 M 图标） | `wscript.exe` + `launch-mmx-status.vbs` | ✅ **唯一正确入口**，官方更新不会覆盖，零黑窗（见 14.8） |
 | `MiniMax Code.lnk` | 应用 exe，无参数 | 官方直连（保持原样，不动） |
 | 开始菜单 `MiniMax Code.lnk` | 应用 exe，无参数 | 官方直连（保持原样，不动） |
 
@@ -1114,8 +1157,10 @@ setInterval(() => {
                                        └─ 注入掉了？──► 重新 bootstrap
 ```
 
-- **快捷方式改写**：新建 `mmx-fix.lnk` 指向 `launch-mmx-status.ps1`
-  （`-WindowStyle Hidden` 无窗口），配自绘红色 M 图标。**不改官方那两个 `.lnk`**
+- **快捷方式改写**：新建 `mmx-fix.lnk` 指向 `wscript.exe` +
+  `launch-mmx-status.vbs`（2026-10-03 起从直接指 ps1 升级，原因见 14.8：
+  powershell.exe 会先建控制台再隐藏，红 M 每次点开都闪黑窗），配自绘红色 M
+  图标。**不改官方那两个 `.lnk`**
   —— `install-launcher.ps1` 现在**只创建 `mmx-fix.lnk`**，
   官方桌面/开始菜单的 `MiniMax Code.lnk` 保持原样、一个字节都不动
   （见下方"为什么必须改这个脚本"）
@@ -1250,6 +1295,39 @@ node .\tests\watchdog-heal-e2e.mjs 9331        # 杀掉守护，验证 watchdog 
 模板串里，**注释里出现一个反引号就会把整个模块变成 SyntaxError**，daemon
 死在 import 阶段且日志一个字都不留（`daemon-*.log` 0 字节 = 首先怀疑这里）。
 `test-cloud-bucket.mjs` 第 10 节已把"全文件反引号计数 = 10"锁成回归项。
+
+### 14.8 2026-10-03：红 M 黑窗根治（VBS）+ 启动器/watchdog 竞态握手
+
+**黑窗**。用户报"双击红 M 会弹一个常驻黑窗，里面有日志"（附截图）。窗口
+记录器抓到真身：标题为 `mmx-fix` 的 powershell 控制台。根因是
+`powershell.exe` 的启动顺序——**先把控制台窗口建出来（可见），再执行
+`-WindowStyle Hidden` 参数把它藏掉**；`.lnk` 的 WindowStyle=7（最小化）也只是
+把"可见"降级成"任务栏里闪"，远程桌面下仍然看得见。
+
+根治：`launch-mmx-status.vbs` + `.lnk` 改指 `wscript.exe`（GUI 子系统，
+**根本没有控制台可建**），VBS 里 `Shell.Run ..., 0, False` 从第一条指令起
+就是隐藏的。实测点红 M 12 秒内新窗口数 0。`install-launcher.ps1` 同步，
+重装不回退。与 2026-10-01 ocx-patch-guard 的修法同款（本机验证过的模式）。
+
+**竞态**（追黑窗时顺藤摸出，2026-10-03 00:48:59 实录）。启动器
+`杀旧 daemon → cleanup.mjs（至多 8s）→ 起新 daemon` 的窗口里没有 daemon；
+watchdog 5 秒一探，立刻自愈拉起**第二只**；启动器自己的那只反被 watchdog
+的 keep-exactly-one 逻辑收割——日志里"daemon pid=41020"之后戛然而止就是它。
+
+修法分三层，全部真机双向验证：
+
+1. **握手**：启动器全程持 `logs/launcher-in-progress.json`（try/finally 保证
+   删除）；watchdog 见新鲜握手（60s TTL，防启动器中途崩溃永久卡死自愈）
+   本轮不拉起，日志明说"让启动器完成它自己的启动"。
+2. **两轮确认**：watchdog 需连续 2 轮探测无 daemon 才自愈——`findDaemonPids`
+   是 shell 出去数进程，一次瞬时失败不该触发拉起。
+3. **BOM**：PS 5.1 的 `Set-Content -Encoding UTF8` 写 BOM，Node 的
+   `JSON.parse` 吃到 `\ufeff` 直接抛错、握手恒判"不存在"（真机让路测试首战
+   失败的真凶）。watchdog 读时剥 BOM（防御任意写入方），启动器改写 ascii。
+
+真机验证记录：手持握手杀 daemon → watchdog 明确让路；释放握手 → 第 1/2 次
+确认 → 第 2/2 次确认 → 自愈拉起 → 注入恢复（tick 正常）。这同时补上了
+watchdog 自愈路径的首次端到端真机验证。
 
 ---
 
@@ -1615,6 +1693,39 @@ local_runtime_background_tasks → 有没有 status='running' 的子 agent 任�
 这是刻意的：画一个侧边栏上根本不存在、也点不进去的行没有意义。
 但它意味着"waiting 的行数"可能少于"判据命中的会话数"，排查时别把这当成 bug。
 
+### 15.7 云端会话：Cloud 视图的状态点（2026-10-02）
+
+侧边栏有 本地/云端 分段开关。**云端视图里行的 `data-session-id` 是纯数字**
+（实测 2026-10-02：`447993841729699`），不存在于 `local_runtime_sessions`，
+所以 `cfg.status` 永远查不到它们——云端行原本**永远没有状态点**。
+
+数据真源是宿主自己的事件总线 store：`window.__MAVIS_EVENT_BUS_STORE__`
+（zustand）。但它有两个坑，决定了实现形态：
+
+1. **`getState().events` 是 200 条滚动窗口**（实测 200 = 11 cloud + 189 local）。
+   启动时读一遍毫无用处——几分钟前开始的云端会话早已被挤出窗口。所以必须
+   **订阅**，累积进自己拥有的 Map；Map 只存仍活跃的 id，丢旧窗口条目不丢状态。
+2. **宿主 `addEvent` 是前插**（app.asar 实测：
+   `events: [{...t, conversationSource: i}, ...e.events].slice(0, 200)`），
+   `events[0]` 是最新。**重放必须倒序**——正序会把已 finish 的会话用更旧的
+   `session.start` 复活成 running（绿点永不消失、汇总条虚高，要约 198 条
+   本地事件才自愈）。首版测试全绿却线上必错，根因是**假 store 用了 push
+   （后插）**，与宿主前插正好相反——测试的 store 必须复刻宿主形状，
+   否则断言毫无意义。已在真机验证：已完成会话的 finish 在窗口头部、
+   两条旧 start 紧随其后，`tracked=0`。
+
+状态映射刻意**不引入本地没有的桶**：`session.start → running`、
+`session.error → error`、`finish/abort → 从 Map 删除`（不画点，与本地
+aborted 的默认行为一致）、其余（created/title_updated/pinned_updated）
+一律忽略。键空间隔离有两道真实依据：本地 id 全部 `mvs_` 前缀（观测事实，
+**不是** SQL 保证——主查询只有 `WHERE s.archived = 0`）；云端 id 必须
+过 `/^[0-9]+$/` 才入 Map。64 并发上限的溢出**计数可观测**
+（`cloudEvicted`，daemon 日志可见），绝不静默丢。
+
+降级静默且完全：老版本宿主或沙箱渲染进程没有这个 store → 整段功能
+不生效，本地路径原样工作。全套回归在 `test-cloud-bucket.mjs`
+（119 项，含倒序重放 8 条回归锁）。
+
 ---
 
 ## 16. 沙箱工作流：绝不拿用户正在用的实例做实验
@@ -1730,16 +1841,18 @@ minimax-code-sidebar-status/
     ├── daemon.mjs               守护主程序（重连 / 重注入 / 致命兜底）
     ├── watchdog.mjs             常驻看门狗（双路端口发现 + 单实例锁 + 三闸门；⚠️ 能 kill/重启应用，见 9.6.2）
     │
-    │  ── 测试（6 个不需要 CDP，随时可跑）──
-    ├── selftest.mjs             110 项自测
-    ├── watchdog-selftest.mjs    74 项自测
+    │  ── 测试（7 个不需要 CDP，随时可跑）──
+    ├── selftest.mjs             116 项自测（含 daemon 僵尸上限 6b）
+    ├── test-cloud-bucket.mjs    119 项：云端状态点全套 + 倒序重放回归锁 + attribute observer 锁（见 15.7 / 8.4）
+    ├── watchdog-selftest.mjs    83 项自测（含启动器握手 8 条）
     ├── test-autofix-gates.mjs   --fix-app 三闸门测试（32 项，每闸门正例+反例）
     ├── test-reorder-defaults.mjs reorder 默认值 / 逃生舱 / 启动器参数构造 / 杀旧 daemon 筛选（40 项）
     ├── test-waiting-bucket.mjs  waiting 判据 / overlay 优先级锁 / kind 过滤回归锁 / 页面侧样式与置顶（49 项，见 15.6）
     ├── test-process-filters.ps1 进程过滤器回归（D 组 Test-IsStaleDaemonProcess + 端口参数形态，见 9.5）
     │
     │  ── 启动 / 安装 ──
-    ├── launch-mmx-status.ps1    无窗口启动器（**红 M 调的就是它**，无 Read-Host，做完即退）
+    ├── launch-mmx-status.vbs    无控制台入口（红 M 的直接目标：wscript 调它，它再隐藏调 ps1，零黑窗，见 14.8）
+    ├── launch-mmx-status.ps1    无窗口启动器（VBS 调的就是它，无 Read-Host，做完即退）
     ├── start-mmx-status.ps1     原始前台交互启动器（有 Read-Host，终端/排查用，不是日常入口）
     ├── stop-mmx-status.ps1      清注入 + 停守护（**不关应用**）
     ├── install-launcher.ps1     **只创建 mmx-fix.lnk**（不碰官方 .lnk）+ 加 Run\mmxStatusWatchdog 自启（见 14.2）
@@ -1808,6 +1921,17 @@ minimax-code-sidebar-status/
 | 侧边栏 CPU 飙高、界面卡死 | 改宿主布局导致重排死循环（见 15.5） | renderer `CPU` 持续上涨，`Runtime.evaluate` 30s 超时 | 只能重启应用；2026-10-02 起置顶默认开启，`--no-reorder` / `-NoReorder` 就是为这个症状准备的逃生舱 |
 | e2e 报「还原后 10 秒不复活」失败 | **daemon 正在运行**，每 2.5s 会把点重新画回来 | `Get-CimInstance ... -like '*mmx-status*daemon*'` | 跑 e2e 前先确认没有 daemon |
 | `.ps1` 双击报错、pwsh 里却正常 | UTF-8 无 BOM + 中文，PS 5.1 按 GBK 解码崩溃 | 用 `powershell.exe`（5.1）解析会报错，pwsh 7 不报 | `.\src\fix-ps1-encoding.ps1 -Dir .\src` |
+
+### 18.0 症状 → 章节 速查（2026-10-03 更新）
+
+| 症状 | 去哪 |
+|---|---|
+| 点红 M 弹黑窗 | 14.8（VBS 根治；若仍出现，检查 .lnk 是否还指 powershell.exe） |
+| 侧边栏完全没有状态点 | 14 章自愈链路；`logs\daemon-*.log` 0 字节 = import 阶段死了，先查 page-script 语法（14.7） |
+| 置顶的会话切换云端/本地时闪一下又折叠 | 8.4（attribute observer，已归零；若复现抓 `scrollHeight` 逐帧证据） |
+| 已完成的云端会话一直绿点不消失 | 15.7 倒序重放（test-cloud-bucket 第 4c 节是回归锁） |
+| daemon 越积越多 / 空转不停 | daemon 240 次上限自退 + watchdog 握手（14.7 / 14.8） |
+| 双 daemon 打架 | 14.8 竞态握手；`logs\watchdog.log` 里应有"让启动器完成"字样 |
 
 ### 18.1 最常用的一条命令
 
