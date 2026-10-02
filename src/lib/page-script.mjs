@@ -293,6 +293,15 @@ function __mmxStatusMain(cfg) {
     // Count only what the user can actually see right now, not the database
     // total: a running session scrolled out of the virtualised list is not
     // something they can act on by looking.
+    //
+    // runningOnScreen ALREADY includes cloud rows. apply() increments it for
+    // every running bucket regardless of which source produced it, because a
+    // cloud running row is painted with the exact same green bar and green
+    // tint as a local one. So the bar keeps its two segments: the "running"
+    // number is local + cloud, and the empty predicate below therefore hides
+    // the bar only when local AND cloud are both zero. Passing a third
+    // argument here and summing it separately was rejected: it would show the
+    // user two numbers for one state.
     var n = runningOnScreen || 0;
     var w = waitingOnScreen || 0;
     var b = bar.querySelector('b');
@@ -455,12 +464,158 @@ function __mmxStatusMain(cfg) {
     return { moved: moved, roots: roots.length, runningLists: plans.length };
   }
 
+  // ---- cloud session accumulator -----------------------------------------
+  // The sidebar has a Local / Cloud switch. In the CLOUD view the
+  // data-session-id values are bare digits (measured 2026-10-02:
+  // 447993841729699) and do not exist in local_runtime_sessions, so
+  // cfg.status has no entry for them and no dot was ever painted there.
+  //
+  // Source of truth is the host's own event bus store,
+  // window.__MAVIS_EVENT_BUS_STORE__ (zustand; getState() exposes events,
+  // unreadCount, panelOpen, connections, connected, reconnectGeneration).
+  //
+  // CRITICAL: getState().events is a ROLLING window capped at 200 entries
+  // (measured: 200 = 11 cloud + 189 local). Reading that array once at
+  // mount is useless, because a cloud session that started minutes ago is
+  // already evicted and we would never learn about it. So we SUBSCRIBE and
+  // accumulate into a Map we own. The Map only holds ids we still believe
+  // are active, which is why losing old window entries cannot lose state.
+  //
+  // Degradation is silent and total: an older host build or a sandboxed
+  // renderer simply has no store, and then this whole section contributes
+  // nothing while the local path keeps working untouched.
+  var CLOUD_STORE = '__MAVIS_EVENT_BUS_STORE__';
+  // Leak guard, same spirit as the reorder ceilings below. The Map only grows
+  // on session.start and only shrinks on finish/abort, so a dropped terminal
+  // event would leave one entry behind forever. Cap it and drop the oldest
+  // insertions first; 64 is far above the concurrent cloud sessions the user
+  // can plausibly have open.
+  //
+  // Above 64 CONCURRENT cloud sessions that ceiling really does drop a live
+  // session, which then stops getting a dot until its next event. That is an
+  // honest consequence of the cap, so every drop is counted rather than
+  // swallowed: a silent drop would only ever surface as "some row lost its
+  // dot", which is unsearchable. Read cloudEvicted through api.cloudState()
+  // and apply()'s stats.
+  var CLOUD_MAX_TRACKED = 64;
+  var cloudEvicted = 0;
+  var cloudState = new Map();
+  var unsubCloud = null;
+
+  // Cloud has exactly four states (source enum Idle:0 Started:1 Error:2
+  // Abort:3) and no paused and no waiting-on-a-child concept, so it maps
+  // onto buckets the local side ALREADY has. It deliberately introduces no
+  // new bucket:
+  //   session.start        -> running (green bar, same shape as local)
+  //   session.error        -> error   (red)
+  //   session.finish/abort -> removed from the Map, i.e. NO dot. Local does
+  //     the same for aborted: it only paints paused under includeAborted
+  //     (--show-aborted), which the daemon does not set by default. A dotted
+  //     finished cloud row would be a state the local path cannot produce.
+  //   anything else        -> ignored (created / title_updated /
+  //     pinned_updated carry no status meaning)
+  function cloudBucketFor(type) {
+    if (type === 'session.start') return 'running';
+    if (type === 'session.error') return 'error';
+    if (type === 'session.finish' || type === 'session.abort') return null;
+    return undefined;
+  }
+
+  function onCloudEvent(e) {
+    if (disposed) return;
+    try {
+      if (!e || e.conversationSource !== 'cloud') return;
+      var raw = e.payload && e.payload.sessionId;
+      if (raw === null || raw === undefined) return;
+      var id = String(raw);
+      // Digits only. This doubles as the local/cloud key-space guard, so a
+      // local id could never be mistaken for a cloud one here.
+      if (!/^[0-9]+$/.test(id)) return;
+      var b = cloudBucketFor(e.type);
+      if (b === undefined) return;
+      if (b === null) {
+        cloudState.delete(id);
+        return;
+      }
+      cloudState.set(id, b);
+      while (cloudState.size > CLOUD_MAX_TRACKED) {
+        cloudState.delete(cloudState.keys().next().value);
+        cloudEvicted++;
+      }
+    } catch (err) { /* never break the host app */ }
+  }
+
+  // Tolerates both shapes: an array of events, or a whole store state whose
+  // .events holds them.
+  //
+  // The second form is the one that actually fires. zustand subscribe() calls
+  // its listener with (state, prevState), NOT with an individual event, so
+  // subscribing onCloudEvent directly would hand it the state object, fail the
+  // conversationSource test, and accumulate nothing at all. This is the entry
+  // point that must be passed to subscribe().
+  function ingestCloudState(state) {
+    if (!state) return 0;
+    var list = null;
+    if (Object.prototype.toString.call(state) === '[object Array]') list = state;
+    else if (state.events) list = state.events;
+    if (!list || typeof list.length !== 'number') return 0;
+    // OLDEST FIRST -- the replay has to run BACKWARDS on purpose.
+    //
+    // The host store PREPENDS. Measured 2026-10-02 from the store factory
+    // inside the real app.asar, addEvent is:
+    //   events: [{ ...t, conversationSource: s }, ...prev.events].slice(0, 200)
+    // so index 0 is the NEWEST event and the tail is the oldest.
+    //
+    // Replaying that array forwards applies the OLDEST event LAST. For one
+    // session that means its session.start (old, sitting in the tail) runs
+    // after its own session.finish (new, at the head) and writes the row back
+    // as running. Real symptom: a cloud session that has already finished
+    // keeps a green running bar and stays counted in the summary bar's
+    // "运行中" total until roughly 198 later local events push the stale
+    // start out of the 200-entry window. Same shape for start -> error: the
+    // stale start downgrades a red row back to green.
+    //
+    // Reverse order makes the accumulator replay in real chronological order,
+    // so last-writer-wins is the host's actual newest event.
+    for (var i = list.length - 1; i >= 0; i--) onCloudEvent(list[i]);
+    return list.length;
+  }
+
+  function subscribeCloud() {
+    try {
+      var store = window[CLOUD_STORE];
+      if (!store || typeof store.subscribe !== 'function') {
+        return { subscribed: false, tracked: 0, reason: 'no-event-bus-store' };
+      }
+      // Replay the window that is still alive at mount so a bootstrap right
+      // after a page reload does not report "nothing running" for one pass.
+      // This is a bonus, not the mechanism: the subscription below is what
+      // makes the Map survive the window rolling.
+      if (typeof store.getState === 'function') ingestCloudState(store.getState());
+      // ingestCloudState, NOT onCloudEvent: see the note above. The listener
+      // receives the whole store state.
+      unsubCloud = store.subscribe(ingestCloudState);
+      return { subscribed: true, tracked: cloudState.size, reason: '' };
+    } catch (err) {
+      return { subscribed: false, tracked: cloudState.size, reason: 'subscribe-threw' };
+    }
+  }
+
+  function disposeCloud() {
+    disposed = true;
+    if (unsubCloud) {
+      try { unsubCloud(); } catch (e) {}
+      unsubCloud = null;
+    }
+    cloudState.clear();
+  }
+
   function apply() {
     if (disposed) return { rows: 0, painted: 0, matched: 0, removed: 0, skipped: 'disposed' };
     var map = cfg.status || {};
     var scope = cfg.scope ? document.querySelectorAll(cfg.scope) : null;
     var rows = document.querySelectorAll('[data-session-id]');
-    var stats = { rows: 0, painted: 0, matched: 0, removed: 0, unknownIds: 0, runningOnScreen: 0, waitingOnScreen: 0, reorder: null };
+    var stats = { rows: 0, painted: 0, matched: 0, removed: 0, unknownIds: 0, runningOnScreen: 0, waitingOnScreen: 0, cloudOnScreen: 0, cloudTracked: cloudState.size, cloudEvicted: cloudEvicted, reorder: null };
 
     for (var i = 0; i < rows.length; i++) {
       var row = rows[i];
@@ -470,6 +625,28 @@ function __mmxStatusMain(cfg) {
       stats.rows++;
 
       var bucket = map[id];
+      // The two key spaces do not overlap in practice, so the lookup order is
+      // not load-bearing. What actually keeps them apart is two things, and
+      // neither of them is this page script:
+      //   1. cfg.status comes out of local_runtime_sessions, which only ever
+      //      holds local sessions. Every id read from it has been observed to
+      //      start with mvs_ (e.g. mvs_6ef1e2238f1247148f52a2b8fa149633), but
+      //      that is an observation about the data, NOT a query guarantee:
+      //      the main statement in status-db.mjs filters on
+      //      WHERE s.archived = 0 only and has no
+      //      WHERE session_id LIKE 'mvs_%' clause.
+      //   2. A cloud id only enters the Map through the /^[0-9]+$/ test in
+      //      onCloudEvent, and every cloud id measured is a bare digit
+      //      (447993841729699). A local id therefore cannot be mistaken for a
+      //      cloud one no matter what the table grows.
+      // Local still stays authoritative on the lookup order, because
+      // cfg.status is the source that is continuously re-polled while the
+      // cloud Map is a fallback.
+      var fromCloud = false;
+      if (!bucket) {
+        var cb = cloudState.get(id);
+        if (cb) { bucket = cb; fromCloud = true; }
+      }
       // The "done" bucket is opt-in: hundreds of grey dots drown the three
       // states that actually matter (green running / yellow paused / red error).
       if (bucket === 'done' && !cfg.showDone) bucket = undefined;
@@ -490,8 +667,13 @@ function __mmxStatusMain(cfg) {
         dot.setAttribute('data-mmx-bucket', bucket);
         stats.painted++;
       }
+      // Cloud running is counted into the SAME running total as local
+      // running, because it is the same visual signal (green bar, green row
+      // tint). Splitting them into two segments in the summary bar would
+      // show the user two numbers for one state.
       if (bucket === 'running') stats.runningOnScreen++;
       if (bucket === 'waiting') stats.waitingOnScreen++;
+      if (fromCloud) stats.cloudOnScreen++;
     }
 
     updateSummary(stats.runningOnScreen, stats.waitingOnScreen);
@@ -505,9 +687,16 @@ function __mmxStatusMain(cfg) {
     if (touched.size > 64) {
       var live = [];
       touched.forEach(function (r) { if (r.isConnected) live.push(r); });
+      // pruned = how many rows were DROPPED from the bookkeeping Set, i.e.
+      // rows the virtualising sidebar had already detached. It is NOT
+      // live.length, which is how many SURVIVED -- that number reads like
+      // "94 DOM nodes were deleted" in the daemon log, when it is closer to
+      // "94 of 600 are still around". This sweep only ever touches our own
+      // Set, never the host's DOM, and the count makes that checkable.
+      // Snapshot the size BEFORE clear(), or the delta is always 0.
+      stats.pruned = touched.size - live.length;
       touched.clear();
       for (var t2 = 0; t2 < live.length; t2++) touched.add(live[t2]);
-      stats.pruned = live.length;
     }
     return stats;
   }
@@ -543,6 +732,11 @@ function __mmxStatusMain(cfg) {
     subtree: true,
     characterData: false,
   });
+
+  // Subscribe to the host event bus BEFORE the first apply() below, so the
+  // very first paint already sees the cloud sessions that are running. A
+  // missing store is not an error: subscribeCloud reports it and returns.
+  var cloudSub = subscribeCloud();
 
   // ---------------------------------------------------------------------
   // "Never expand, at all" guard.
@@ -596,6 +790,14 @@ function __mmxStatusMain(cfg) {
     mount: mount,
     apply: apply,
     enforceNoAutoExpand: enforceNoAutoExpand,
+    // Read-only view of the cloud accumulator, so the daemon log can tell
+    // "cloud unsupported" apart from "cloud connected but nothing running".
+    // evicted is the cumulative count of entries the 64-session ceiling threw
+    // away; a non-zero value means some running cloud session may be missing
+    // its dot, which is a different problem from a missing event bus.
+    cloudState: function () {
+      return { subscribed: !!unsubCloud, tracked: cloudState.size, evicted: cloudEvicted, entries: Array.from(cloudState) };
+    },
     // apply()'s return value used to be discarded here, so the paint statistics
     // (rows / painted / removed / unknownIds) were unobservable and a stale-dot
     // regression could not be asserted by any test. Return the paint stats and
@@ -609,6 +811,10 @@ function __mmxStatusMain(cfg) {
     },
     dispose: function () {
       disposed = true;
+      // Unsubscribe from the host event bus first, so a late notify() cannot
+      // repopulate the Map we are about to clear. A dangling listener would
+      // keep this whole closure (and the Map) alive for the page's lifetime.
+      disposeCloud();
       try { observer.disconnect(); } catch (e) {}
       window.removeEventListener('mavis:status-refresh', handler);
       window.clearInterval(timer);
@@ -634,7 +840,7 @@ function __mmxStatusMain(cfg) {
   window[GLOBAL] = api;
   var initial = apply();
   var collapseResult = enforceNoAutoExpand();
-  return { ok: true, initial: initial, collapse: collapseResult };
+  return { ok: true, initial: initial, collapse: collapseResult, cloud: cloudSub };
 }
 `;
 
