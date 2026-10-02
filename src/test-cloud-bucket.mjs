@@ -685,7 +685,25 @@ console.log('\n=== 9. 页面接线：源码层回归锁 ===');
   check('旧的 live.length 口径已不存在', !/stats\.pruned = live\.length;/.test(pageSrc));
   check('touched.size 在 clear() 之前取（否则差值恒为 0）',
     pageSrc.indexOf('stats.pruned = touched.size - live.length;') <
-      pageSrc.indexOf('touched.clear();', pageSrc.indexOf('if (touched.size > 64)')));
+    pageSrc.indexOf('touched.clear();', pageSrc.indexOf('if (touched.size > 64)')));
+
+  // 2026-10-02 视图切换闪烁回归锁：宿主切回时把置顶行连同「已展开」的
+  // caret 一起 commit，展开布局画出 2 帧后才被 rAF 守卫折回（主上报
+  // 「多出来又折叠」）。MutationObserver 回调是微任务、在 paint 之前
+  // 跑，所以第二只 observer 盯 class 变化、同步折叠，展开帧应归零。
+  // 曾试过两版按时间的窗口（350/600ms）与「风暴门门」（行数静默 1.2s）：
+  // 前者没盖住第二波（净伤害：拖到 1551ms），后者让展开态持续 2 秒
+  // （expandedFrames 2→99+）。三版均比 rAF-only 更差，只有微任务路径
+  // 真正有效，此锁防止任何时间窗方案回潮。
+  check('有独立的 attribute observer 盯 caret class（微任务同帧折叠）',
+    /expandGuardObserver\.observe\(mount, \{/.test(pageSrc) &&
+    /attributeFilter: \['class'\]/.test(pageSrc));
+  check('attribute observer 只折 transition-transform 的 caret（不误伤其他节点）',
+    /indexOf\('transition-transform'\) < 0\) continue;/.test(pageSrc));
+  check('attribute observer 在 dispose 里断开（不泄漏）',
+    pageSrc.indexOf('expandGuardObserver.disconnect()') > pageSrc.indexOf('expandGuardObserver.observe'));
+  check('时间窗/风暴门方案没有回潮（350/600/1200 静默都已删除）',
+    !/lastChurnAt|lastCollapseAt|now - last/.test(pageSrc));
 
   // The key-space comment must not claim a SQL guarantee it does not have.
   // status-db.mjs's main query (lines 97-107) filters on `WHERE s.archived = 0`

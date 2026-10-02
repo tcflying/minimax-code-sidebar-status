@@ -726,6 +726,48 @@ function __mmxStatusMain(cfg) {
     });
   }
 
+  // Same-frame expansion guard. The rAF path above is one frame too late for a
+  // specific case the user sees: on a 本地<->云端 view switch the host re-addmits
+  // the pinned rows with the caret ALREADY expanded, so the expanded layout
+  // paints for 1-2 frames before our rAF folds it (measured 2026-10-02:
+  // scrollHeight 392 visible for exactly 2 frames, then back to 270 -- the
+  // "多出来又折叠" flicker). MutationObserver callbacks, unlike rAF, run as a
+  // MICROTASK before the browser paints that frame, so folding from inside the
+  // observer callback -- synchronously, not via scheduleApply -- reverts the
+  // expansion before it ever reaches the screen.
+  //
+  // Why a SECOND observer instead of folding inside scheduleApply: the rAF
+  // indirection is exactly what costs the frame. And why attribute:true on the
+  // whole subtree: the caret's expansion marker is a class change
+  // ('-rotate-90' removed), i.e. an ATTRIBUTE mutation, not childList -- the
+  // observer above never even fires for it.
+  var expandGuardObserver = new MutationObserver(function (muts) {
+    if (disposed) return;
+    if (!cfg.collapseOnStart) return;
+    // Only class mutations on caret-ish nodes can mean expansion.
+    for (var i = 0; i < muts.length; i++) {
+      var m = muts[i];
+      if (m.type !== 'attributes' || m.attributeName !== 'class') continue;
+      var t = m.target;
+      if (!t || !t.getAttribute || String(t.getAttribute('class') || '').indexOf('transition-transform') < 0) continue;
+      // A caret's class just changed and it is expanded now: fold it back
+      // synchronously, before this frame paints. The row's own caret click is
+      // the same button the rAF guard uses, so semantics are identical.
+      var row = t.closest ? t.closest('[data-session-id]') : null;
+      if (!row) continue;
+      if (!isExpanded(row)) continue;
+      if (row.getBoundingClientRect().height <= 40) continue; // already collapsed
+      clickCaret(row);
+      break; // one per callback; the next mutation (if any) re-enters
+    }
+  });
+  expandGuardObserver.observe(mount, {
+    childList: false,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ['class'],
+  });
+
   var observer = new MutationObserver(scheduleApply);
   observer.observe(mount, {
     childList: true,
@@ -816,6 +858,7 @@ function __mmxStatusMain(cfg) {
       // keep this whole closure (and the Map) alive for the page's lifetime.
       disposeCloud();
       try { observer.disconnect(); } catch (e) {}
+      try { expandGuardObserver.disconnect(); } catch (e) {}
       window.removeEventListener('mavis:status-refresh', handler);
       window.clearInterval(timer);
       if (rafId) { try { cancelAnimationFrame(rafId); } catch (e) {} rafId = 0; }
