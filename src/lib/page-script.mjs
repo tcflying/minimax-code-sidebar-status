@@ -680,6 +680,10 @@ function __mmxStatusMain(cfg) {
     // Must run AFTER the dots are painted: the hoister keys off the bucket
     // attribute the loop above just set.
     stats.reorder = applyReorder();
+    // List-level truncation restore ("更多"). Runs after reorder so the click
+    // lands on the button in its final position; self-limiting -- once the
+    // host expands, the button disappears and the next tick finds nothing.
+    restorePinnedMore(stats);
 
     // The sidebar is virtualised, so rows are constantly created and destroyed.
     // Drop detached rows from the bookkeeping Set, otherwise a long-running
@@ -823,8 +827,99 @@ function __mmxStatusMain(cfg) {
     return { collapsed: collapsed };
   }
 
+  // ---------------------------------------------------------------------
+  // Pinned-section truncation memory ("更多" sticky expand).
+  //
+  // Host behaviour, measured on the live app (2026-10-03): the pinned list
+  // truncates to ~6 rows plus a "更多" button, and every 本地<->云端 view
+  // switch REMOUNTS the local list, resetting the expansion the user chose.
+  // When expanded the host renders NO collapse control at all (the button
+  // disappears from the DOM), so after a switch the user must re-click 更多
+  // every single time -- the exact "所有 session 自动收缩起来了" report.
+  //
+  // Fix: remember the user's REAL click (isTrusted only -- the synthetic
+  // restore click below has isTrusted=false and cannot feed back), persist it
+  // in localStorage so it survives daemon re-injection and app restarts, and
+  // after any remount puts the truncation button back, click it once on their
+  // behalf. Orthogonal to the row-caret guard above: that one folds INLINE
+  // subtask previews; this one restores the LIST-LEVEL truncation.
+  // ---------------------------------------------------------------------
+  var PINNED_MORE_KEY = 'mmxStatusPinnedMore';
+  var PINNED_MORE_EXPAND = ['更多', 'More'];
+  var PINNED_MORE_COLLAPSE = ['收起', 'Show less'];
+  var pinnedMoreState = { want: null, restored: 0 };
+  try {
+    var storedWant = localStorage.getItem(PINNED_MORE_KEY);
+    pinnedMoreState.want = storedWant === '1' ? true : (storedWant === '0' ? false : null);
+  } catch (e) { /* storage unavailable -> memory-only mode */ }
+
+  function rememberPinnedMore(want) {
+    pinnedMoreState.want = want;
+    try { localStorage.setItem(PINNED_MORE_KEY, want ? '1' : '0'); } catch (e) {}
+  }
+
+  // The truncation button lives INSIDE [data-pinned-section] and ONLY there.
+  // Measured on the live app (2026-10-03): truncated state = 6 rows in the DOM
+  // (hidden rows are UNMOUNTED, not clipped) + a visible 更多 button inside
+  // the section; expanded state = the section holds NO such button at all.
+  // A parent-wrapper fallback was tried and caused a click loop: the wrapper
+  // also contains the project groups' OWN 更多 buttons (identical markup,
+  // DIV.space-y-px -> DIV.grid), so with the section expanded the fallback
+  // found a foreign button and clicked it ~2x/s for as long as the DOM
+  // churned. Scope is therefore strictly sec.querySelectorAll -- anything
+  // outside the section is never ours to click or remember.
+  function pinnedTruncButton() {
+    var sec = document.querySelector('[data-pinned-section]');
+    if (!sec) return null;
+    var btns = sec.querySelectorAll('button,[role="button"]');
+    for (var i = 0; i < btns.length; i++) {
+      var t = (btns[i].textContent || '').trim();
+      if (PINNED_MORE_EXPAND.indexOf(t) >= 0) return { btn: btns[i], kind: 'expand' };
+      if (PINNED_MORE_COLLAPSE.indexOf(t) >= 0) return { btn: btns[i], kind: 'collapse' };
+    }
+    return null;
+  }
+
+  function restorePinnedMore(stats) {
+    if (pinnedMoreState.want === null) {
+      // Lazy re-read while undecided: lets a seeded key take effect without a
+      // re-injection. Once the user has actually clicked, want is decided and
+      // the stored value is never consulted again.
+      try {
+        var lazy = localStorage.getItem(PINNED_MORE_KEY);
+        pinnedMoreState.want = lazy === '1' ? true : (lazy === '0' ? false : null);
+      } catch (e) {}
+    }
+    if (pinnedMoreState.want !== true) return;
+    var f = pinnedTruncButton();
+    if (!f || f.kind !== 'expand') return;
+    if (!f.btn.getClientRects().length) return; // hidden leftover, never click
+    f.btn.click(); // synthetic -> isTrusted=false -> cannot re-enter the memory
+    pinnedMoreState.restored++;
+    if (stats) stats.pinnedMoreRestored = pinnedMoreState.restored;
+  }
+
+  function onPinnedMoreClick(ev) {
+    if (!ev || !ev.isTrusted) return; // our own restore click is synthetic
+    var t = ev.target;
+    var b = t && t.closest ? t.closest('button,[role="button"]') : null;
+    if (!b) return;
+    var sec = document.querySelector('[data-pinned-section]');
+    if (!sec) return;
+    // Strict containment, same lesson as pinnedTruncButton: the section's
+    // parent wrapper holds the project groups' own 更多/收起 buttons, and a
+    // loose scope would memorise a click that was never about the pinned list.
+    if (!(sec === b || sec.contains(b))) return;
+    var txt = (b.textContent || '').trim();
+    if (PINNED_MORE_EXPAND.indexOf(txt) >= 0) rememberPinnedMore(true);
+    else if (PINNED_MORE_COLLAPSE.indexOf(txt) >= 0) rememberPinnedMore(false);
+  }
+
   var handler = function () { scheduleApply(); };
   window.addEventListener('mavis:status-refresh', handler);
+  // Capture phase: must observe the user's real click before any host handler
+  // can stopPropagation it away. Only isTrusted clicks update the memory.
+  document.addEventListener('click', onPinnedMoreClick, true);
   var timer = window.setInterval(scheduleApply, cfg.intervalMs || 3000);
 
   var api = {
@@ -832,6 +927,13 @@ function __mmxStatusMain(cfg) {
     mount: mount,
     apply: apply,
     enforceNoAutoExpand: enforceNoAutoExpand,
+    // Read-only view of the pinned-truncation memory, for probes and the
+    // daemon log: what the user asked for, how many restores fired so far,
+    // and which truncation button (if any) is currently in the DOM.
+    pinnedMore: function () {
+      var f = pinnedTruncButton();
+      return { want: pinnedMoreState.want, restored: pinnedMoreState.restored, button: f ? f.kind : null };
+    },
     // Read-only view of the cloud accumulator, so the daemon log can tell
     // "cloud unsupported" apart from "cloud connected but nothing running".
     // evicted is the cumulative count of entries the 64-session ceiling threw
@@ -860,6 +962,7 @@ function __mmxStatusMain(cfg) {
       try { observer.disconnect(); } catch (e) {}
       try { expandGuardObserver.disconnect(); } catch (e) {}
       window.removeEventListener('mavis:status-refresh', handler);
+      try { document.removeEventListener('click', onPinnedMoreClick, true); } catch (e) {}
       window.clearInterval(timer);
       if (rafId) { try { cancelAnimationFrame(rafId); } catch (e) {} rafId = 0; }
       pending = false;

@@ -534,6 +534,46 @@ paint 之前执行**，回调内同步 `clickCaret` 折叠——展开布局从�
 （4 条：observer 存在 / 只认 transition-transform / dispose 断开 / 时间窗
 方案不得回潮）。
 
+### 8.5 置顶区「更多」展开记忆（截断恢复，2026-10-03）
+
+用户报：**置顶区本来展开二十几条，点一下云端标签再点回本地，所有
+session 自动收缩成 6 条，下面一个「更多」**。真机取证还原机制：
+
+- 宿主的置顶列表默认截断为 **6 行 + 「更多」按钮**（截断态下隐藏行被
+  **卸载**而非遮蔽：DOM 里只有 6 行；展开态下**容器内根本没有按钮**，
+  也没有任何收起控件）。
+- 每次 本地↔云端 视图切换，宿主**重挂载**本地列表，展开态被重置回
+  默认截断——用户点过的「更多」白点，每次切换后都要重新点。
+
+修复（`page-script.mjs` 的 pinned-more 块）：
+
+1. **记忆**：capture 阶段监听 document 点击，只认 `isTrusted` 的真实
+   点击（我们自己的合成恢复点击 `isTrusted=false`，天然不会反馈进记忆）。
+   点「更多」记 `want=true`、点「收起」记 `want=false`，落在
+   `localStorage['mmxStatusPinnedMore']`——**重注入和应用重启后依然生效**。
+2. **恢复**：每个 apply tick，`want=true` 且置顶容器内出现展开向截断
+   按钮且可见（`getClientRects` 非空）时，替用户点开一次。自限：展开后
+   容器内无按钮，下一轮自然扑空。
+3. **可观测**：恢复计数进 tick stats（`pinnedMoreRestored`），
+   `window.__mmxStatus.pinnedMore()` 暴露 `{want, restored, button}`。
+
+**范围纪律（一次真机翻车的教训）**：首版给按钮搜索加了
+`sec.parentElement` 兜底，结果置顶区**展开**时兜底抓到了父容器里
+**项目组自己的「更多」按钮**（结构完全同构：`DIV.space-y-px →
+DIV.grid`），在 DOM 抖动期间以 ~2 次/秒空点了 150+ 次（稳态实测
+`restored` 3 秒涨 6）。终版严格限定 `sec.querySelectorAll`——容器外
+的东西永远不点、不记。回归锁 8 条锁住：reorder 后挂钩 / isTrusted
+守卫 / 只点展开向 / 不可见不点 / localStorage 恒键 / 严格范围 /
+捕获+dispose / api 视图。
+
+真机验证：种 `want=true` 后重注入（当下截断态）首 tick 恢复、展开稳态
+5 秒零增长；云端→本地完整复现自动回展开（每轮重挂恢复 2 次均为真实
+截断→点开），daemon 日志可见 `pinnedMoreRestored`。
+
+**与本工具其他"折叠"的关系**：8.1–8.4 的守卫压的是**行内 caret**
+（子任务预览）；本节恢复的是**列表级截断**（「更多」）。两者正交：
+行内永不自动展开，列表级尊重用户选择。
+
 ---
 
 ## 9. 踩过的坑（方法论价值大于代码价值）
@@ -1006,7 +1046,7 @@ node daemon.mjs --active-bg 'rgba(255,255,255,0.10)'
 
 ```
 node .\src\selftest.mjs                      116 项 · 不需要 CDP
-node .\src\test-cloud-bucket.mjs             119 项 · 不需要 CDP
+node .\src\test-cloud-bucket.mjs             127 项 · 不需要 CDP
 node .\src\watchdog-selftest.mjs              83 项 · 不需要 CDP
 node .\src\test-autofix-gates.mjs             32 项 · 不需要 CDP
 node .\src\test-reorder-defaults.mjs          40 项 · 不需要 CDP
@@ -1738,7 +1778,7 @@ aborted 的默认行为一致）、其余（created/title_updated/pinned_updated
 
 降级静默且完全：老版本宿主或沙箱渲染进程没有这个 store → 整段功能
 不生效，本地路径原样工作。全套回归在 `test-cloud-bucket.mjs`
-（119 项，含倒序重放 8 条回归锁）。
+（127 项，含倒序重放 8 条回归锁）。
 
 ---
 
@@ -1857,7 +1897,7 @@ minimax-code-sidebar-status/
     │
     │  ── 测试（7 个不需要 CDP，随时可跑）──
     ├── selftest.mjs             116 项自测（含 daemon 僵尸上限 6b）
-    ├── test-cloud-bucket.mjs    119 项：云端状态点全套 + 倒序重放回归锁 + attribute observer 锁（见 15.7 / 8.4）
+    ├── test-cloud-bucket.mjs    127 项：云端状态点全套 + 倒序重放回归锁 + attribute observer 锁 + pinned-more 截断恢复锁（见 15.7 / 8.4 / 8.5）
     ├── watchdog-selftest.mjs    83 项自测（含启动器握手 8 条）
     ├── test-autofix-gates.mjs   --fix-app 三闸门测试（32 项，每闸门正例+反例）
     ├── test-reorder-defaults.mjs reorder 默认值 / 逃生舱 / 启动器参数构造 / 杀旧 daemon 筛选（40 项）
@@ -1943,6 +1983,8 @@ minimax-code-sidebar-status/
 | 点红 M 弹黑窗 | 14.8（VBS 根治；若仍出现，检查 .lnk 是否还指 powershell.exe） |
 | 侧边栏完全没有状态点 | 14 章自愈链路；`logs\daemon-*.log` 0 字节 = import 阶段死了，先查 page-script 语法（14.7） |
 | 置顶的会话切换云端/本地时闪一下又折叠 | 8.4（attribute observer，已归零；若复现抓 `scrollHeight` 逐帧证据） |
+| 切云端再回本地，置顶区缩回 6 条 + 「更多」 | 8.5（pinned-more 展开记忆：localStorage 记住真实点击，重挂后自动点开） |
+| 子 agent 在跑但行不黄（反而红点） | 15.6（陈旧 error_message 让位于活子代理；`waitingOnScreen` 应 ≥1） |
 | 已完成的云端会话一直绿点不消失 | 15.7 倒序重放（test-cloud-bucket 第 4c 节是回归锁） |
 | daemon 越积越多 / 空转不停 | daemon 240 次上限自退 + watchdog 握手（14.7 / 14.8） |
 | 双 daemon 打架 | 14.8 竞态握手；`logs\watchdog.log` 里应有"让启动器完成"字样 |

@@ -705,6 +705,35 @@ console.log('\n=== 9. 页面接线：源码层回归锁 ===');
   check('时间窗/风暴门方案没有回潮（350/600/1200 静默都已删除）',
     !/lastChurnAt|lastCollapseAt|now - last/.test(pageSrc));
 
+  // 2026-10-03 置顶区截断记忆回归锁（主上报「切云端再回本地，所有 session
+  // 自动收缩，下面一个更多」）：宿主每次视图切换重挂本地列表，把用户点过
+  // 的「更多」展开态重置回默认 6 条截断，且展开态下宿主不渲染任何收起控件
+  // ——用户无从对抗。修复 = 记住真实点击（isTrusted），宿主把截断按钮放回
+  // DOM 后替用户重新点开一次。以下锁住这个行为的关键不变量。
+  check('置顶截断恢复挂在 apply() 的 reorder 之后（按钮落在最终位置再点）',
+    pageSrc.indexOf('stats.reorder = applyReorder();') < pageSrc.indexOf('restorePinnedMore(stats);'));
+  check('记忆只认真实点击（isTrusted 守卫在前，合成恢复点击不会自反馈）',
+    /function onPinnedMoreClick\(ev\) \{\s*\n\s*if \(!ev \|\| !ev\.isTrusted\) return;/.test(pageSrc));
+  check('恢复点击自限：只点展开向按钮（展开后按钮消失，下一轮扑空即停）',
+    /if \(!f \|\| f\.kind !== 'expand'\) return;/.test(pageSrc) &&
+    pageSrc.indexOf("f.kind !== 'expand'") < pageSrc.indexOf('f.btn.click();'));
+  check('不可见按钮绝不点击（虚拟列表残留/隐藏菜单）',
+    pageSrc.indexOf('getClientRects().length) return;') < pageSrc.indexOf('f.btn.click();'));
+  check('记忆落在 localStorage（重注入/重启后仍生效）且键名恒定',
+    pageSrc.includes("var PINNED_MORE_KEY = 'mmxStatusPinnedMore'") &&
+    /localStorage\.setItem\(PINNED_MORE_KEY/.test(pageSrc));
+  check('恢复按钮严格限定在置顶容器内部（父级兜底已删，项目组的 更多 不许碰）',
+    !/var roots = \[sec, sec\.parentElement\];/.test(pageSrc) &&
+    /sec\.querySelectorAll\('button,\[role="button"\]'\)/.test(pageSrc) &&
+    /if \(!\(sec === b \|\| sec\.contains\(b\)\)\) return;/.test(pageSrc));
+  check('click 监听用捕获阶段（宿主 handler stopPropagation 之前看到）且 dispose 移除',
+    pageSrc.includes("document.addEventListener('click', onPinnedMoreClick, true);") &&
+    pageSrc.indexOf("document.addEventListener('click', onPinnedMoreClick, true);") <
+    pageSrc.indexOf("document.removeEventListener('click', onPinnedMoreClick, true);"));
+  check('api 暴露 pinnedMore 只读视图（探针/daemon 可观测）',
+    /pinnedMore: function \(\) \{/.test(pageSrc) &&
+    /return \{ want: pinnedMoreState\.want, restored:/.test(pageSrc));
+
   // The key-space comment must not claim a SQL guarantee it does not have.
   // status-db.mjs's main query (lines 97-107) filters on `WHERE s.archived = 0`
   // only -- there is no `WHERE session_id LIKE 'mvs_%'` anywhere.
