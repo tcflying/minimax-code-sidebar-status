@@ -90,6 +90,28 @@ const D = (subagent, bash) => ({ subagent, bash });
     m.get('d').bucket === BUCKET.waiting, `got=${m.get('d').bucket}`);
 }
 {
+  // STALE error vs waiting -- the 2026-10-03 live case (session mvs_1feaae52
+  // "MMX Code 远程web版"): status='idle', terminal_outcome='completed', but a
+  // leftover error_message ("BYOK provider ... 429") from an earlier failed
+  // turn, while TWO Agent Team sub agents were actively running. bucketFor
+  // painted it error via hasErrorMessage and the overlay skipped it, so the
+  // user saw red instead of yellow while the chat pane said "等待 Agent Team
+  // 返回结果...". Rule: only the LIVE status field keeps red safe; an
+  // error_message / terminal_outcome on an idle session is history, and a
+  // running child is the present.
+  const staleMsg = { id: 's1', status: 'idle', bucket: BUCKET.error, title: 's1' };
+  const staleOutcome = { id: 's2', status: 'idle', bucket: BUCKET.error, title: 's2' };
+  const liveErr = { id: 's3', status: 'error', bucket: BUCKET.error, title: 's3' };
+  const m = new Map([['s1', staleMsg], ['s2', staleOutcome], ['s3', liveErr]]);
+  StatusDb.applyWaitingOverlay(m, new Map([['s1', D(2, 0)], ['s2', D(1, 0)], ['s3', D(1, 0)]]));
+  check('陈旧 error_message（status=idle）+ 活子 agent -> waiting 接管',
+    m.get('s1').bucket === BUCKET.waiting, `got=${m.get('s1').bucket}`);
+  check('陈旧 terminal_outcome=failed（status=idle）+ 活子 agent -> waiting 接管',
+    m.get('s2').bucket === BUCKET.waiting, `got=${m.get('s2').bucket}`);
+  check('status=error 的活错误 + 活子 agent -> 仍 error（红不被盖）',
+    m.get('s3').bucket === BUCKET.error, `got=${m.get('s3').bucket}`);
+}
+{
   // A finished sub agent (detail counts at zero) must NOT light anything up.
   const m = new Map([['x', row('x', 'started')], ['y', row('y', 'idle')]]);
   StatusDb.applyWaitingOverlay(m, new Map([['x', D(0, 0)], ['y', D(0, 0)]]));

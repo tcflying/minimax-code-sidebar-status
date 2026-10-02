@@ -182,16 +182,32 @@ export class StatusDb {
    * The overlay only applies to a session that is NOT already showing a
    * higher-urgency signal. Precedence, strongest first:
    *
-   *     error  >  running  >  paused  >  waiting  >  done / idle
+   *     live error  >  running  >  paused  >  waiting  >  stale error  >  done / idle
    *
    * `waiting` is a statement about a turn that has already handed control back
    * -- "nothing is happening here right now, but something I own is". None of
    * the three above it say that, so none of them may be repainted:
    *
    *   - `running`  the turn is executing; it is not waiting on anything.
-   *   - `error`    a failure must not be buried under a calmer colour.
+   *   - `error`    a LIVE failure (status is 'error'/'failed' right now) must
+   *                not be buried under a calmer colour.
    *   - `paused`   an interrupted turn is a state the user has to act on;
    *                overwriting it with "waiting" erases the call to action.
+   *
+   * A STALE error is different, and waiting outranks it. Measured on the live
+   * database (2026-10-03): session mvs_1feaae52 ("MMX Code 远程web版") read
+   * status='idle', terminal_outcome='completed', but carried a leftover
+   * error_message ("BYOK provider ... upstream error: 429") from an earlier
+   * failed turn, while TWO Agent Team sub agents it owned were actively
+   * running (local_runtime_background_tasks rows subagent/running). bucketFor
+   * painted it error via hasErrorMessage, this overlay then skipped it, and
+   * the user stared at a red dot -- no yellow -- while the chat pane said
+   * "等待 Agent Team 返回结果...". An error_message on an idle session is
+   * history; a running child is the present, so the present wins. The same
+   * staleness argument covers terminal_outcome='failed': it describes the
+   * last COMPLETED run, and a new turn with live children has already moved
+   * past it. Only the session's own live status ('error'/'failed') keeps the
+   * red dot safe from this overlay.
    *
    * The running guard was added after measuring the live database (2026-10-02):
    * the root session `mvs_743fa8` read status='started' with 2 live sub agents,
@@ -216,8 +232,11 @@ export class StatusDb {
       // be a phantom row that can never be acted on.
       if (!cur) continue;
       // Already saying something more urgent than "waiting" -- leave it alone.
-      if (cur.bucket === BUCKET.error || cur.bucket === BUCKET.running
-        || cur.bucket === BUCKET.paused) continue;
+      // For error, urgency is decided by the LIVE status field only: an
+      // error_message / terminal_outcome on a non-error session is a stale
+      // leftover that waiting must overwrite (see the block comment above).
+      if (cur.bucket === BUCKET.running || cur.bucket === BUCKET.paused) continue;
+      if (cur.bucket === BUCKET.error && ERROR.has(cur.status)) continue;
       cur.bucket = BUCKET.waiting;
       cur.waiting = d;
     }

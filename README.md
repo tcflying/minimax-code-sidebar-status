@@ -266,8 +266,11 @@ A 或 B 任一成立即判 `waiting`。
 判据只是"这个会话名下有活"。真正决定**画不画黄**的是 overlay 的优先级：
 
 ```
-error  >  running  >  paused  >  waiting  >  done / idle
+活 error  >  running  >  paused  >  waiting  >  陈旧 error  >  done / idle
 ```
+
+（"活 error"指 `status` 本身是 `error/failed`；"陈旧 error"指 status 已回 `idle`、
+只是 `error_message`/`terminal_outcome` 还留着上次失败的痕迹——见下方实测案例。）
 
 只有**当前不是更高级信号**的会话才会被 waiting 接走。这条守卫是**实测加上去的**：
 
@@ -281,10 +284,19 @@ error  >  running  >  paused  >  waiting  >  done / idle
 
 | 桶 | 为什么不能被 waiting 盖掉 |
 |---|---|
-| `error` | **失败不能被一个更平静的颜色盖掉**——红是最高优先级 |
+| 活 `error` | **正在发生的失败不能被一个更平静的颜色盖掉**——红是最高优先级 |
 | `running` | turn 还在执行，它**根本没在等任何东西** |
 | `paused` | 中断态是**等用户处理**的，涂成"在等子任务"等于**把待办抹掉** |
-| `done` / `idle` | 无信息可遮蔽，**允许**被 waiting 接走（这才轮到黄出场） |
+| done / idle | 无信息可遮蔽，**允许**被 waiting 接走（这才轮到黄出场） |
+
+**陈旧 error 必须让位于黄（2026-10-03 真机案例，`mvs_1feaae52`「MMX Code 远程web版」）**：
+会话 `status='idle'`、`terminal_outcome='completed'`，但 `error_message` 里躺着早前一次
+BYOK 429 限流失败的残留文本；与此同时它的 **Agent Team 两个子代理正在跑**
+（`local_runtime_background_tasks` 两条 `subagent/running`）。
+`bucketFor` 经 `hasErrorMessage` 判成 error，旧行优先级 `error > waiting` 把黄压死——
+用户盯着聊天区"等待 Agent Team 返回结果..."、侧边栏却一个黄都没有（红点也不显眼）。
+结论：`error_message`/`terminal_outcome` 是**历史**，活着的子任务是**现在**，现在赢。
+只有 `status` 字段本身处于 `error/failed` 才算"活错误"、才继续压黄。
 
 > ⚠️ "不要求父会话是 `started`"和"`started` 被忽略"**是两句话**。
 > 前者说的是 waiting **不排斥**非 started 的会话；后者说的是 started **优先**。
@@ -294,6 +306,8 @@ error  >  running  >  paused  >  waiting  >  done / idle
 > `error 优先于 waiting（红不被黄盖掉）`、
 > `paused 优先于 waiting（橙色中断态是待用户处理，不该被盖）`、
 > `running 优先于 waiting`、
+> `陈旧 error_message（status=idle）+ 活子 agent -> waiting 接管`、
+> `status=error 的活错误 + 活子 agent -> 仍 error（红不被盖）`、
 > `done 可被 waiting 接走（最低优先级，无信息可遮蔽）`。
 > 改这个顺序等于改产品语义，**先看测试**。
 
@@ -996,7 +1010,7 @@ node .\src\test-cloud-bucket.mjs             119 项 · 不需要 CDP
 node .\src\watchdog-selftest.mjs              83 项 · 不需要 CDP
 node .\src\test-autofix-gates.mjs             32 项 · 不需要 CDP
 node .\src\test-reorder-defaults.mjs          40 项 · 不需要 CDP
-node .\src\test-waiting-bucket.mjs            49 项 · 不需要 CDP
+node .\src\test-waiting-bucket.mjs            52 项 · 不需要 CDP
 pwsh -NoProfile -File .\src\test-process-filters.ps1   28 项 · 需要应用在跑（但**不需要 CDP**）
 node .\src\e2e.mjs --port 9331               19 项 · 需要已开 CDP 的实例
 pwsh -NoProfile -File .\src\test-launcher.ps1        20 项 · 自建一次性实例
@@ -1847,7 +1861,7 @@ minimax-code-sidebar-status/
     ├── watchdog-selftest.mjs    83 项自测（含启动器握手 8 条）
     ├── test-autofix-gates.mjs   --fix-app 三闸门测试（32 项，每闸门正例+反例）
     ├── test-reorder-defaults.mjs reorder 默认值 / 逃生舱 / 启动器参数构造 / 杀旧 daemon 筛选（40 项）
-    ├── test-waiting-bucket.mjs  waiting 判据 / overlay 优先级锁 / kind 过滤回归锁 / 页面侧样式与置顶（49 项，见 15.6）
+    ├── test-waiting-bucket.mjs  waiting 判据 / overlay 优先级锁（含陈旧 error 让位） / kind 过滤回归锁 / 页面侧样式与置顶（52 项，见 15.6）
     ├── test-process-filters.ps1 进程过滤器回归（D 组 Test-IsStaleDaemonProcess + 端口参数形态，见 9.5）
     │
     │  ── 启动 / 安装 ──
