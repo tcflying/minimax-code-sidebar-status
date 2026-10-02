@@ -1228,6 +1228,29 @@ node .\tests\watchdog-heal-e2e.mjs 9331        # 杀掉守护，验证 watchdog 
 `verify-running-visual.mjs` 不接 ps1，可单独 `node .\tests\verify-reorder.mjs 9331` 跑
 （前者会 `Page.reload`，属破坏性）。
 
+### 14.7 2026-10-02 事故补丁：两条让自愈链"自己别变成病灶"的护栏
+
+当晚一次编辑半途崩溃留下了带语法错误的 `page-script.mjs`，连环触发了两个
+**自愈链自身的缺陷**，修复如下（都有回归测试）：
+
+1. **watchdog 无条件相信 DevToolsActivePort 文件**。文件是 Electron 启动时写的，
+   实例退出后**文件不删**（当晚实测：文件写着 9331，活实例在 9333）。
+   旧逻辑 `fileRes.port` 有值就直接采用，导致 watchdog 对着死端口
+   连续重连 500+ 次。现在文件端口必须先通过 CDP 探活才生效，否则回退到
+   进程命令行里的端口（与启动器 `Resolve-TargetPort` 同一套逻辑）；
+   两者都没有时才保留文件端口用于 `APP_UP_NO_CDP` 诊断。陈旧文件警告
+   **跳变触发**（只在状态变化时打一条，否则每 5s 一条、一天 3 万行）。
+2. **daemon 重连无上限**。端口背后的实例退出后，daemon 以 30s 退避无限重试，
+   且 `Stop-StaleDaemon` 只清理"新启动器目标端口"上的 daemon，不同端口的
+   僵尸没人收尸。现在连续 240 次重连失败（顶格退避约 2 小时，足够熬过
+   应用重启）后自行退出并在日志里写明原因；上限行为由 `selftest.mjs`
+   第 6b 节锁定（onGiveUp 触发、定时器停止、日志含端口号）。
+
+当晚的另一条教训与自愈链无关，但同样致命：注入脚本包在 `String.raw`
+模板串里，**注释里出现一个反引号就会把整个模块变成 SyntaxError**，daemon
+死在 import 阶段且日志一个字都不留（`daemon-*.log` 0 字节 = 首先怀疑这里）。
+`test-cloud-bucket.mjs` 第 10 节已把"全文件反引号计数 = 10"锁成回归项。
+
 ---
 
 ## 15. 视觉增强：让 running 真的看得见（本轮新增）

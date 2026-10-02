@@ -6,3 +6,4 @@ shots/
 *.out
 .DS_Store
 Thumbs.db
+.mimosa/
