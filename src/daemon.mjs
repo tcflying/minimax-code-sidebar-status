@@ -27,6 +27,15 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const FAILURE_THRESHOLD = 3; // consecutive refresh failures before reconnecting
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 30000;
+// Give-up ceiling. A daemon whose target port has NO listener behind it (the
+// app was closed, or restarted on a different port) can never succeed, yet the
+// old loop retried forever: the 2026-10-02 incident left one spinning at
+// 30s backoff for 500+ consecutive failures over hours. 240 attempts at the
+// 30s ceiling is two hours of patience -- enough to ride out an app restart,
+// short enough to not survive as a zombie. Nothing else reaps a daemon whose
+// port went away: Stop-StaleDaemon only kills daemons on the port a NEW
+// launcher run targets, so a daemon on a DIFFERENT dead port is on its own.
+const RECONNECT_MAX_ATTEMPTS = 240;
 const REBOOT_BASE_MS = 1500; // renderer reload -> not-installed -> re-bootstrap
 const REBOOT_MAX_MS = 30000;
 
@@ -177,6 +186,11 @@ export function createRefreshLoop({
   failureThreshold = FAILURE_THRESHOLD,
   reconnectBaseMs = RECONNECT_BASE_MS,
   reconnectMaxMs = RECONNECT_MAX_MS,
+  reconnectMaxAttempts = RECONNECT_MAX_ATTEMPTS,
+  // Invoked (with the final log line) when consecutive failed reconnects hit
+  // reconnectMaxAttempts. Default exits the process; selftest injects a spy so
+  // the ceiling itself stays testable without taking the test runner down.
+  onGiveUp = null,
   rebootBaseMs = REBOOT_BASE_MS,
   rebootMaxMs = REBOOT_MAX_MS,
   reconnect = () => Promise.reject(new Error('createRefreshLoop 未注入 reconnect')),
@@ -189,6 +203,7 @@ export function createRefreshLoop({
     consecutiveFailures: 0, // transport failures
     notInstalled: 0, // consecutive refreshes that reported not-installed
     reconnectAttempts: 0,
+    reconnectFails: 0, // consecutive FAILED reconnects; reset on any success
     reconnects: 0, // successful reconnects
     reboots: 0, // successful re-bootstraps
     reconnecting: false,
@@ -270,9 +285,32 @@ export function createRefreshLoop({
           state.reconnects++;
           state.reconnectBackoffMs = reconnectBaseMs;
           state.consecutiveFailures = 0;
+          state.reconnectFails = 0;
           logFn('重连成功:', (next.target && next.target.url) || '(unknown target)');
           return;
         } catch (e) {
+          state.reconnectFails++;
+          if (state.reconnectFails >= reconnectMaxAttempts) {
+            // Give up on a port that has had no listener for two hours of
+            // backed-off attempts. Spinning forever here is how the 2026-10-02
+            // zombie happened: nothing else reaps a daemon whose port went
+            // away, so this exit is the daemon's own responsibility.
+            const final =
+              `连续 ${state.reconnectFails} 次重连 127.0.0.1:${args.port} 失败，` +
+              `该端口已无实例监听，daemon 放弃并退出（避免僵尸空转）。` +
+              `下次启动 MiniMax Code 时由 launch-mmx-status.ps1 拉起新 daemon。`;
+            logFn(final);
+            state.stopped = true;
+            if (timer) clearInterval(timer);
+            const giveUp =
+              onGiveUp ||
+              ((reason) => {
+                console.error(reason);
+                process.exit(1);
+              });
+            giveUp(final);
+            return;
+          }
           logFn(
             '重连失败:',
             e && e.message,
