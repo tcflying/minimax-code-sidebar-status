@@ -722,17 +722,23 @@ console.log('\n=== 9. 页面接线：源码层回归锁 ===');
   check('记忆落在 localStorage（重注入/重启后仍生效）且键名恒定',
     pageSrc.includes("var PINNED_MORE_KEY = 'mmxStatusPinnedMore'") &&
     /localStorage\.setItem\(PINNED_MORE_KEY/.test(pageSrc));
-  check('恢复按钮严格限定在置顶容器内部（父级兜底已删，项目组的 更多 不许碰）',
+  // The behaviour is locked where it can actually be observed -- on the real
+  // section markup -- by test-pinned-lifecycle.mjs 2.4/2.6/2.7. A regex can
+  // only confirm the MECHANISM is present, which is what this file is for; the
+  // previous form of this assertion still demanded the old sec.contains(b)
+  // guard and went red when the logic moved into the shared classifier.
+  check('恢复按钮严格限定在置顶容器内部（父级兜底已删，项目组的 更多 不许碰）' +
+    '——行为锁见 test-pinned-lifecycle 2.4/2.6/2.7，此处只锁机制',
     !/var roots = \[sec, sec\.parentElement\];/.test(pageSrc) &&
     /sec\.querySelectorAll\('button,\[role="button"\]'\)/.test(pageSrc) &&
-    /if \(!\(sec === b \|\| sec\.contains\(b\)\)\) return;/.test(pageSrc));
+    /function classifyPinnedButton\(b\) \{[\s\S]*?closest\('\[data-session-id\]'\)[\s\S]*?if \(!rowsHere\) return null;/.test(pageSrc));
   check('click 监听用捕获阶段（宿主 handler stopPropagation 之前看到）且 dispose 移除',
     pageSrc.includes("document.addEventListener('click', onPinnedMoreClick, true);") &&
     pageSrc.indexOf("document.addEventListener('click', onPinnedMoreClick, true);") <
     pageSrc.indexOf("document.removeEventListener('click', onPinnedMoreClick, true);"));
   check('api 暴露 pinnedMore 只读视图（探针/daemon 可观测）',
     /pinnedMore: function \(\) \{/.test(pageSrc) &&
-    /return \{ want: pinnedMoreState\.want, restored:/.test(pageSrc));
+    /return \{\s*want: pinnedMoreState\.want, restored: pinnedMoreState\.restored/.test(pageSrc));
 
   // The key-space comment must not claim a SQL guarantee it does not have.
   // status-db.mjs's main query (lines 97-107) filters on `WHERE s.archived = 0`

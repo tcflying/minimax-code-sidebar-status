@@ -75,13 +75,54 @@ const INTERRUPTED = new Set(['interrupted']);
 const ABORTED = new Set(['aborted']);
 const ERROR = new Set(['error', 'failed']);
 
+/**
+ * Precedence: the CURRENT status decides first; the leftover fields only fill
+ * in after it has said nothing.
+ *
+ * This order is load-bearing and it was wrong once (README §15.16.3 /
+ * 1003.md §14.30.3). It used to open with
+ *     if (ERROR.has(status) || terminalOutcome === 'failed') return error;
+ * which merged a LIVE status with a SUPPLEMENTARY field into ONE branch, and
+ * that branch ran ahead of started / interrupted / aborted. The measured
+ * consequence: a session reading status='started' right now, carrying a
+ * terminal_outcome='failed' left over from its previous turn, painted RED;
+ * interrupted went red instead of orange; aborted went red instead of showing
+ * nothing at all. A user watching a green row flip to red had no way to tell
+ * "this just failed" from "it failed last time and is working now" -- and the
+ * second one is what was actually true.
+ *
+ * The current status is therefore read FIRST and in full:
+ *
+ *   1. error | failed              live failure; nothing overrides it
+ *   2. started                     running
+ *   3. interrupted                 paused
+ *   4. aborted                     terminal cancel; includeAborted lights paused
+ *   5. idle + completed            done  -- deliberately ABOVE the two leftover
+ *                                           fields, so a leftover error_message
+ *                                           on a finished session stops being red
+ *   6. terminal_outcome='failed'   error (kept: idle + failed is still red)
+ *   7. error_message               error (kept: a bare idle + error_message is
+ *                                           still red)
+ *   8. otherwise                   idle  (no dot)
+ *
+ * Steps 1-4 are mutually exclusive -- the four Sets do not overlap -- so their
+ * relative order carries no behaviour. What carries behaviour is that all four
+ * sit ABOVE 5-7. Steps 6 and 7 are preserved on purpose: they are the existing
+ * base policy for a session whose own status says nothing, not a defect
+ * (README §15.16.3 rows 7 and 8, locked by selftest).
+ *
+ * The waiting overlay is deliberately untouched. It keys off the CORRECT bucket
+ * produced here, and keeps protecting running / paused / LIVE error -- which is
+ * exactly what it should protect now that the buckets it sees are the right ones.
+ */
 export function bucketFor({ status, terminalOutcome, hasErrorMessage, includeAborted = false }) {
-  if (ERROR.has(status) || terminalOutcome === 'failed') return BUCKET.error;
+  if (ERROR.has(status)) return BUCKET.error;
   if (RUNNING.has(status)) return BUCKET.running;
   if (INTERRUPTED.has(status)) return BUCKET.paused;
   if (ABORTED.has(status)) return includeAborted ? BUCKET.paused : BUCKET.idle;
-  if (hasErrorMessage) return BUCKET.error;
   if (status === 'idle' && terminalOutcome === 'completed') return BUCKET.done;
+  if (terminalOutcome === 'failed') return BUCKET.error;
+  if (hasErrorMessage) return BUCKET.error;
   return BUCKET.idle;
 }
 

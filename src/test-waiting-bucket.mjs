@@ -36,7 +36,11 @@ check('两者都有也是 waiting', StatusDb.isWaiting({ subagent: 3, bash: 2 })
 
 // ---------------------------------------------------------------------------
 console.log('\n=== 2. overlay 规则（合成数据，不依赖真实库状态）===');
-const row = (id, status) => ({ id, status, bucket: bucketFor({ status }), title: id });
+// 行工厂以前只传 status，从来不传 terminalOutcome —— 这正是覆盖漏洞
+// （README §15.16.3 / 1003.md §14.30.3「测试覆盖的漏洞」一节登记的那一条）。
+// 现在第三个参数透传给 bucketFor，覆盖表 1-6 的 outcome 组合；
+// 只传 status 的旧调用点行为完全不变（extra 默认为空对象）。
+const row = (id, status, extra = {}) => ({ id, status, bucket: bucketFor({ status, ...extra }), title: id });
 const D = (subagent, bash) => ({ subagent, bash });
 
 // The headline regression: a session whose turn is OVER but whose sub agent is
@@ -141,6 +145,112 @@ check('idle -> idle', bucketFor({ status: 'idle' }) === BUCKET.idle);
 check('interrupted -> paused', bucketFor({ status: 'interrupted' }) === BUCKET.paused);
 check('bucketFor 不知道 waiting（无子信息输入）', bucketFor({ status: 'idle', waiting: true }) === BUCKET.idle);
 check('BUCKET 含 waiting', BUCKET.waiting === 'waiting');
+
+// ---------------------------------------------------------------------------
+// 表 1-8：判据顺序（README §15.16.3 / 1003.md §14.30.3，验收矩阵 A3-A7）。
+// 这一节全部用【真实的 overlay】跑，而不是只测纯函数：表 2 / 表 4 的期望
+// 绿/橙只有 overlay 真的放过 running / paused 才成立。
+console.log('\n=== 3b. 判据顺序：当前状态优先于上一轮残留（A3-A7）===');
+const FAILED = { terminalOutcome: 'failed' };
+const FAILED_ERR = { terminalOutcome: 'failed', hasErrorMessage: true };
+
+// 表 1 / A3：started + failed，无子 agent。红曾盖住绿。
+{
+  const r = row('t1', 'started', FAILED);
+  check('表1 started+failed 无子 agent -> running', r.bucket === BUCKET.running, `got=${r.bucket}`);
+  const r2 = row('t1b', 'started', FAILED_ERR);
+  check('表1 started+failed+error_message -> running', r2.bucket === BUCKET.running, `got=${r2.bucket}`);
+}
+// 表 2 / A4：started + failed，有子 agent。黄曾盖住绿。
+{
+  const m = new Map([['t2', row('t2', 'started', FAILED)]]);
+  StatusDb.applyWaitingOverlay(m, new Map([['t2', D(2, 0)]]));
+  check('表2 started+failed 有子 agent -> 仍是 running', m.get('t2').bucket === BUCKET.running,
+    `got=${m.get('t2').bucket}`);
+  check('表2 没有被挂上 waiting 明细', m.get('t2').waiting === undefined,
+    JSON.stringify(m.get('t2').waiting));
+}
+// 表 3 / A5（上半）：interrupted + failed，无子 agent。红曾盖住橙。
+{
+  const r = row('t3', 'interrupted', FAILED);
+  check('表3 interrupted+failed 无子 agent -> paused', r.bucket === BUCKET.paused, `got=${r.bucket}`);
+}
+// 表 4 / A5（下半）：interrupted + failed，有子 agent。黄曾盖住橙。
+{
+  const m = new Map([['t4', row('t4', 'interrupted', FAILED)]]);
+  StatusDb.applyWaitingOverlay(m, new Map([['t4', D(1, 0)]]));
+  check('表4 interrupted+failed 有子 agent -> 仍是 paused', m.get('t4').bucket === BUCKET.paused,
+    `got=${m.get('t4').bucket}`);
+}
+// 表 5 / A6：aborted + failed。取消是终态，不是故障。
+{
+  const r = row('t5', 'aborted', FAILED);
+  check('表5 aborted+failed 默认 -> idle（不点亮）', r.bucket === BUCKET.idle, `got=${r.bucket}`);
+  const r2 = row('t5b', 'aborted', { ...FAILED, includeAborted: true });
+  check('表5 aborted+failed includeAborted -> paused', r2.bucket === BUCKET.paused, `got=${r2.bucket}`);
+  const r3 = row('t5c', 'aborted', FAILED_ERR);
+  check('表5 aborted+failed+error_message 默认仍不点亮', r3.bucket === BUCKET.idle, `got=${r3.bucket}`);
+}
+// 表 6 / A7：idle + completed + 残留 error_message。完成态优先。
+{
+  const r = row('t6', 'idle', { terminalOutcome: 'completed', hasErrorMessage: true });
+  check('表6 idle+completed+error_message -> done', r.bucket === BUCKET.done, `got=${r.bucket}`);
+  const r2 = row('t6b', 'idle', { terminalOutcome: 'completed' });
+  check('表6 idle+completed（无 err）-> done', r2.bucket === BUCKET.done, `got=${r2.bucket}`);
+  // 同一条 idle+completed+残留 err 的会话：bucketFor 现在给 done（最低优先级），
+  // 所以有活子 agent 时 overlay 会把它接成 waiting。这不是新行为，是 done 一直
+  // 就是最低优先级（见上面表里 d 的断言）；这里锁的是它【不再】被染成 error 后
+  // 还会保持 error。
+  const m = new Map([['t6', row('t6', 'idle', { terminalOutcome: 'completed', hasErrorMessage: true })]]);
+  StatusDb.applyWaitingOverlay(m, new Map([['t6', D(1, 0)]]));
+  check('表6 idle+completed+err 有子 agent -> 不再是 error', m.get('t6').bucket !== BUCKET.error,
+    `got=${m.get('t6').bucket}`);
+}
+// 表 7 / 表 8：必须保留红的两条基础策略。
+{
+  check('表7 idle+failed 保留 error',
+    row('t7', 'idle', FAILED).bucket === BUCKET.error,
+    `got=${row('t7', 'idle', FAILED).bucket}`);
+  check('表8 裸 idle+error_message 保留 error',
+    row('t8', 'idle', { hasErrorMessage: true }).bucket === BUCKET.error,
+    `got=${row('t8', 'idle', { hasErrorMessage: true }).bucket}`);
+}
+// 表 9：live error / failed + 有子 agent，overlay 显式豁免。
+{
+  const m = new Map([
+    ['t9a', row('t9a', 'error', FAILED_ERR)],
+    ['t9b', row('t9b', 'failed', FAILED_ERR)],
+  ]);
+  StatusDb.applyWaitingOverlay(m, new Map([['t9a', D(1, 0)], ['t9b', D(1, 0)]]));
+  check('表9 live error+子 agent -> 仍是 error', m.get('t9a').bucket === BUCKET.error,
+    `got=${m.get('t9a').bucket}`);
+  check('表9 live failed+子 agent -> 仍是 error', m.get('t9b').bucket === BUCKET.error,
+    `got=${m.get('t9b').bucket}`);
+}
+// 表 10：不在词表内的 status。无补充字段 => 无点；有补充字段 => 照旧红。
+{
+  check('表10 unknown 无补充字段 -> idle 无点',
+    bucketFor({ status: 'weird' }) === BUCKET.idle);
+  check('表10 unknown + failed -> 仍红', bucketFor({ status: 'weird', terminalOutcome: 'failed' }) === BUCKET.error,
+    `got=${bucketFor({ status: 'weird', terminalOutcome: 'failed' })}`);
+  check('表10 unknown + error_message -> 仍红',
+    bucketFor({ status: 'weird', hasErrorMessage: true }) === BUCKET.error);
+}
+// 顺序不变量：补充判据对【当前状态】零影响。任一把补充字段插回前面的改动先撞它。
+{
+  const supplementary = [{ terminalOutcome: 'failed' }, { hasErrorMessage: true },
+    { terminalOutcome: 'failed', hasErrorMessage: true }];
+  const currentStates = ['started', 'interrupted', 'aborted', 'error', 'failed'];
+  const leaks = [];
+  for (const st of currentStates) {
+    const base = bucketFor({ status: st });
+    for (const extra of supplementary) {
+      const after = bucketFor({ status: st, ...extra });
+      if (after !== base) leaks.push(`${st}+${JSON.stringify(extra)}=${after} vs bare=${base}`);
+    }
+  }
+  check('补充判据对当前状态零影响（顺序不变量）', leaks.length === 0, leaks.join(','));
+}
 
 // ---------------------------------------------------------------------------
 console.log('\n=== 4. 真实库只读：overlay 与查询接得上 ===');

@@ -26,6 +26,23 @@
 | 重启后还能用 | ❌ 官方更新器会覆盖快捷方式 | ✅ 改名 `mmx-fix` + 四层自愈链路，见 14 |
 | 不改本体 | — | ✅ 零字节改动 |
 
+> **📌 2026-10-04 状态速记（读上面那张表之前先读这一段）**
+>
+> 1. **上面「running 行自动置顶」这一行只对**各项目分组下的**普通会话列表**成立。
+>    **置顶区（pinned）的顺序本项目一律不碰**——宿主 `pinned-items-order` 数组是唯一真相源。
+>    所以**「所有已置顶的会话会被自动排到最前面」是错的读法**：置顶区里哪怕正在跑，
+>    也不会被自动搬到置顶区最前，也不会被自动插进普通列表。
+>    源码坐标见 15.5「置顶区不再由本项目排序」与 12「已知边界」。
+> 2. **「已置顶很靠下的会话对话后不自动到顶」是当前磁盘源码的显式排除所致**
+>    （2026-10-03 的既定裁定，形态见 15.5 末尾）。**对用户这次的新预期而言，
+>    它是一个尚未覆盖的产品缺口**：需求存在、实现没有，且本轮未获授权去补。
+>    要把某个已置顶会话真的顶到最前，请用 15.8 的「到最顶」或 15.10 的红色悬停锁顶——
+>    **这两个都不是「普通会话列表的自动提升」入口**；红锁另有**已授权、有界**的后台维持。
+>    **本轮未取证**用户点的是哪个界面路径。逐条见 15.16。
+> 3. **本轮（2026-10-04）只更新了文档**：登记了新症状、状态点语义勘误，以及一批
+>    **尚未修复**的缺陷。**代码未修、未部署、GUI 未测**。逐条见 15.16。
+> 4. **2026-10-05 修复批次已落地（离线全绿，未部署、未在真实宿主生效）**，详见 15.16.8。
+
 ---
 
 ## 1. 问题是怎么被定义的
@@ -1047,6 +1064,11 @@ node daemon.mjs --active-bg 'rgba(255,255,255,0.10)'
 ```
 node .\src\selftest.mjs                      116 项 · 不需要 CDP
 node .\src\test-cloud-bucket.mjs             127 项 · 不需要 CDP
+node .\src\test-reorder-pinned.mjs            50 项 · 不需要 CDP
+node .\src\test-topmost-menu.mjs             603 项 · 不需要 CDP
+node .\src\test-pinned-lifecycle.mjs          73 项 · 不需要 CDP
+node .\src\test-topmost-diag.mjs              144 项 · 不需要 CDP
+node .\src\run-mutations.mjs                  43 个变异全红才算过 · 不需要 CDP
 node .\src\watchdog-selftest.mjs              83 项 · 不需要 CDP
 node .\src\test-autofix-gates.mjs             32 项 · 不需要 CDP
 node .\src\test-reorder-defaults.mjs          40 项 · 不需要 CDP
@@ -1055,6 +1077,21 @@ pwsh -NoProfile -File .\src\test-process-filters.ps1   28 项 · 需要应用在
 node .\src\e2e.mjs --port 9331               19 项 · 需要已开 CDP 的实例
 pwsh -NoProfile -File .\src\test-launcher.ps1        20 项 · 自建一次性实例
 ```
+
+> 新增的三个套件**先切片出厂代码再在假 DOM / 假 fiber 上跑**，
+> 所以它们断言的是行为而不是源码里的字符串。
+> 这一点是被教训逼出来的：旧的 127 条源码正则断言只在源码里**找字符串**，
+> 所以"搬移循环被清空""dispose 不再删点"这类改动**照样全绿**——
+> 模式还在，实现已经没了。正则断言证明不了实现还能跑。
+>
+> 三个套件都支持 `MMX_MUTATE=<id>`，把某处**故意改回旧写法**后必须变红：
+>
+> ```
+> node .\src\run-mutations.mjs        # 一次跑完 43 个变异并打印矩阵
+> MMX_MUTATE=d1 node .\src\test-reorder-pinned.mjs     # 期望 FAILED
+> MMX_MUTATE=m1 node .\src\test-topmost-menu.mjs       # 期望 FAILED
+> MMX_MUTATE=s5 node .\src\test-pinned-lifecycle.mjs   # 期望 FAILED
+> ```
 
 > 上面 7 个**不需要 CDP** 的套件可以随时跑。唯一的环境前提是
 > `test-process-filters.ps1`——它的 A2/A3/A4/B1 断言要数**真实**进程，
@@ -1067,6 +1104,9 @@ pwsh -NoProfile -File .\src\test-launcher.ps1        20 项 · 自建一次性�
 |---|---|
 | `selftest` | 桶映射规则（含 waiting overlay 优先级，见 5.4）/ 真实库只读 / 注入表达式语法 / **无破坏性 DOM 调用** / dispose 回归 / 反引号守卫 / **daemon 僵尸上限**（6b：240 次重连失败必须自退）/ 环境 probe 改 skip 语义 |
 | `test-cloud-bucket` | **云端会话状态点全套**：bucket 映射 / 键空间隔离（mvs_ vs 纯数字）/ 前插窗口重放（2026-10-02 倒序重放回归锁 8 条）/ 滚动窗口不受 store 200 条影响 / 泄漏上限计数 / 8.4 的 attribute observer 回归锁 4 条 / 模板串反引号计数=10 守卫 |
+| `test-reorder-pinned` | **置顶区排序三缺陷的行为锁**（切片 `findListRoots`/`sameOrder`/`countMoves`/`applyReorder` 出厂代码）：置顶区**零 insertBefore**、项目子列表照旧、变更检测**零搬移**与**复位后能修**、**同下标不同会话**也会搬、预算**整轮不动**且 `planned` 如实上报（见 15.5） |
+| `test-topmost-menu` | **「到最顶」全套**：精确选择器（7 参依赖 / 三参 / `.pinSession`+`.getSessionInfo` / local 源 / 非只读）/ 同形诱饵被拒 / 多候选 fail closed / alternate fiber / 菜单**归属到被右键的那一个** / 复制子菜单与空菜单不注入 / 反复开合只有一项 / **显式 `(id, true, 0)` 且落库也带 0** / 已在首位 no-op / 行已卸载拒绝调用 / 并发只放行一次 / 合成点击不触发（见 15.8） |
+| `test-pinned-lifecycle` | 汇总条**位置**（不只是父节点）/ 截断按钮**不会点到**标题为「更多」的会话行与行内子列表的同名按钮 / `展开其余 N 项` 文案 / **展开记忆的逃生控件**（不改宿主 DOM）/ 展开守卫 40px 阈值 / **dispose 摘掉全部监听与节点** / dispose 后 rAF 不再跑 apply（见 15.8） |
 | `watchdog-selftest` | 双路端口发现（含陈旧 DevToolsActivePort 探活回退）/ 单实例锁 / 僵尸回收 / 退避节奏 / **启动器握手**（fresh/stale/缺失/损坏/带 BOM 共 8 条） |
 | `test-autofix-gates` | `--fix-app` 三道闸门，**每道都配正例 + 反例** |
 | `test-reorder-defaults` | reorder 默认值为 **true** / `--no-reorder` 逃生舱 / 启动器参数构造（dry-run 打印的和真跑的是同一个数组）/ **杀旧 daemon 的筛选**（含"启动器源码里没有任何针对 MiniMax Code / Electron 的 taskkill 或按名批量杀"这条静态断言） |
@@ -1132,8 +1172,14 @@ Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
 | 侧边栏虚拟滚动，只有当前渲染的行能上色 | 滚动时 observer 自动补 |
 | 状态点是纯装饰，不改变任何业务行为 | 设计如此 |
 | 展开守卫会与应用争 React 状态 | 同帧执行，视觉上无感；`--no-collapse` 可关 |
-| 桌面端源不开源，升级后锚点可能变 | 锚点只有 `data-session-id` 一个，稳定性较好 |
-| 覆盖范围：置顶区 + 各项目分组区 | 二者都由应用自己的列表渲染、都带 `data-session-id`，**都已覆盖**。置顶区实测 `kids=7 / withRow=6`（第 7 个是折叠控件不是会话行），所以判据用容差 `withRow >= kids-1` 而非 `===`——用 `===` 会静默漏掉置顶区 |
+| 桌面端源不开源，升级后锚点可能变 | 状态点锚点只有 `data-session-id` 一个。「到最顶」依赖宿主 `handlePinSession` 钩子的**精确签名**（7 参依赖 + 三参 + `.pinSession`/`.getSessionInfo` 源码标记）；宿主一改就退化成**禁用菜单项 + `api.topmost().reason`**，不会误动作 |
+| 「到最顶」的**完整应用重启后**持久性 | **未测**：本轮不重启宿主（会打断用户活任务）。已用「只读导出 `pinned-items-order` → 重新注入 → 视图重挂 → 再导出比对」代替，**不得**据此声称重启后仍保持 |
+| 「到最顶」在**云端视图** | **fail closed**：菜单项禁用并写明 `cloud-not-provable`。云端 id 是纯数字（实测 `447993841729699`），本机 `pinned-items-order` 里只有本地 `mvs_` 会话，没有证据证明同语义 |
+| 活跃置顶会话"沉底"的用户报告 | **未复现**。已修的是三个**静态可证**的排序缺陷（置顶区双写、下标派生的缓存键、预算中途放弃），**它们不构成该报告的已证实根因**。见 15.5 末尾 |
+| 覆盖范围：置顶区 + 各项目分组区 | 状态点/汇总条/展开守卫**两者都覆盖**。**排序只覆盖各项目分组**——置顶区的顺序由宿主的 `pinned-items-order` 数组唯一决定，2026-10-03 起本项目**不再在其中搬 DOM**（见 15.5）；要把置顶会话挪到最前请用 15.8 的「到最顶」 |
+| 套在另一个容器里的分组列表要多几轮才排到位 | **实测 2 轮搬移 + 第 3 轮确认**（`test-reorder-pinned.mjs` D2.5），即最多 2 个 daemon 周期的滞后。中间态都是**正确的前移**、不是乱序，且因为**不缓存**所以不会卡住。详见 15.5「嵌套容器需要多轮才收敛」 |
+| 「到最顶」的**键盘可达性** | **Tab 可达**（项带 `tabindex="0"`），Enter/Space 可激活（Space 会 `preventDefault`，否则侧边栏跟着滚）。**但方向键不参与**——宿主 rc-menu 的漫游 tabindex 只认它自己渲染的项，追加的 `li` 不在其中，`ArrowDown` 会跨过它。要接管就得全局拦截键盘，代价更大，**故不做**。**不得表述为"完整支持键盘导航"**，见 15.8 |
+| 「到最顶」的**右键重试窗口** | 仍是 `0/8/16ms` 共 3 次，**本轮有意未放宽**。是否放宽由**主对话真机 20 次右键的命中率**决定，不靠推断 |
 | macOS 未实测 | 启动参数与 Windows 略有差异（`-na <app> --args`） |
 
 ---
@@ -1608,7 +1654,7 @@ if (withRow >= kids - 1) { /* 这才是列表容器 */ }
 | 闸门 | 值 | 防什么 |
 |---|---|---|
 | `REORDER_MAX_ROOTS` | 128 | 容器识别是否又错了。侧边栏**真的**有很多列表——实测 72~30 个，全是各项目分组 |
-| `REORDER_MAX_MOVES` | 16 | 单次搬多少节点。匹配到 100 个容器但只有 3 个有 running，就只搬 3 个节点 |
+| `REORDER_MAX_MOVES` | 32 | 单次搬多少节点。匹配到 100 个容器但只有 3 个有 running，就只搬 3 个节点 |
 
 > 🚫 **新增 `waiting` 桶时，这两行常量一个字节都没有动，也不许动。**
 >
@@ -1621,22 +1667,110 @@ if (withRow >= kids - 1) { /* 这才是列表容器 */ }
 > 护栏不是"跑得慢就调大"的性能参数，是**唯一拦住那次事故的东西**。
 >
 > 正确做法是让新桶复用现有两个闸门（现在就是这么做的）：
-> 需要搬的节点变多，触发的是 `move-budget-exhausted` **提前中止**，
+> 需要的搬移数超限时，**整轮一个节点都不动**并上报
+> `aborted:'move-budget-exhausted'` + `planned:N`，
 > 表现为一两行没排上去，而不是整个侧边栏被拖死。
 > **把"少排几行"当成可接受的降级，把"卡死页面"当成不可接受。**
 
-#### 状态判据必须用哨兵值
+#### 预算必须**前置预检**（2026-10-03 修正）
+
+旧实现把预算检查放在**搬移循环内部**，超限就 `return`，
+留下一轮**搬了一半的乱序**（2026-10-02 实测：18 选中，搬了 16 个就
+`aborted='move-budget-exhausted'` 退出，顺序是乱的）。
+> 那组数字是**当时 ceiling 还是 16** 的一次现场记录——18 个要搬，只搬了 16 个
+> 就被循环里的检查打断。**它现在不是活的上限**：ceiling 早已是 32，
+> 18 次搬移根本不触发任何东西。保留它是因为它正是"中途退出"这个缺陷的证据。
+现在改成：先用 `countMoves()` 在**子节点数组的副本**上把
+「从后往前 `insertBefore`」这套动作**完整模拟一遍**，数出本轮真正需要的搬移数，
+**超限则整轮不动**。
 
 ```js
-// ❌ 初始值用空串是错的
-var lastReorderKey = '';
-// "没有 running"时算出的 key 也是空串 → 第一次变化被当成没变化 → 永远不动
-// ✅ 哨兵值
-var lastReorderKey = '__mmx_uninitialised__';
+// 真实 DOM 一个字节都没碰，得到的却是这一轮确切的 insertBefore 次数
+if (planned > REORDER_MAX_MOVES) {
+  return { moved: 0, planned: planned, aborted: 'move-budget-exhausted', ... };
+}
 ```
 
-这个 bug 在沙箱里被实测抓到：把一行标成 running、`refresh()` 也跑了，
-结果 `reorder: { unchanged: true, moved: 0 }`——**因为它根本没看见"变化"**。
+不模拟就没法"前置"，而不能前置就一定会中途留下乱序——
+这正是 `planned` 这个字段存在的理由：超限是可诊断的，不是静默的。
+
+#### 变更检测：**不再有缓存键**（2026-10-03 修正）
+
+旧实现有一个 `lastReorderKey`，键值由**被选中的行在 `root.children` 里的下标**拼成
+（`indexOf.call(root.children, w)`），和上一轮的键比对。两个后果都是确定的：
+
+| 缺陷 | 机制 | 现场症状 |
+|---|---|---|
+| 搬过之后必然再搬一轮 | 一次真实搬移必然改变下标 → 键必然与上一轮不同 | 每轮重排都**多产生一轮无净变化的搬移** |
+| 宿主复位看不见 | 宿主把列表重渲染回它自己的顺序后，下标又变回原值 → 键**又相等了** | 复位**永远不被修复**，列表一直错下去 |
+| 同下标不同会话看不见 | 键里没有会话身份 | 该搬的没搬 |
+
+现在**没有键、没有任何跨轮状态**。每轮对每个容器做一次纯比较：
+
+```js
+var ideal = selected.concat(rest);      // 理想顺序 = [running…][waiting…][其余原相对序]
+if (sameOrder(kids, ideal)) { alreadyOk++; continue; }   // 已经对 → 零 insertBefore
+```
+
+「已经对」= **零 `insertBefore`**（不是"搬了但结果一样"），
+「被外部重置」= 下一轮比较不等 → 当场修回来。
+没有可以变陈旧的状态，也就没有"复位看不见"这一类 bug。
+
+#### 置顶区不再由本项目排序（2026-10-03）
+
+置顶区的顺序**只有一个真相源**：宿主的 `pinned-items-order` 数组。
+渲染代码（asar `@316732355` / `@316733013`）把该数组的前 6 项
+`slice(0,6)` 之后按数组序渲染成行。**我们以前在同一个容器里用 `insertBefore` 排同一个顺序**，
+两套控制权指向一个事实。
+
+现在 `findListRoots()` 明确排除置顶区，判据取自本安装宿主的真实锚点：
+
+| 锚点 | 说明 |
+|---|---|
+| `data-pinned-section` | 真实 DOM 属性，置顶区容器（装着置顶列表的那个 section） |
+| `data-sidebar-drop-id` | 真实属性，但本安装只取 `pinned-drop-zone` / `pinned:` 前缀的值；`recent-sessions` / `projects` / `agents` **不在排除范围** |
+| `pinned-drop-zone` | 本安装是 dnd-kit 的 **JS 侧 id**，DOM 上只有 ref；仍然检查，以防别的构建真的渲染成属性 |
+
+排除计数随 `apply()` 统计一起上报（`reorder.pinnedSkipped`），
+所以"置顶区到底有没有被识别到"在 daemon 日志里是**可查的**，不是靠信任。
+
+**`pinnedZoneOf` 一路走到文档根，不设固定层数。**
+层数上限是个猜测：浅一层，置顶区里的行就认不出来了，
+而这个失败方向是最糟的那个——**我们会重新开始搬置顶列表**。
+DOM 遍历本来就终止于文档，所以代码里那个 `d >= 64` 只是兜底，
+不是机制；真的撞上它按"**可能**是置顶"处理，同样不搬。
+> ⚠️ 早先的写法是 `d < 12` 的定深循环。缺陷在**保护的位置**上：
+> "深度用尽就当置顶"那条 `return` 写在**循环体内部**，
+> 一旦循环本身被限深，那条 `return` 根本执行不到，函数直接落到末尾的
+> `return null`——也就是"**不是置顶**"。于是**隔着 15 层的真置顶区被当成
+> 普通列表搬了**。变异 `MMX_MUTATE=d4` 就是把它改回 12 层，
+> 会让 `test-reorder-pinned.mjs` 的 D1.6 变红（`pinnedSkipped=0`、置顶列表被搬）。
+
+**各项目分组的子列表行为逐字节不变**：`--no-reorder` 语义不变，
+`REORDER_MAX_ROOTS/MAX_MOVES` 不变。
+
+#### 嵌套容器需要多轮才收敛（2026-10-03 实测）
+
+容器之间是独立的，但**一个套在另一个里面的容器**不是同一轮能收尾的：
+子树里有行的列表**自己也是候选根**，而搬动它会改变外层下一轮读到的子节点。
+实测（`test-reorder-pinned.mjs` 的 D2.5）：
+
+| 轮次 | 外层 | 内层 | 说明 |
+|---|---|---|---|
+| 1 | `o3, o1, [内层], o2` | `i2, i1, i3, i4` | 内层在自己内部搬好了；外层此刻还把内层当**普通包裹**读（首行 i1 没点） |
+| 2 | `o3, [内层], o1, o2` | 同上 | 第 1 轮把 running 的 i2 放到了内层头部，外层于是改把**内层本身**当成 running 包裹提到队首 |
+| 3 | 同上 | 同上 | 两个根都等于各自理想值 → `alreadyOk`，`moved=0` |
+
+即**最多 2 个 daemon 周期的滞后，永远不会卡住**。
+真正要紧的不是轮数而是**中间态**：每一轮中间态都是一次**正确的前移**，
+不是乱序——因为搬移循环是从后往前，且每个理想序列都从该根**自己当时的活子节点**推出。
+**也只有"不缓存"才可能收敛**：一个在搬移前算好的键，
+会在下一轮认定"它刚改过的这个列表没问题"。
+
+> 📌 **归因纪律**：以上三个缺陷是**静态可证**的代码缺陷，已修并有变异证明。
+> 用户报告的"活跃置顶会话偶发沉底"**真机路径尚未复现**，
+> **不要把这两件事合并叙述成"沉底已修复"**。想把置顶会话挪到最前，
+> 走 15.8 的「到最顶」——它改的是数组本身，不是 DOM。
 
 #### 沙箱实测数据
 
@@ -1734,7 +1868,9 @@ local_runtime_background_tasks → 有没有 status='running' 的子 agent 任�
    用户要的是"我在等子 agent"，不是"我留了个 build 在跑"。
 3. **不要加 TTL，不要用 `updated_at_ms`。**
    子 agent running 行没有心跳，两个都会误杀长任务。孤儿行永远黄着是可接受的失败方向。
-4. **置顶护栏 `REORDER_MAX_ROOTS=128` / `REORDER_MAX_MOVES=16` 一个字都没改，也不许改。**
+4. **置顶护栏 `REORDER_MAX_ROOTS=128` / `REORDER_MAX_MOVES=32` 一个字都没改，也不许改。**
+   （MOVES 是 `16 -> 32` 改过来的，**那次改动在加 waiting 桶时就已经做完**，
+   早于本轮；本轮只是把文档里的 16 改回来。）
    新桶让单次搬移节点数变多，这是最容易想"调大一点"的时刻——
    详见 15.5 的两道闸门，新桶复用它们，超预算就提前中止、少排几行。
 
@@ -1780,6 +1916,1478 @@ aborted 的默认行为一致）、其余（created/title_updated/pinned_updated
 不生效，本地路径原样工作。全套回归在 `test-cloud-bucket.mjs`
 （127 项，含倒序重放 8 条回归锁）。
 
+---
+
+### 15.8 会话右键「到最顶」（2026-10-03）
+
+用户诉求：**把某个会话置顶，并放到置顶区最前**；已置顶/未置顶都要能用，
+**不需要先给这个会话发消息**。
+
+#### 走的是宿主自己的语义，不是我们发明的
+
+`pinned-items-order` 是宿主持久化的**有序数组**，宿主已经把整条链路接好了：
+
+```
+handlePinSession(sessionId, pinned, insertIndex)        ← asar @317043972
+  ├─ if (isReadOnlySessionById(id, src)) return;        ← 静默拒绝
+  ├─ next = updatePinnedRefs(order, {session,id}, pinned, insertIndex)
+  │         先把自己 filter 掉，再按 clamp 后的下标插回去
+  │         insertIndex 缺省 = 追加到末尾；insertIndex = 0 = 插到最前
+  ├─ setPinnedItemsOrder(next)                          ← 乐观更新
+  └─ await pinSession(id, pinned, insertIndex)          ← 落库（asar @317045053）
+       失败 → 宿主自己回滚数组 + error toast
+```
+
+所以「到最顶」= 以 `insertIndex: 0` 调这一条。**对已置顶项天然幂等**
+（先摘出再插到 0），对未置顶项是「置顶 + 首位」一步完成。
+
+#### ⚠️ 两参 props 回调**绝对不能**拿来用
+
+侧边栏行组件收到的 prop 是**两参 wrapper**：
+
+```js
+// asar @316963124 / @317072055
+onPinSession: (e, t) => void u.handlePinSession(e, t)
+```
+
+调 `onPinSession(id, true, 0)` 的第三个实参**会被静默丢弃**，
+宿主随即把会话**追加到置顶区末尾**——正好是「到最顶」的反面，
+而且**没有任何报错**。因此本项目**从不调用 props 上的任何 pin 回调**。
+
+真正的三参 `useCallback` 在侧边栏容器 fiber 的 `memoizedState` 钩子链里。
+选择器是**精确匹配**，不是"找一个同名函数"：
+
+| 判据 | 排除掉谁 |
+|---|---|
+| `memoizedState` 形如 `[fn, deps]` 且 `deps.length === 7` | 非 `useCallback` 节点、6 参的 sidebar hover 回调 |
+| `fn.length === 3` | 两参的 `onToggleSession` 之类 |
+| `fn.toString()` 同时含 `.pinSession` 与 `.getSessionInfo` | `handlePinAgent`（8 参依赖、只调 `pinAgent`）、同形的悬停回调 |
+| `deps[2] === 'local'` | 云端视图那一份（云端先 fail closed） |
+| `deps[0](id, src)` 为假 | 只读会话（宿主会**静默 return**，调了等于没调） |
+
+`deps[1]` 就是宿主当前的置顶顺序数组，「已经在首位」是**读它**判出来的，
+不是记在本项目里的缓存——宿主失败时会把自己的数组回滚，本地缓存会跟它永久分歧。
+
+#### 能力不足一律 fail closed
+
+拿不到、拿到多个、只读、云端——**四种情况都注入一个禁用菜单项并把原因写在脸上**
+（例：`到最顶（no-handle-pin-session）`），**没有兜底路径**：
+不回退去调 props 回调、不找动作注册表、不走后端 fetch、不碰 token/端口。
+更**没有**"只在渲染层把它排到最前"的假置顶：那种做法宿主数组没变、
+重启即失效、别的视图看不到，还会让人误以为置顶成功。
+
+#### 只在用户真的点了的时候才动手
+
+- 只监听 `contextmenu`（捕获阶段，**不** `preventDefault`、**不** `stopPropagation`），
+  不碰普通 `click`/`input`/`keydown`。
+- 菜单项是**追加**在宿主菜单末尾的一个 `li.ant-dropdown-menu-item`，
+  沿用宿主自己的 `matrix-menu-item` 结构，**原有条目与分隔线一个不动**。
+- 菜单归属用 **fiber 身份**判定：从被右键的行向上找到带 `menu` 数组的那个
+  dropdown fiber，再要求弹层的 fiber 链**能走回同一个 fiber**。
+  只看 class 是不够的——`mavis-sidebar-session-menu` 也被侧边栏筛选菜单用着；
+  复制子菜单（`mavis-sidebar-copy-popup`）也必须排除。
+- **只往用户看得见的弹层里注入**。`rc-trigger` 关闭时会先把浮层留在 DOM 上跑完
+  关闭动画，之后 antd 还可能把它缓存住：节点、条目、fiber 全都还在，
+  `getClientRects()` 却已经是空的。往那儿注入 = 造一个用户永远看不到的菜单项，
+  而 `injected` 还报 1。看不见就跳过并**继续往后找**同 owner 的可见弹层。
+  `reapTopmost()` 同理：item 还 connected 但所在浮层已不可见时，计数归零，
+  **不把隐藏项冒称成用户能看见的东西**。
+- **一次右键一条链，两道独立的闸门**。捕获阶段必然早于宿主打开浮层，
+  所以菜单是随后才出现的，只能靠有界重试去找它。链会跑飞的情形有两种，
+  应对它们的顺序也是确定的——**先取消，后代次**：
+  - 一次新的右键顶替了旧链。
+    - **第一道：取消仍在队列里的定时器。** 已入队但尚未执行的 timer
+      **是可以**被 `clearTimeout` 取消的，所以这一道正常生效时通常就够了。
+      （**不**要把它说成"取消不掉"。）
+    - **第二道：`topmostGeneration` 纵深防御。** 每次开新链 +1，
+      每个 attempt **第一件事**就是比对本链代次与当前代次，对不上立刻返回。
+      它**不依赖**取消是否登记、id 是否还在 `topmostTimers` 里、
+      以及取消是否赶在回调执行前生效——所以第一道出 bug 时它还站着。
+      `dispose()` 同样让代次失效。
+  - 宿主把**同一个 DOM 节点**换成了别的会话。链在开链时**快照**当时的
+    `data-session-id`，attempt 每次复核；对不上报 `row-retargeted`。
+    只查 `isConnected` 是不够的——侧边栏不会因为换会话就卸载那个节点。
+- 点击时**重新解析**能力（重渲染后闭包里的数组是旧的），并复查：
+  菜单项还在不在、行还在不在、行的 `data-session-id` 是不是当初那个、
+  有没有别的调用在飞。**行已卸载就不许去置顶接管它位置的那个会话。**
+- 全局 busy：宿主是从它闭包里的数组出发做乐观更新的，两次并发调用会让第二次
+  用第一次的旧快照落库。
+- 宿主回调**自己 catch、自己回滚、自己弹 toast**。它返回的 Promise 兑现
+  **不等于成功**，所以本项目**不额外宣告成功、不额外弹提示**。
+
+#### 键盘：**Tab 可达，方向键不参与**（已知限制，不要写成"完整支持键盘导航"）
+
+| 键 | 行为 | 说明 |
+|---|---|---|
+| `Tab` | **可达** | 项带 `tabindex="0"`；弹层是开着的真实 DOM，Tab 能落到它上面 |
+| `Enter` | 激活 | Enter 没有默认行为，**不**调 `preventDefault` |
+| `Space` / `Spacebar` | 激活，**并调 `preventDefault()`** | 空格在聚焦元素上的默认行为是滚动最近的可滚动祖先——侧边栏列表正好就是。**不挡，侧边栏会跟着滚** |
+| `Escape` | **完全不碰** | 关菜单是宿主 rc-menu 的事 |
+| `ArrowUp` / `ArrowDown` | **不参与宿主的菜单漫游** | 见下 |
+
+> ⚠️ **方向键是已知限制，不是"已支持"**。宿主 rc-menu 用**漫游 tabindex**
+> 加自己的键盘处理，驱动的是**它自己渲染的**那些项；追加进去的 `li` 不在
+> 那份名单里，所以 `ArrowDown` 会**跨过**「到最顶」。
+> 也就是说：**键盘可用（按一次 Tab 能到），但不与宿主其余项等效。**
+> 要自己接管方向键就得**全局拦截键盘事件**，那比"多按一次 Tab"坏得多，
+> 所以**不做**。任何文档或汇报都**不得**把这一项表述为
+> "菜单项完整支持键盘导航"或"方向键与原生一致"。
+
+监听器只有**一个**，挂在这个 `li` 上，**没有**任何全局键盘拦截，也**不**
+`stopPropagation`；合成派发的按键（`isTrusted === false`）什么都触发不了，
+连计数都不加。
+
+> ⚠️ **重试窗口本轮有意不动**：仍是 `0ms / 8ms / 16ms` 共 3 次尝试。
+> 要不要放宽由**主对话真机 20 次右键的命中率**决定，不由这里的推断决定。
+
+#### 运维可观测（纯只读）
+
+```js
+window.__mmxStatus.topmost()          // 不用点任何东西
+// { available, reason, id, source, alreadyTop, orderLength, orderFirst,
+//   injected, busy, clicks, calls, noops, blocked, lastReason, lastSessionId }
+```
+
+`reason` 取值：`ok` / `already-top` / `no-handle-pin-session` /
+`ambiguous-handle-pin-session` / `readonly-session` / `cloud-not-provable` /
+`source-not-local:<src>` / `no-session-row`。
+这个纯读结果随每轮 `refresh()` 一起回给 daemon，进 `tick N:` 日志行——
+**运维不用点菜单就能判断"是没实现"还是"实现了但宿主不暴露"**。
+
+#### 附带修掉的三个置顶区生命周期缺陷
+
+| 缺陷 | 原因 | 现在 |
+|---|---|---|
+| 汇总条被永久留在置顶区末尾 | `ensureSummary` 只校验"父节点是 section"，header 单独重挂的帧会把追加过的节点留在末尾，而父节点判据依然成立 | 位置也是正确性的一部分：必须是 `section.children[1]`，每轮复核 |
+| 标题叫「更多」的置顶会话被误点 | `pinnedTruncButton` 只按 `textContent` 全等匹配 | 结构 + 文案双判据：排除任何 `[data-session-id]` 子树内的按钮、要求父容器确实持有行、文案只认 asar 里那几种（含 `展开其余 N 项`） |
+| 展开记忆变成单向棘轮 | 宿主展开后**不渲染任何收起控件**（按钮只在 `ec && !eo` 时存在，且容器里只有 `el(!0)` 这一个 setter 调用点），用户回不去 | 在置顶区注入一个可见的「收起置顶」控件：只清**本工具**那一个 localStorage 键，并**明说**当前已展开的列表要等宿主重挂才收起。**不隐藏任何真实会话行** |
+
+#### 回归与变异证明
+
+| 文件 | 断言数 | 覆盖 |
+|---|---|---|
+| `src/test-reorder-pinned.mjs` | 50 | 置顶区排除（含 15 层深的真置顶区）、变更检测、嵌套根多轮收敛、预算原子性（切片出厂代码 + 假 DOM） |
+| `src/test-topmost-menu.mjs` | 603 | 能力解析、真实行内 Dropdown 拓扑、当前半边 fiber、菜单归属、键盘（Space preventDefault / Enter 不挡 / 方向键不接管）、关菜单、可见浮层、代次失效、session 快照复核、显式三参、竞态与 fail closed；13-21 节为弹层实录：四道门各自只在真实出口记、owner 四态与 39/40 真边界、严格双向 alternate 配对不参与放行、截断只截诊断、递归严格形状（键/类型/无别名）+ 十个反例、按序位在助手自己的 try 内真注入（8 场景 × 7 注入点，产品返回值/理由序列/逐元素求值序列全部不变）、跨候选污染不可见、读数边界（切片出厂代码 + 假 fiber 树） |
+| `src/test-pinned-lifecycle.mjs` | 73 | 汇总条位置、截断按钮作用域、展开记忆与 restore 共用一个分类器、展开逃生、展开守卫、dispose（含代次失效与诊断拆除）、debounce |
+| `src/test-topmost-diag.mjs` | 144 | 最小主证探针：nomenu / nopopup 记在工厂自己的 return 点、connected / retarget / append、三次上限与 0/8/16 窗口、earlyStop 链级记录、快照行断开即清（不被 reap 早退挡住）、dispose 清理、selection 置顶优先、expando 计数与 anchor 形状、root 出厂 40 与 extended 256 分开、出厂契约未被动；W11b 改成逐层**精确键**白名单、W14 改成对弹层侧信道的实话断言；W16 接线（信封/槽/stage 归属/三戳校验/预算/Start-Reap-Dispose）、W17 拷贝白名单与十五个反例、W18 collector 逐层新建不回流（切片出厂代码 + 假 fiber，见 15.9） |
+
+**43 个变异全部被证伪**（`node .\src\run-mutations.mjs` 一次跑完并打印矩阵；
+每个都让对应断言变红）：
+
+| 组 | 变异 | 重新引入的缺陷 |
+|---|---|---|
+| 排序 | `d1` | 不再排除置顶区 |
+| | `d2` | 变更检测回退到"下标派生"的缓存键 |
+| | `d3` | 预算检查挪回搬移循环内（中途放弃 → 乱序） |
+| | `d4` | `pinnedZoneOf` 回到定深 12 层循环（15 层之上的真置顶区被搬） |
+| 菜单 | `m1` | 调用少传第三参（下标变 `undefined` → 追加到末尾） |
+| | `m2` | 不校验菜单归属这一行的 portal |
+| | `m3` | `clearTopmostItems()` 不做事（旧项泄漏） |
+| | `m4` | 点击时不复查行身份（卸载后误钉别的会话） |
+| | `m5` | 放松钩子选择器（6 参诱饵被误认） |
+| | `m6` | 去掉 `isTrusted` 守卫 |
+| | `m7` | `rowMenuFiber` 回到只走上溯（真实拓扑下**根本找不到菜单**） |
+| | `m8` | 不再证明当前挂载的是哪一半 fiber（陈旧半边） |
+| | `m9` | 菜单项失去 `tabindex` 与 keydown（键盘不可达） |
+| | `m10` | 点击后不调用宿主的关菜单回调 |
+| | `m11` | 菜单里显示内部错误码而不是中文 |
+| | `m12` | 归属判定从"最近菜单拥有者"弱化为"在该 Dropdown 之下"（命中 hover 菜单） |
+| | `m13` | 空格键不再 `preventDefault`（侧边栏跟着滚） |
+| | `m14` | 去掉重试里的**代次比对**（`clearTimeout` 故意保留） |
+| | `m15` | 去掉弹层可见性闸门（注入到正在关闭/已缓存的浮层） |
+| | `m16` | `dispose` 不再让代次失效（`clearTimeout` 保留） |
+| | `m17` | 弹层实录退回**每次调用共用一个 record**（候选之间互相覆写） |
+| | `m18` | 截断上限从 4 变成 64（诊断不再有界） |
+| | `m19` | 上溯走到 null 也报 `budget`（两种"停"分不开） |
+| | `m20` | alternate 配对从严格双向 AND 变成单向 OR |
+| | `m21` | 命中出口去掉 `ulExpando` 入口守卫（入口没记上仍伪造出口状态） |
+| | `m22` | hidden 出口把 `visible` 报成 `null`（"跑过"与"没跑到"混为一谈） |
+| 生命周期 | `s1` | 汇总条只校验父节点、不校验位置 |
+| | `s2` | 去掉"不在会话行内"的守卫 |
+| | `s3` | 去掉"父节点持有行"的守卫 |
+| | `s4` | 折叠态也出现「收起置顶」 |
+| | `s5` | 展开守卫的高度阈值变成 0 |
+| | `s6` | dispose 不摘 contextmenu 监听 |
+| | `s7` | 点击记忆回退成裸文本比较（与 restore 的分类器不一致） |
+| 诊断 | `g1` | `nomenu` 不记（真实卡点丢失，探针只能靠猜） |
+| | `g2` | `nopopup` 不记（分不出"没菜单"与"没弹层"） |
+| | `g3` | 快照清理挪到 `reapTopmost` 的 early return 之后（reap 早退时快照永远挂着） |
+| | `g4` | `earlyStop` 不记（链被掐断的事实丢失） |
+| | `g5` | 去掉 stage 归属门（`nomenu` 之类也能挂上残留信封） |
+| | `g6` | `Take` 取走信封却不清槽（残留跨到下一次 attempt） |
+| | `g7` | 白名单拷贝退化成 `Object.assign`（未知键 / DOM / 输入别名一起进 payload） |
+| | `g8` | 不校验不可空计数（缺失或非有限值被当成量出来的数） |
+| | `g9` | 不校验 chain 戳（被接管那条链的 trace 被当成本次的） |
+| | `g10` | collector 不再逐层重建（payload 与诊断内部别名，改输出会回流） |
+
+断言的是**出厂代码跑出来的行为**，不是源码里的字符串。
+> 跑红的判据是**断言失败**。一个变异如果让套件**崩溃**而不是失败，
+> `run-mutations.mjs` 会把它算成问题（`CRASH`），因为崩溃说明后面的行为
+> 根本没被执行到。
+
+#### 未测（明确登记）
+
+- **完整应用重启后的持久性未测**：本轮不重启宿主（会打断用户活任务）。
+  改用「只读导出 `pinned-items-order` → 重新注入 → 视图重挂 → 再导出比对」证明，
+  **不得**用这个结果代替重启验证。
+- **云端会话置顶到顶未交付**：`cloud-not-provable`，按 fail closed 处理。
+- **「沉底」的用户报告路径未复现**：见 15.5 末尾的归因纪律。
+
+---
+
+### 15.9 `topmostDiag` 最小主证探针（2026-10-03，**不是修复**）
+
+> **这一节不修任何东西。** 真机上的症状（右键菜单里没有「到最顶」，
+> `api.topmost().reason` 报 `no-fiber-root`）到本节为止**仍未定位、未修复、
+> 未在真机验证**。这一节只把"到底卡在哪一步"变成可读的事实。
+
+#### 为什么需要它
+
+现场只有一句 `no-fiber-root`，它同时对应至少两种完全不同的成因，
+所以**不能**拿它当结论用。这个探针的唯一任务是回答一个问题：
+
+> 右键之后，工厂代码**自己**走到了哪一步、在哪一步返回了 `false`？
+
+#### 它怎么做到不撒谎
+
+关键在于**不在诊断里复刻工厂逻辑**。上一版探针（已冻结废弃）复刻了一份
+`rowMenuFiber` 的子树 DFS，结果那份复刻比工厂**更宽松**：工厂的兄弟链
+只能从 `fb.child` 起走，复刻版却独立走 `it.f.sibling`，于是工厂返回 `null`
+的地方复刻版报 `found`——把真正的 `nomenu` 读成"菜单找到了"。
+
+所以本探针**不做**这些事（`test-topmost-diag.mjs` W14 逐项断言它们连编译
+都没进探针；查之前先剥注释，否则那段解释用的注释本身会被当成罪证）：
+
+- 不镜像 `rowMenuFiber` 的 DFS
+- 不做 `currentFiberOf` / `currentHostRoot` / `chainTop` 的半边证明
+- 不输出 dfs / raw-vs-current 任何一个字段
+
+**关于"弹层"这一条，2026-10-03 有一处必须改口的更正。** 本节早先写的是
+"不扫弹层、不输出 popup"。现在 `nopopup` / `append` 这两条 attempt 上**确实**
+带一个 `popup` 字段，所以那句话已经不准了。改口后的准确说法是：
+
+- 探针**不扫弹层**。它自己不调用 `querySelectorAll('.ant-dropdown-menu')`、
+  不调用 `fiberOf`、不读 `memoizedProps`、不求值可见性、不做任何 `.return`
+  上溯（`test-topmost-diag.mjs` W14e 对弹层实录那一整段源码逐个禁掉这些名字）。
+- `popup` 里装的是**出厂 `popupForMenu` 那一次循环自己的实录**，不是诊断重新
+  算一遍的结果。它挂在四个真实出口与 `nearestMenuOwner` 的两个真实出口上，
+  一个新循环、一次新 DOM 求值、一次新 owner walk 都没有加。
+- 所以它能回答"这一次停在了哪道门"，**不能**回答"为什么停"，也**不能**回答
+  "产品返回了什么"（见下面「读数边界」）。
+
+
+它只在**工厂自己的 return 点**上记一行字：
+
+| stage | 记在工厂的哪一行 | 出厂 `lastReason` 同时是 |
+|---|---|---|
+| `nomenu` | `tryInjectTopmost` 的 `!menuFiber` | `no-menu-fiber` |
+| `nopopup` | `tryInjectTopmost` 的 `!ul` | （无，这行本就不写 reason） |
+| `append` | 注入成功 / 认领已有项 | `ok` 或 `already-top` |
+| `connected` | `attempt` 的 `!row.isConnected` | `row-gone` |
+| `retarget` | `attempt` 的 sessionId 变了 | `row-retargeted` |
+
+一次右击最多 3 条 `attempts`（与工厂的 `tries` 上限一致），另有：
+
+- `capped`：`tries >= 3` 的布尔。**它不覆盖最后一次的真实 stage**——
+  把最后一次写成 `'cap'` 恰好会毁掉 `nomenu` / `nopopup` 的区分，那是这个
+  探针存在的理由。
+- `earlyStop`：`{chain, reason}`，记在**链**上而不是伪造一个 try。
+  `superseded` = 上一次右击还有排队 timer 就被接管；`disposed` = 被拆。
+- `root.failureKind`：`ok` / `no-expando` / `no-fiber` / `over-shipped-cap` /
+  `root-budget-ended` / `root-not-found` / `threw`。出厂看的是 depth 0..39，
+  所以 root 落在 **depth ≥ 40** 时出厂解析不出来——这条和"root 根本不存在"
+  是两回事，必须分开读。
+- `selection`：`pinned-first` / `document-first` / `none`，与 `api.topmost()`
+  的默认取行顺序一致，**只出枚举，不出 id**。
+- `phase`：恒为 `unknown`。这个探针**不观察弹层树的当前状态**，所以它没有
+  资格声称自己与某一次 attempt 同时态；晚到的 DOM 状态不得被读回当成那次
+  失败的原因。它带的 `popup` 不违反这一点：那是那一次 attempt **当时跑过**的
+  循环，而不是采集时刻的 DOM。
+- `durationMs`：开销是**量出来的**，不是声称"可忽略"。
+
+#### `attempt.popup`：那一次 `popupForMenu` 循环的实录
+
+只有 `nopopup` 与 `append` 这两个 stage 会带它——因为只有这两个 stage 是
+`popupForMenu` 之后才记的。`nomenu` / `connected` / `retarget` 一律是 `null`，
+并且**顺带把槽里任何残留信封清掉**。
+
+```
+attempt.popup = {
+  identityOnly:true, loopTotal, scanned, returned,
+  forkCopy, forkNoItems, forkOwner, forkHidden,
+  accepted, dropped, noRecord, candidates[ <=4 ]
+}
+candidate = {
+  i, outcome, copy, hasItems, visible,
+  ulExpando, ownerFound, ownerEnd, hops, ownerCap,
+  ownerIsAlternateOfMenuFiber
+}
+```
+
+`outcome ∈ copy | no-items | owner-mismatch | hidden | accepted`，
+`ownerEnd ∈ found | budget | chain-ended | no-fiber`。
+
+| 字段 | 只能证明这一件事 |
+|---|---|
+| `loopTotal` / `scanned` | `querySelectorAll` 找到了几个候选、循环开出了几条记录。**不等**：故障时可以少记（见「读数边界」）。 |
+| `forkCopy/NoItems/Owner/Hidden`、`accepted` | 四个真实出口各自被走到几次。**不受"只留 4 条"限制**——第 5 个候选照常参与出厂判定，只是不入表，`dropped` 记 1。 |
+| `returned` | 被接受那条候选的**下标**；没有任何一次 accepted 时是 `null`。 |
+| `candidates` | 前 4 个候选的明细，按扫描顺序。**第 5 个及以后的明细没有**（只留计数）。 |
+| `candidate.i` / `outcome` | 不可空，非法就**整份拒成 null**（宁可没有读数，也不要拿 0 / unknown 冒充一次真实分叉）。 |
+| `copy` / `hasItems` / `visible` | `null` = **这道门还没跑到**，不是"跑出来是空"。`owner-mismatch` 的候选 `visible` 必然是 `null`：它在 owner 门就 `continue` 了，可见性门从未对它求值。 |
+| `ulExpando` | `null` = 门没跑到；`false` = 入口就没有 fiber；`true` = 有。**只在入口写一次**。 |
+| `ownerEnd` | 四态互斥。`found` = 走到了 menu fiber；`budget` = `i` 撞到 40 且 fiber 仍非空；`chain-ended` = fiber 先变 null；`no-fiber` = 入口就没 fiber。**走到 null 一律 chain-ended，绝不写 budget。** |
+| `hops` / `ownerCap` | 上溯实际走了几步 / 出厂那个 40。44 跳的链也只会记 40——上溯没有为诊断多走一步。 |
+| `ownerIsAlternateOfMenuFiber` | 严格**双向** AND 的身份旁证：单向成立是 `false`，同一对象是 `false`。**它不参与任何放行**（配对为真照样 `owner-mismatch`，配对为假照样 accept），也**不据此声称哪一半是当前树**。 |
+
+#### 读数边界（这几条比字段表更重要）
+
+- **`accepted=0` / `returned=null` 不证明产品返回了 `null`。** 出厂可能返回了
+  某个 `ul` 而诊断没记上：比如构造候选 record 的助手在第一句就抛了，`fork`
+  照常计数、`returned` 留 `null`，而产品把项注入得干干净净
+  （`test-topmost-menu.mjs` 20.1-20.2 就是这个场景）。
+- **反过来，诊断助手首句抛错也不改产品行为**：它全在助手自己的 `try` 里。
+- **计数只是"已记的读数"**：故障可以少记、可以缺失，但**不会造出结果**。
+- **不要用 `总分叉 == scanned + kept` 之类的合计式在任意故障情形下推产品成败**，
+  只在无故障的正常路径上成立。
+- **产品主证仍然是 stage**：一条 `nopopup` / `append` 才是"出厂自己走到了哪里"。
+
+#### 传输契约（为什么它不会被算到别的 attempt 头上）
+
+`popup` 走一个模块内槽 `topmostDiag.popup`，不走返回值也不走参数：
+
+1. `Open` 先**无条件自 guard 清旧槽**，再造一份新 trace，并发布
+   `{chain, gen, attempt, trace}` 信封。三个归属戳**只活在信封里**，不进
+   trace、不进 payload。成功时信封里的 trace 就是调用点拿到的那一份。
+2. `Take` 先把信封抓在手里，**立刻清槽**，然后在 `try` 内读三个戳与 trace。
+3. `Copy` 逐字段白名单重建（**没有** `Object.assign`、没有展开、没有 JSON 克隆），
+   每个候选都新建，所以输出里没有别名，也不会泄漏输入对象或它的 getter。
+4. 三个戳里任何一个对不上当前链 / 代次 / 该是第几次 attempt，**整份拒成 null**。
+5. `Record` 的取数与记账是两个独立的 `try`：取数炸了 `popup` 降成 `null`，
+   而这一条 attempt **仍然照记**——出厂的 stage 是主证，不能被诊断自己的故障吃掉。
+6. 开新链（`Start`）、快照行真实断开（`Reap` 的断开分支）、`Dispose` 都清槽。
+7. collector 每次 `collect()` 都**逐层重建** attempt / popup / candidate，
+   **不读那个槽、不额外扫一次**（改输出不会回流到诊断内部）。
+
+归属戳存在的理由很具体：一条迟到的 trace 被算到另一次 attempt 头上，
+比没有这条 trace 更糟——它看起来像个测量结果。
+
+#### 没有动的东西（`test-topmost-diag.mjs` W15 逐项锁死）
+
+`TOPMOST_MAX_ANCESTORS = 40`、重试窗口 `0 / 8 / 16`、`topmostReason` 的写点
+多重集（14 处，逐字比对）、所有 `return` / 条件 / 原有函数的调用次数。
+弹层实录**没有**新增任何循环、任何 DOM 求值、任何 owner walk、任何可见性
+求值：`popupForMenu` 里的 `querySelectorAll` 仍然只有一次，每个候选到达哪道
+门就只被问一次（`test-topmost-menu.mjs` 18.* 用逐元素调用序列对照未注入参照）。
+`nearestMenuOwner` 的循环头与 `fiber = fiber.return` 的出现次数一字未改。
+
+`record` 全程包在 `try/catch` 里，抛错也不会影响工厂行为；collector 自己也有
+`try/catch`，并且在 refresh 表达式里单独包了一层——它抛错只降级成
+`{available:false,error:'collector-threw'}`，不会带走 `stats` 或 `topmost`。
+`schema` 仍是 `topmost-diag/1`，`refresh` 的出厂顺序（先 `apply()` 再
+`enforceNoAutoExpand()`）与 dispose 的监听摘除顺序未动。
+
+#### 怎么读
+
+正常 refresh 的返回里多了一个字段，和 `topmost` 平级：
+
+```
+topmostDiag: { available, schema:'topmost-diag/1', phase:'unknown',
+               chain, gen, capped, attempts:[…], earlyStop:[…],
+               row:{present,connected}, selection, expando, anchor,
+               root:{shipped,extended,failureKind}, durationMs }
+
+attempt:  { try, stage, chain, gen, popup }
+// popup 只在 nopopup / append 上是对象，其余 stage 是 null；形状见上节。
+```
+
+> 下面是**每个字段自身能证明的那件事**，不是成因结论。
+
+1. `attempts` 出现 `nomenu` ⇒ **那一次 attempt** 在 `!menuFiber` 就返回了，
+   与弹层无关。这**不等于**周期读到的 `lastReason` 仍是 `no-menu-fiber`：
+   后续 attempt 会把它改写成 `menu-not-found`，所以 `lastReason` 只能在
+   单次 attempt 内用来验证同源，不能跨 attempt 读。
+2. 出现 `nopopup` ⇒ **那一次**菜单 fiber 找到了、弹层没拿到。这与 `nomenu`
+   方向相反：`nopopup` 已经证明菜单 fiber 是找到了的。
+3. `capped` 只说明 3 次 attempt 用完了，本身不携带原因。只有当三条 attempt
+   的 stage **都是 `nomenu`** 时才可以说"这三次工厂始终没找到菜单 fiber"；
+   出现 `nopopup` 就必须改写成"菜单 fiber 找到了，弹层没拿到"。
+4. `failureKind === 'over-shipped-cap'` ⇒ **在被观察的那一行上**，按出厂 40
+   步没命中 root、按 256 步命中了。它不说明当次 `nomenu`／菜单项缺失就是它
+   造成的，**也不构成"把 40 改大就能修"的依据**。
+5. `failureKind === 'no-expando'` ⇒ **在被观察的那一行上**没有 react expando。
+   `rowMenuFiber` 的 anchor 分支是先取 `[data-shortcut-session-target]` 再从
+   anchor 的 fiber 上溯，**不经过行元素自己的 expando**，所以这一条推不出
+   "工厂怎么走都到不了菜单"。
+6. `row` / `anchor` / `root` 是**采集时刻**对快照行的观察，`attempts` 是
+   **链上真实发生过**的记录；`phase` 恒为 `unknown`，两者没有已证明的时序
+   关系，不要用采集时刻的 `root` 去反推某次 attempt 的失败原因。
+7. 拿到真机读数**之前**，不对成因下任何结论，也不改工厂逻辑。
+8. `attempt.popup` **只说明那一次循环停在哪道门**，不说明为什么停。特别地：
+   `forkOwner` 大不等于"归属判断错了"，`forkNoItems` 大也不等于"宿主没渲染
+   项"——它们只说明候选停在了那道门**之前**。哪一道是缺项成因，要靠真机读数
+   加宿主侧事实判断，本节不主张。
+
+#### 未测（明确登记）
+
+- **整个探针（含弹层实录）未在真机跑过。** 本轮不部署、不重启宿主，因此
+  **没有一条真机读数**。上面的 schema 是设计，不是观测。
+- **真机症状未定位、未修复。** 拿到第一条真机 `attempts` 之前，
+  不许对成因下任何结论，也不许改工厂逻辑。
+- 探针每轮 refresh 多跑两次 `querySelectorAll` 和两条 `.return` 上溯；
+  `durationMs` 是为此加的观测点，**实际开销未在真机测过**。
+- **弹层实录的真机开销未测。** 它不加新的 DOM 求值与新的上溯（这一点有
+  逐元素调用序列对照），但多出来的是**每候选两次字段写**与**每出口一次
+  计数**；这部分在真机上的耗时没有量过，而 `durationMs` 只覆盖 collector，
+  不覆盖 attempt 当时那一段。
+- **真机上的 `ownerEnd` 分布未知。** 桌面侧边栏的容器 fiber 深度、
+  `p.menu` 出现的位置、弹层 fiber 的挂载点都没在真机上量过，所以 39/40
+  这条边界在真机上究竟落在哪一侧，**本节没有任何数据支持**。
+- **`alternate` 配对在真机上的取值未知。** 假 fiber 上它可以取到 `true`，
+  真机上是否会出现严格双向配对**未观测**。它本来就不参与任何放行，所以即使
+  恒为 `false` 也不改变产品行为。
+
+### 15.10 红色悬停锁顶：单会话持续锁顶（2026-10-03，**离线实现，未部署**）
+
+#### 结论先写清楚
+
+这一节记录的是**一次离线实现及其证据**，不是一次交付，更不是一次真机验收。
+
+| 项 | 状态 |
+|---|---|
+| 代码落盘 | ✅ `src/lib/page-script.mjs` |
+| 离线行为套件 | ✅ `src/test-top-lock.mjs`，234 断言 / 0 FAIL |
+| 变异证明 | ✅ 16 条变异全部正常红、0 崩溃（并入 `run-mutations.mjs`，旧 43 条原样保留） |
+| **受控部署** | ❌ **未做**。daemon 是静态 import，重启 daemon 才能加载，而这仍是用户独有批准项 |
+| **真机悬停 / 点击** | ❌ **未做**。官方 Computer Use 的公开方法**不提供 hover**，主会话至今没有真正悬停过任何一行 |
+| 冷启动持久性、应用重启后的表现 | ❌ **未测** |
+| `pinned-items-order` 基线 29 vs 27 的裁决 | ❌ **仍阻塞**（见 §14.23，本节不碰它） |
+
+#### 它做什么
+
+- 侧栏每一行多一颗**红按钮**，点一次把这个会话顶到置顶区最顶，并且**持续保持**在最顶：
+  别人用原生 `pin` / `unpin` / 拖拽把它挪下去，后台会把它顶回来。
+- **同时只有一个锁**。点别行的红按钮 = 直接替换；再点当前那颗 = 解除。
+- 解除**只清本地意图**，不 unpin、不恢复旧位置——宿主原来的顺序原样保留。
+
+#### 三条必须分开的真相
+
+代码里这三样东西在命名、注释、断言上都是分开的，任何一处都不允许合并：
+
+1. **锁意图** —— `localStorage['mmxStatusTopLockV1']`，内容**只有** `{version, source, id}`。
+   没有排序表，没有标题，没有正文。
+2. **宿主位置** —— 唯一真相是宿主自己那份 pinned order，**DOM 从来不是证据**。
+3. **Promise resolve** —— 只表示"宿主处理完了"，**绝不表示它成功了**。
+   确认只认**调用之后重新解析出来的新鲜 order**。
+
+#### 授权与 fail closed
+
+- 写宿主仍然只有唯一那一个三参回调 `handlePinSession(id, true, 0)`（§4.1 T1）。
+  没有 props 路径、没有 `togglePin`、没有备用接口，**绝不 `insertBefore` 宿主置顶 DOM**。
+- **先存意图，存成功才允许调用宿主**；存储失败时**一次宿主写都不发生**，且原因对用户可见。
+- 云端 / 只读 / 无 fiber / 回调不唯一 → 显式禁用并给出中文原因。
+- 能力不足时**没有第二句台词**：不存在"降级可用"，不存在呈现层假置顶（T2）。
+
+#### 容器适配：只认已核的形状，认不出就不挂
+
+2026-10-03 从 `app.asar` 精确核实（关键坐标见 `page-script.mjs` 里的注释块）：
+
+| render site | 支持？ | 依据 |
+|---|---|---|
+| **3 · tf normal** | ✅ | 唯一带 `data-shortcut-session-target` 的行；悬停条 `absolute right-1 top-1/2 -translate-y-1/2 z-[1]` |
+| **5 · i$ pinned** | ✅ | 真正两个原生按钮（`unpin` + `B.L` 包的 `more`）；无 anchor，标题按自身 class 形状认 |
+| **6 · iK recent** | ✅ | 同上，`pin/unpin` + `more`；悬停条**定宽** `w-[60px]` |
+| 1 · project | ❌ | 另一套行壳 + 独立列表，**本项目显式不支持改造它** |
+| 2/4 · rename | ❌ | 行内是 input，没有悬停条 |
+| archived（只有 `more`） | ❌ | `actions` 里只有一个原生按钮，按按钮数判据拒绝 |
+
+**硬规则：`strip`、`mount 容器`、`标题` 三者都必须唯一命中**，命中 0 个或多于 1 个一律不挂按钮
+（`api.topLock().anchorRefused` 会计数，所以"按钮没出现"永远能被解释）。
+上一轮"条命中之后还能顺着 `continue` 退到更宽松的形状"是个真 bug，已修——
+它会让 archived 的 iK 行先被按钮数挡下、再被不检查按钮数的 i$ 行认领。
+
+#### 第三颗按钮的右边距：自有 scoped CSS，不改宿主 class
+
+追加一颗 30px 按钮会超出宿主给标题预留的空间。做法是**只读**宿主标题 class 里的
+`mr-2` / `mr-8` / `mr-10` / `mr-[60px]` 与 `group-hover:` / `group-focus-within:` 变体，
+把"原值 + 我们这一颗的宽度"写成**我们自己的一条规则**，挂在**我们自己的 marker 属性**上：
+
+- 标题：`[data-mmx-toplock-reserve]{margin-right: 38px}` + hover/focus-within 变体；
+- 定宽条（site 6）：`[data-mmx-toplock-strip]{width: 90px}`。
+
+宿主的 class 与 inline style **一个字都没动**，`app.asar` 没动，`dispose()` 会把 marker、
+按钮与样式节点全部摘掉。这是自有展示层调整，**不是排序**，因此不落在 T2 里。
+
+#### 键盘与无障碍
+
+- 原生 `<button type="button">`，**只挂一个 `click` 监听**，不挂 `keydown`。
+  Enter / Space 的激活完全交给原生按钮，因此不存在"键处理 + click 处理"双触发的问题，
+  也不会拦截宿主的按键。**注意**：本项目没有在 Electron 里实测过键序，
+  这里断言的是"我们自己没有第二条入口"，不是"浏览器一定按某顺序派发"。
+- **不使用原生 `disabled`**：原生 disabled 的按钮不能被聚焦，一旦能力中途失效，
+  当前锁的解除入口会连 Tab 都到不了。禁用态用 `aria-disabled="true"` + 视觉 + 业务拒绝。
+- **可见标签恒定**（`锁顶到最顶`），pressed 态一律交给 `aria-pressed`。
+  按 W3C ARIA APG 的 toggle button 语义，`aria-pressed` 成立的前提就是标签两种状态下读起来一样；
+  状态说明（再点解除 / 阻塞原因 / 暂停原因）放在 `title` 与 `aria-label` 上。
+- 全程不调用 `focus()`，重挂原节点不会抢走宿主的焦点。
+
+#### 后台维持：串行、有界、预算耗尽即显式暂停
+
+- 挂在**已有的** `apply()` 上：**不新增任何 observer / interval / rAF**。
+- 每一次真正写宿主都从 `TOPLOCK_MAX_MAINT = 3` 的预算里扣一次；扣光就
+  `phase=paused / reason=budget-exhausted`，在真人重新点一次之前**不再自动写**。
+  没有预算就意味着与外部反复对拉可以无限进行，那正是 toast 风暴的成因。
+- 宿主返回后另有 `TOPLOCK_CONFIRM_TRIES = 2` 趟**只读**确认窗口（React 重渲染不是同步的）。
+  窗口用完仍拿不到证据 = 回滚 / 静默拒绝 → **永久停用自动重试**。
+- 忙时其它锁意图可以安全更新（那只是一次本地写），但**绝不并发写宿主**；
+  在途调用的回执属于旧代次，不会改变新意图的状态。
+
+#### 目标消失：可证明才清锁
+
+| 观察到 | 处置 |
+|---|---|
+| 目标行不在 DOM，且拿不到任何可信 order | `paused: view-unstable`，**保留**意图 |
+| 拿到的可信 order 是**空的** | `paused: order-missing-id`，**保留**意图 |
+| 拿到可信 / 本地 / **非空** order，里面确实没有目标 | `cleared-gone`，**清锁**，且不 repin、不复活会话 |
+| order 非空、目标在里面但不在首位 | 有界维持（有预算） |
+
+**绝不用"连续两趟都没看见"来推断删除**——那是猜，不是证据。
+
+#### 与「到最顶」的关系
+
+两者共用**同一个跨入口 inflight 闸**（`hostGate`）。锁存在时，「到最顶」对**其它行**禁用并中文提示先解除；
+红按钮仍然可以替换目标。宿主自己的 pin / unpin / 拖拽 / 菜单一条都没被拦截。
+
+#### 只读诊断
+
+`api.topLock()` 返回意图、相位、原因、**宿主确认的当前位置**与一批计数器。
+它**不含** fiber、DOM、函数、会话标题或正文；唯一暴露的 id 就是这个功能被允许记住的那一个。
+
+#### 未测与已知边界
+
+- ❌ 真实 GUI 悬停、点击、视觉核对 —— **全部未做**。官方 SDK 无 hover，这是硬阻塞，不是疏漏。
+- ❌ 受控加载最终版（需重启 daemon，用户独有批准项）。
+- ❌ 应用重启后的持久性、冷启动路径。
+- ⚠️ `cleared-gone` 的"可信非空 order"判据来自**两个宿主事实**（渲染出的行 + 宿主自己的 order），
+  但"加载中途那一瞬的 order 也可能非空"这个残余窗口**没有被观测**，按 fail-safe 方向处理。
+- ⚠️ 云端视图、项目分组子列表、搜索过滤下的行为**未实现也未宣称**；本项目不对这些场景假装"永远第一"。
+- ❌ 真机开销（本按钮每趟 apply 对每行走一次 Map 查表，能力判定是懒解析 + 30 趟 TTL 缓存，未在真机量过）。
+
+
+### 15.11 锁顶 r2：两轮 review 的 BLOCK 修正（2026-10-04，**离线，未部署**）
+
+> 本节**只追加，不改写** §15.10。凡是 §15.10 里与本节冲突的段落，以本节为准；
+> 冲突点在本节末尾逐条点名，便于对照。
+
+#### 结论先写清楚
+
+| 项 | 状态 |
+|---|---|
+| 代码落盘 | ✅ `src/lib/page-script.mjs`（r1 `0cf4659…` → r2 `62df497…`） |
+| 离线行为套件 | ✅ `src/test-top-lock.mjs`，**293 断言 / 0 FAIL** |
+| 变异证明 | ✅ **69/69 全红、0 崩溃**（旧 43 + `t1…t16` + `r1…r10`），并入 `run-mutations.mjs`，旧 43 条原样保留 |
+| 全量套件 | ✅ 11 个套件 0 FAIL |
+| **离线浏览器夹具** | ✅ 已产出，**未在浏览器里打开过**（见下） |
+| **受控部署** | ❌ **未做**。daemon 静态 import，仍需用户独有批准项 |
+| **真机悬停 / 点击 / 键盘** | ❌ **未做**。官方 Computer Use 不提供 hover，本会话亦未开浏览器 |
+
+**r1（`0cf4659…`）被两轮独立只读 review 判 BLOCK，本节不复活它。**
+r2 是"离线绿"，**不是"通过"**：真实 GUI 验收门从未为这个功能打开过。
+
+#### 两轮 review 到底指出了什么
+
+判据、逐条修正和"怎么把它改回去证明修得真"都在
+`_diag-toplock/2026-10-04_0530-r2-offline-toplock/baseline.md` 与
+`counterexamples/red-then-green.txt`。摘要：
+
+- **A 红色按钮从来没红过**：图标是文本节点，CSS 里没有能选中它的颜色规则。
+  r2 换成出厂一次创建的 SVG，描边=空闲 / 实心=已确认，语义红 token，focus ring，30/32px 带单位。
+- **B reserve CSS 无界**：每趟追加一条规则，不同 margin 的两行互相覆盖，量错了元素。
+  r2 改成按 (rest, hover, focus, px, alwaysVisible, stripWidth) 生成的有限 key，静息态保留宿主原值，
+  行变未知形状时把自己的 marker 摘干净。
+- **C 后台拿"缺失"当证据**：目标被宿主 unpin 后下一趟又被顶回去；
+  借用 witness 的非空 order 缺目标被当成"已删除"而清锁（视图切换时必现）。
+  r2 统一：**任何后台写之前先证明 ref 在可信 order 里；证明不了就暂停、保留意图**。
+- **D 用户的退路取决于一个他取消不了的调用**：`isTarget && !hostCallBusy()` 让在途时点当前行
+  变成"重新落盘"，toggle 看起来什么都没发生。r2 解除优先于能力、优先于忙，且靠行自身 closest-id 证明。
+- **E 闸和预算是每次 bootstrap 一份**：第二次注入能并发写宿主；每次刷新补满 3 次预算。
+  r2 闸和运行时搬上 `window`，用不透明 ticket；预算与"不再自动重试"跨注入存活。
+- **F 每趟重建图标 / 标签 / 样式表**：r2 只在值真的不同时才写，样式表按 key 缓存。
+
+#### 顺带修掉的"假绿"（不是 review 提的，是重锚变异时发现的）
+
+- **21b 拿同一个节点当两个状态断言**：它先把 `mvs_a` 的按钮当 idle 读，锁完又把 `mvs_a`
+  当 locked 读。现改为读两行不同的按钮。
+- **21b 的 pending 不是产品不收敛，是 fixture 驱动缺失**：旧写法手调 `api.refresh()`，
+  把"点击 → 一次宿主调用 → 宿主换新数组 → 下一趟确认 → 再下一趟上色"压进同一拍。
+  现在 `pump()` 只走出厂那条 `MutationObserver(childList) → scheduleApply → rAF → apply`，
+  fixture 里没有任何一处直接调 `refresh()`。判据就是它——如果生产真的不收敛，pump 不会让它绿。
+  反向也钉死了：25.6b（原地改写同一个数组**不算** commit）、25.6c（先确认后暂停，
+  `confirmedAtTop` 必须清），防止"多刷几拍把 pending 洗成 confirmed"。
+- **7.x 只 spy 不冒泡**：假 DOM 现在按 `cancelBubble` 断冒泡，7.4–7.7 挂**真的**行/strip/body
+  监听器，并带一条对照组证明冒泡本身有效（宿主自己的按钮照常冒泡）。
+- **五条变异锚在已经不存在的代码上**（t2/t3/t4/t5/t12），抛 `anchor matched 0 times`，
+  被 runner 记成 CRASH 而非红。已重锚。
+- **四条变异是绿的**（t12/r4/r7/r9），等于什么都没测。已重定向到活代码，
+  r7/r4 另配了真反例（25.6b / 25.6c）。
+- **一次产品 bug**：用户点击传的是 `null` 而不是它发出时对着的那份 order，
+  于是身份校验对"唯一由用户触发的那条路径"从不生效。已改为传 `cap.order`。
+- `check(..., true)` 全部清空；`buttonFor()` 不再用真值 `MISSING_BTN` 冒充"按钮存在"，
+  存在性断言改走 `realButtonFor()`。
+
+#### 离线浏览器夹具（`.../browser/`）
+
+    cd _diag-toplock/2026-10-04_0530-r2-offline-toplock/browser
+    node serve.mjs          # http://127.0.0.1:8792/ ，自打印 pid，Ctrl-C 停
+
+`page-script.js` 是**由 `src/lib/page-script.mjs` 生成**的出厂 bootstrap，不是抄的；
+`fixture.js` 只桩掉四样东西：React fiber、宿主 pin 回调、pinned order、会话清单。
+事件派发与 `isTrusted`、焦点与 Tab/Enter/Space、`:hover` / `:focus-within`、
+`getComputedStyle`、**真的** MutationObserver / rAF / localStorage / Promise 全部是真的。
+服务端在本轮起停过一次并做过 HTTP 冒烟（`/ 200`、`/tw-stub.css 200`、`/fixture.js 200`、
+`/page-script.js 200`、`/nope 404`），**但没有在浏览器里打开过**。
+
+#### 本节取代 §15.10 的以下说法
+
+1. §15.10「目标消失：可证明才清锁」表中
+   **"拿到可信 / 本地 / 非空 order，里面确实没有目标 → `cleared-gone`，清锁"** —— **已取消**。
+   非空 order 缺目标**不是**"宿主加载完了"的证据（加载中途的快照长得一模一样），
+   现在与空 order 走同一条路：`paused: order-missing-id`，**保留**意图，既不 repin 也不清锁。
+2. §15.10 的 `cleared-gone` 措辞与"可证明才清锁"标题整体作废；
+   解除只剩**用户点一次**这一条路。
+3. §15.10「后台维持」里"在途时其它锁意图可以安全更新"补一句：
+   **解除意图除外**——在途时点当前行是解除，不受闸限制（它不写宿主）。
+4. §15.10「键盘与无障碍」中"Enter / Space 的激活完全交给原生按钮"这句**只覆盖设计**，
+   离线没有验证：假 DOM 不会把按键合成 click，**真实 Enter/Space 未测**。
+5. §15.10 的 `TOPLOCK_CONFIRM_TRIES = 2` 已改为 **12**（review 的迟到 commit 反例）。
+
+#### 未测与已知边界（不要越读）
+
+- ❌ **真实 Enter / Space**。4.x 只断言"我们没挂 keydown、只挂一个 click"，别当成键盘已验。
+- ❌ **真实 hover 视觉**（红、focus ring、30/32px、横向排列）。夹具刚产出，**未开浏览器**。
+- ❌ **真实 MMX GUI**。未启动、未探测、未重载；部署门仍关。
+- ❌ 真实 `setPinnedItemsOrder` 提交语义、真实 fiber 树、真实 hook 闭包、真实会话 id、
+  云端 / 只读分支。夹具只是近似，且已如实标注。
+- ❌ 应用重启后的持久性、冷启动路径。
+- ⚠️ §14.23 的 **DB 基线 29 vs 27 裁决仍阻塞**，本节不碰、不归因、不覆写。
+- ⚠️ 三套变异体系（rv13 的 16 / §14.23 的 43 / 本轮的 69）**不可相加、不可互相替代**。
+
+> 本节**不构成**「功能已交付」「已部署」「验收通过」或「问题已解决」。
+
+
+
+---
+
+### 15.12 锁顶 r3：**r2 判 NOT PASS**，三 MEDIUM + 一 LOW 修正（2026-10-04，**离线，未部署**）
+
+> 本节**只追加，不改写** §15.10 / §15.11。冲突点在本节末尾逐条点名。
+> 证据：`_diag-toplock/r3-2026-10-04_0700-offline-toplock/`。
+
+#### 结论先写清楚
+
+| 项 | 状态 |
+|---|---|
+| **r2（`62df497…`）判决** | ❌ **NOT PASS**。两份独立只读复审合计 **三 MEDIUM + 一 LOW**，本节全部修掉 |
+| 代码落盘 | ✅ `src/lib/page-script.mjs`（r2 `62df497…` → r3 `84ba6be1…`） |
+| 离线行为套件 | ✅ `src/test-top-lock.mjs`，**345 断言 / 0 FAIL**（r2 为 293） |
+| 变异证明 | ✅ **78/78 全红、0 崩溃**（旧 69 全部保留锚点与测试意图 + 新增 `w1…w9`） |
+| 全量套件 | ✅ 11 个套件 0 FAIL |
+| 结构门 | ✅ 新增 `src/structural-gates.mjs`（模板 / String.raw / 8 导出 / 三 builder / diff check）全绿 |
+| **离线浏览器夹具** | ⏳ r2 v1 / v2 两版都**未在浏览器里打开过**；r3 版另目录另端口单独冻结 |
+| **受控部署** | ❌ **未做**。daemon 静态 import，部署门仍关 |
+| **真机 / 浏览器** | ❌ **未做**。像素、键盘、点击、收敛一律**未通过未测** |
+
+**r3 仍然是"离线绿"，不是"通过"。** 真实 GUI 验收门从未为这个功能打开过。
+
+#### 三 MEDIUM + 一 LOW，逐条改了什么
+
+**M1（MEDIUM）共享闸在槽不可写时静默放行。** 旧 `hostGateState()` 在 `window[key] = fresh`
+抛异常或被 `Object.freeze(window)` 拒绝时，**照样把那个临时对象返回出去**并铸造票，
+于是两个注入实例各自以为自己拿到了闸 → 并发写宿主。r3 改为 fail closed：
+写完必须 `window[key] === fresh` 回读证明**同一个共享对象**真的进了 window，读回不一致
+（或写入抛错）一律返回 `null`；`take` 再验一次 `g.ticket === ticket` 才发票；
+`busy` / `release` 在拿不到运行时时不抛错、也不假装可写。**没有拿随机字符串去糊这个洞。**
+样式表另立 `__mmxStatusTopLockCssV1` 私有回退，使 fail closed 不会把 CSS 一起带走。
+
+**M2（MEDIUM）后台预算与"不自动重试"在重注入时被偷偷补满。** r2 的 `topLockLoad()`
+在 `owner !== id` 时**重新补满 3 次预算**，而 load / 重新注入**不是**用户手势；
+单目标运行时还留着一张按 history id 无界增长的 `blocked` 表。r3：
+
+- 运行时改成**单目标有界**：`{ owner, budget, reason }`。"不再自动重试"只属于当前 owner，
+  不是一张历史表。
+- **只有**"存储写入成功的、可信的、真实用户重新锁顶"才允许重新武装预算；
+  load / 重新注入 / 观察确认**一律只认领（adopt），不补满**。
+- 存储写失败**不清 blocked、不补预算**（r2 会清）。
+- 存下来的意图**不会**被自动清掉。
+- 拿不到运行时（槽不可写）时直接 `paused: runtime-unavailable`，不做任何维持。
+- 死代码删掉：`topLockDropIntent` 整个函数删除；只读不可达的 `calls` / `ticket` 字段删除；
+  公开诊断字段**未动**。
+
+**M3（MEDIUM）无 DOM 判据拿"witness 自己可写"当成"目标可写"。** r2 的见证行用自己的
+`view.id` 探可写性，却拿它去给 `intentId` 背书——判的是 A，行的是 B。r3 让见证行
+**独立探测目标**：在唯一且当前的 7-deps hook 上用 `deps[0](intentId, source)` 判目标，
+`source` 为本地值且 `order` 里含目标；`readOnly === true` / 抛异常 / 无法证明
+→ **零宿主写、显式暂停、保留意图**。见证行自己的可写性**不被借用**；
+current / unique-hook 要求**未放宽**，也没有发明新的宿主 API。
+
+**L1（LOW）票是 `mmx-toplock-<seq>`，"opaque / unguessable"的说法不成立。** r3 把票换成
+**每次调用一个的对象身份**（window 上的共享引用），迟到的回执只释放**自己那一张**；
+没有票 = 零宿主写，「到最顶」菜单路径同样。**这是实例之间的身份隔离，不是安全或认证边界**——
+同源改写 window 槽在范围内之外，本轮**不设计安全框架**。
+
+#### 顺带修掉的第 4 处产品问题（自查发现，未被要求，**可被否决**）
+
+存储**写**失败后，下一趟 `idle` 会把"没落盘"洗成"成功"（r2 的 `storageWriteFailed`
+只在同一趟内有效）。r3 让失败**跨趟保持**，直到某次写入真的成功。
+若主会话认为超出本轮范围，可整条回退，回退后 `w9` 变异失去覆盖。
+
+#### 测试有效性：修掉的"假绿"
+
+- **21.4** `buttonFor(...) !== null` 恒真 —— `buttonFor()` 的哨兵 `MISSING_BTN` 就是真值。
+  改走 `hasButton()` / `realButtonFor()`，并**全量审计**在场性断言，确认 `MISSING_BTN` 不再能顶包。
+- **5.2** 幂等性断言比的是两个**回退对象**，恒等 —— 改为比对真按钮。
+- **18.x / 25.5** 原来手写 `api.state` / 运行时预算 / owner 再读回来。r3 全部改成
+  **真点击 + 真宿主变更 + 出厂 pump 链**（`MO(childList) → scheduleApply → rAF → apply`），
+  fixture 里没有任何一处调 `api.refresh()`。仍然存在的**单元状态输入**已如实命名为单元测试，
+  行为连线另有独立小节，不混为一谈。
+- **25.7.4** 两条规则的 `||` 应为 `&&`，并分别证明两个 key 都在。
+- **`buildBootstrapExpression` 的 import 此前没有任何断言**。新增第 0 节：证明该导出可解析、
+  含 `__mmxStatusMain` 与 cfg、**出厂模板正文以且仅以一个 `\n` 开头**，本地切片与它的差别
+  **就是那一个换行**——这是**可解释的事实差异，不是字节相同**，本节不这么宣称。
+- 删掉"见上一节已断言"这类假注释。
+
+#### 变异与新覆盖
+
+新增 `w1…w9`（9 条，全部红）分别对应：M1 槽不可写 / M1 票身份 / M1 runtime fail-closed /
+M2 可信重锁不补预算 / M2 load 补预算 / M2 不自动重试的 owner 归属 / M3 借见证行可写性 /
+M3 丢弃目标只读判定 / 存储写失败被洗掉。
+**变异 id 特意从 `g` 改成 `w`**，因为 `test-topmost-diag.mjs` 早就占用了 `g1…g10`（菜单诊断），
+同名会让复审者对着两份不同的变异。
+
+r3 要求的**行为连线**已被 18.6 / 25.5 覆盖：存储写失败的暂停 → 重新注入**仍暂停且零宿主写** →
+真实解除 / 重锁被确认 → 宿主再压下来 → **正好一次**维持。
+
+#### 证据目录
+
+    _diag-toplock/r3-2026-10-04_0700-offline-toplock/
+      pre-SHA256.txt / freeze.md
+      browser-channel-boundary.md        官方 IAB 超时 + 零到达反证 + r3 读数口径
+      v2-readback-corrections.md         v1 事实更正、.w-[32px] 缺口
+      v2-selfexcitation-check.mjs / .txt 18 条断言：v2 不会自己激励自己
+      suites/all-suites.txt              11 套件完整原始输出
+      suites/structural-gates.txt        结构门
+      suites/test-top-lock-clean.txt
+      mutations/mutation-matrix.txt      78/78
+      counterexamples/red-then-green.txt 12 组 red → green 原始输出
+
+#### 本节更正的历史说法
+
+1. §15.11「r2 闸和运行时搬上 `window`，用**不透明 ticket**」—— **"不透明"从来不是安全承诺**，
+   旧票是可枚举的 `mmx-toplock-<seq>`。r3 换成对象身份票，注释已改成
+   "**实例之间的身份隔离，不是安全或认证边界**"。**历史证据目录不改写。**
+2. §15.11 的 `mutations` 记 **69** → r3 为 **78**（+9）。两数**不可相加**。
+3. §15.11 的断言数 **293** → r3 为 **345**。
+4. 上一轮 r2 证据里写的"**每行都拒绝挂按钮**"（v1 tf 形状）是**错的**：
+   **v1 的 tf 行能挂 B / C，只是没挂上按钮**。以
+   `r3-.../v2-readback-corrections.md` 为准。
+
+#### 未测与已知边界（不要越读）
+
+- ❌ **真实 Enter / Space**。4.x 只断言"没挂 keydown、只挂一个原生 click"。
+- ❌ **真实 hover 视觉**（红、focus ring、30/32px、横向排列）。r2 v1 / v2 夹具**都没开过浏览器**。
+- ❌ **浏览器事件到达**：主会话 IAB 通道对 8792 / 8793 均超时，事后读回是
+  **产品侧点击 0、夹具侧 `bub.red` / `bub.key` 全 0**。这只能说明**事件根本没到页面层**，
+  **不得**解释成"产品拒绝了任何东西"。像素 / 键盘 / 点击 / 收敛一律 **未通过未测**。
+- ❌ 真实 `setPinnedItemsOrder` 提交语义、真实 fiber 树与 hook 闭包、真实会话 id、云端 / 只读分支。
+- ❌ 应用重启后的持久性与冷启动。
+- ⚠️ `scheduleApply` 的 `pending` 闩锁在**掉帧**后不会自行恢复（r2 review FINDING 3）。
+  本轮**未修**（超出 r3 范围），如实登记。
+- ⚠️ §14.23 的 **DB 基线 29 vs 27 裁决仍阻塞**，本节不碰、不归因、不覆写。
+- ⚠️ 四套变异体系（rv13 的 16 / §14.23 的 43 / r2 的 69 / r3 的 78）**不可相加、不可互相替代**。
+
+> 本节**不构成**「功能已交付」「已部署」「验收通过」或「问题已解决」。
+---
+
+### 15.13 锁顶 r4：**r3 判 NOT PASS**，两处产品缺陷 + 一处局部 LOW 修正（2026-10-04，**离线，未部署**）
+
+> 本节**只追加，不改写** §15.10 / §15.11 / §15.12。证据：
+> `_diag-toplock/r4-2026-10-04_1000-offline-toplock/`。
+> 同目录下 `snapshot-r3/` 保存了 r3 冻结时的**完整前字节**（不只是 SHA），可以直接 diff。
+
+#### 结论先写清楚
+
+| 项 | 状态 |
+|---|---|
+| **r3（`84ba6be1…`）判决** | ❌ **NOT PASS**。两份独立复审合计 **两处产品缺陷** + **一处局部 LOW** |
+| 代码落盘 | ✅ `src/lib/page-script.mjs`（r3 `84ba6be1…` → r4 见 `freeze.md`） |
+| 离线行为套件 | ✅ `src/test-top-lock.mjs` **414 断言 / 0 FAIL**（r3 为 345）；`test-topmost-menu.mjs` **621 / 0**（r3 为 603）；`test-topmost-diag.mjs` **146 / 0** |
+| 变异证明 | ✅ **85/85 全红、0 崩溃**（r3 的 78 条**全部保留**锚点与测试意图 + 新增 `m23…m25` / `x1…x4`） |
+| 全量套件 | ✅ 11 个套件 **0 FAIL、0 非零退出** |
+| 结构门 | ✅ **两个 CWD 都可跑**（r3 只在 `CWD=src` 时成立，见下） |
+| **浏览器** | ⚠️ 主会话**已实际打开** r3 夹具：snapshot / screenshot **成功**，像素上**看到固定面板遮住三行右端**。**交互仍未通过**（详见 §未测） |
+| **受控部署** | ❌ **未做**，门仍关 |
+| **真机 GUI** | ❌ **未做** |
+
+**r4 仍然是"离线绿"，不是"通过"。**
+
+#### r3 的两处产品缺陷（复审发现的，r3 的测试没能抓到）
+
+**缺陷 1（到最顶菜单入口绕过了闸）。** r3 的 `onTopmostActivate` 写的是
+
+    topmostState.busy = true;
+    topmostState.ticket = hostCallTake();     // 闸拒绝时返回 null
+    topmostState.calls++;
+    ret = cap.fn(sessionId, true, 0);         // 照样调用
+
+r3 的共享闸会 **fail closed**（槽不可写时返回 `null`），但这条路径**把 `null` 丢掉了**，
+于是 r3 闸的每一条 fail-closed 分支在这条入口上**都是装饰**。
+顺带还有两个后果：`busy` 在取票**之前**就被置真，闸拒绝之后**不释放**；`calls++` 也照加，
+用户看得见的计数器会把一次拒绝显示成一次成功。
+
+r4：先取票，**`null` 即拒绝** —— 不调用 `cap.fn`、`busy` 不残留、`ticket` 不残留、
+`calls` 不增、`blocked++`、原因 `gate-unavailable`（界面上是中文：
+"置顶闸不可用，本次未对宿主做任何写入"，**不与 `busy` 混用**：
+`busy` 是"别人正在写，稍等"，`gate-unavailable` 是"闸本身不可用，等也没用"），
+菜单照常关闭（手势发生过，别把菜单吊在半空）。
+
+**缺陷 2（存储写失败闩永不清除）。** `topLockStoreSet` 成功路径只清了 `storageBroken`，
+**没清 `storageWriteFailed`**。于是**一次**写失败之后，`topLockTick` 之后每一趟都
+`paused: storage-write-failed` —— **包括用户再次点击、并且这次点击真的落盘之后**。
+表现是"存储已经恢复、意图也在、按钮还是不可用"。
+
+r4：**只有 `setItem` 成功**才清 `storageWriteFailed`；失败分支照旧置位；
+`load()` 与任何重画**都不碰**它（`w9` 的方向保留：失败不能被下一趟 `idle` 洗掉）。
+清除点**只有一处**，这是刻意的单点。
+
+#### 局部 LOW：CSS 注册表的死三元
+
+r3 的 `topLockCssRegistry` 结尾是
+
+    return window[KEY] === fresh ? fresh : fresh;
+
+一个**三路同值的假检查**：它声称验了 window，实际永远只能返回局部对象。
+把它改成"诚实的私有回退"的过程中，**新写的断言立刻查出它掩盖的真 bug**：
+私有对象**每次调用都重建**，于是槽不可写时每趟都拿到一份**全新的空规则集**，
+刚写进去的规则进了临时对象，**样式表是空的** —— 而且恰好发生在"什么都存不住"的那种 window 上。
+
+r4：私有回退缓存在模块局部 `topLockCssPrivateReg`，同一实例内每次调用看到同一个注册表，
+样式表真的拿到规则。共享闸与运行时**仍然拒绝**（它们的状态决定要不要写宿主，不是展示细节）。
+
+#### 测试有效性
+
+- 新增 **菜单 §22**：闸槽不可写（`Object.freeze` 的 window）→ 零宿主写 / order 未变 /
+  `calls` 不增 / `busy` 不残留 / 原因可读 / 中文文案 / 按钮仍可见；
+  **在途对照**（别人的票是**对象身份**）→ 在 `busy` 门上被拦（与 `gate-unavailable` 区分开）、
+  零宿主写、不抢票、**释放后同一个手势可恢复**；**可写对照** → 照旧成功、闸对象真的在 window 上。
+- 新增 **锁顶 §28**：红按钮入口同样三态（槽不可写 / 整窗冻结 / 他人在途 / 可写对照）。
+- 新增 **§29 存储恢复全链**：坏存储 + 真人点击 → 暂停、**零宿主写**、什么都没存；
+  连续重画洗不掉；**存储恢复后真人再点**（**此刻没有意图可解除**，所以恢复路径只能是"再点一次锁顶"）
+  → 真的落盘、**正好一次**三参宿主写（`index=0`）、新顺序确认；
+  **再连续 20 趟出厂 pump 仍是 confirmed**，原因不再是 `storage-write-failed`；
+  宿主再压下去仍能顶回。
+- 新增 **§30**：已锁目标行消失 / `removeItem` 失败 → 旧意图必须留下，存储一个字节不动。
+- 新增 **§31**：闸 / 运行时 / CSS **三个槽都不可写**时，样式表节点**仍真实挂进文档**、
+  规则**非空且含出厂基础规则与 reserve 规则**、花括号成对、无 `NaN/undefined/Infinity`、
+  长度有界、重画后**一个字节不变**，同时宿主仍零写。
+- `press()` 改用 `pressOrFail()`：原来 `press(null)` 会**抛异常**，而 runner 把崩溃记成
+  **PROBLEM 而不是红**，等于用崩溃盖住了本该红的断言。按钮不存在现在是一条可读的 FAIL。
+- `test-top-lock.mjs` 头部补上 `w1…w9` 与 `x1…x4` 的**真实清单**（不是"已测"注释）。
+
+#### 本轮还修掉的三处"证据本身"的毛病
+
+1. **结构门只在 `CWD=src` 时成立。** r3 写的是 `readFileSync('./lib/page-script.mjs')`，
+   从仓库根跑 `node mmx-status-github/src/structural-gates.mjs` 直接 **ENOENT 崩掉** ——
+   结构门最容易被这样"根本没跑"的方式静默跳过。现在按 `import.meta.url` 取模块目录，
+   并在第一行打印实际读到的路径与 CWD。**两个 CWD 都实测 ALL GREEN。**
+2. **`selftest.mjs` 的真实通过数是 116。** §15.12 / §14.26 的表格里记的是 `0`，
+   那是**当时抓取方式错了**（只读了 `pass=` 行），不是它没跑。**本节更正为 116 passed。**
+3. **"pump 自己不调 refresh" 与"reinject 明确用了 `api.refresh()` + `page.run()`"并不矛盾。**
+   正确说法：`pump()` 只驱动生产链，**从不调 `api.refresh()`**；
+   而 reinject 那条测试**故意**调 `api.refresh()` 并 `page.run()`，
+   因为它要的就是"重新求值一次 GENERATED 文件"这个真实路径。
+   **不要说成"整个夹具一次 refresh 都没有"** —— 那会把 reinject 的接线一起否掉。
+
+#### 浏览器事实（按主会话实测更正，不沿用旧句）
+
+- **writer 从未在浏览器里打开过 r3 夹具** —— 这只说明**我**没开。
+- **主会话已实际打开**：8792 / 8793 的 IAB 通道 **goto / domSnapshot / screenshot 均超时**；
+  事后读回是**产品侧点击 0、夹具侧冒泡计数全 0**。独立仪表复审进一步确认
+  `document` 捕获阶段 `bub.red = 0`，即**事件确实没到 document**，
+  **但"为什么没到"仍未证实** —— **禁止写成"平台已坏"或"产品拒绝了"**。
+- **8794（r3 夹具）本轮 snapshot / screenshot 成功**：`dom_cua.get_visible_dom`
+  **看到三颗 32/30/30 的红按钮**；像素上**固定面板遮住三行右端**，
+  覆盖了三颗图标，导致 hover 视觉无法验收；
+  `domSnapshot` 报 Internal error；对未被遮挡的合成对照的点击仍 **timeout 30000**。
+  **所以：像素可见 ≠ 交互通过。** 交互这一项**仍未通过**。
+
+#### 历史事实更正（不改写旧证据）
+
+- **"从未有人打开过浏览器"** —— 错。准确说法：**writer 没开过；主会话开过**，
+  且 8794 上拿到了 snapshot 与截图，**但视觉被面板遮挡、交互未通过**。
+- **"v1 的 tf 行能挂 B/C"** —— 句式有歧义。准确说法：
+  **v1 的 tf 行能挂出红按钮**（挂得上），**挂不上的是 B（ipinned）与 C（irecent）**。
+- **`strip marker = 1` 是产品正确行为**，不是漏挂：只有 `irecent` 的 `stripWidth` 非 0，
+  产品只对有固定宽度的 strip 打标（`topLockApplyReserve`）。**不要"改成 3"。**
+- **`Math.round(getComputedStyle(b).width)` 恒为 `NaN`** —— 因为 `Math.round("32px")`
+  就是 `NaN`（`Number("32px")` 不是数）。**与 `display:none` 无关，**
+  任何按钮都会这样。必须改用 `getBoundingClientRect()` 的数值，
+  并在**没有布局盒时明写"无布局盒"**，不伪造值。
+
+#### 未测与已知边界（不要越读）
+
+- ❌ **真实 hover 视觉**（红、focus ring、30/32px、横向排列）。主会话的截图上
+  **这三项被固定面板挡住**，因此**仍未通过未测**。
+- ❌ **真实 Enter / Space**、**真实点击 / 收敛**。8794 的点击仍 timeout，
+  原因**未证实**，不得归因给产品。
+- ❌ 真实 `setPinnedItemsOrder` 提交语义、真实 fiber 树与 hook 闭包、真实会话 id、
+  云端 / 只读分支。❌ 应用重启后的持久性与冷启动。❌ 受控部署。
+- ⚠️ `scheduleApply` 的 `pending` 闩锁**掉帧后不会自行恢复**（r2 review FINDING 3），
+  **仍未修**（范围外）。r4 的仪表侧会**按 handle 记账取消**，
+  但**不改产品调度**。
+- ⚠️ §14.23 的 **DB 基线 29 vs 27 裁决仍阻塞**，本节不碰、不归因、不覆写。
+- ⚠️ 五套变异体系（rv13 的 16 / §14.23 的 43 / r2 的 69 / r3 的 78 / r4 的 85）
+  **不可相加、不可互相替代**。r3 的 78 条**全部保留**。
+
+> 本节**不构成**「功能已交付」「已部署」「验收通过」或「问题已解决」。
+
+### 15.14 锁顶 r5：两条**测试**补强 + 三处**证据本身**的勘误（2026-10-04，**离线，未部署**）
+
+> 本节**只追加**，不改写 §15.12 / §15.13 的任何一行。
+> 证据：`_diag-toplock/r5-2026-10-04_1100-offline-toplock/`。
+> **本节不构成**「验收通过」「已部署」或「GUI 已验证」。
+
+#### 结论先写清楚
+
+| 项 | 状态 |
+|---|---|
+| **本轮改了什么** | **三个测试文件**（`test-topmost-menu.mjs` / `test-top-lock.mjs` / `run-mutations.mjs`）里的**断言**与**变异登记**；产品 `page-script.mjs` **只改注释，一个字节的逻辑都没动** |
+| 离线行为套件 | ✅ 11 套件 **0 FAIL、0 非零退出**（合计 **1770** 断言；r4 为 1754） |
+| 变异证明 | ✅ **87/87 全红、0 崩溃**（r4 的 85 条**全部保留**锚点与意图 + 新增 `m26` / `x5`） |
+| 结构门 | ✅ **两个 CWD 实测 ALL GREEN**（见勘误 3） |
+| **浏览器 / 真机 GUI** | ❌ **未测**。本轮 writer **没有开过任何浏览器**；受控加载授权与 §14.23 的 **29 vs 27 基线裁决**仍未解除，**部署门仍关** |
+
+#### r5 补强的两条测试（都是**断言空洞**，不是产品缺陷）
+
+**补强 1 — 菜单 §22.1「菜单照样关闭」原本是恒真断言。**
+旧断言是
+
+    p.api.state.lastClose !== null && p.api.state.lastClose !== undefined
+
+`lastClose` 的初值是 `''`，而**闸拒绝分支根本不赋值 `lastClose`**（它只调
+`closeHostMenu(menuFiber)` 并丢弃返回值）。所以无论菜单关没关，这个表达式都是真 ——
+把拒绝分支里的 `closeHostMenu` 整行删掉，**全绿依旧**。
+r5 改为断言**宿主自己的受控契约**：受控 Dropdown 的 `onOpenChange` 被调用
+**恰好一次**、实参是 `false`，并且宿主的受控 `open` 状态**真的从 true 变成 false**
+（夹具把这个回调建模成「宿主应用新状态再渲染」，与 React 受控组件一致）。
+新增变异 **`m26` 专门只删拒绝分支的 `closeHostMenu`** ——
+实测 `pass=621 fail=2`、**exit 1、stderr 空**，即正常 FAIL 而**不是崩溃**。
+`onOpenChange calls=[]` 这一行本身就证明旧断言是瞎的。
+
+**补强 2 — 存储 `topLockStoreClear` 成功清闩**此前**零覆盖**。
+闩 `storageWriteFailed` 只有**两个**合法清除点（成功 `setItem` / 成功 `removeItem`），
+r4 只测了第一个。§30.2 只证明了「`removeItem` 失败 → 意图必须留下」，
+**没有测恢复的那一半**：把 `topLockStoreClear` 里那行清除删掉，**全绿依旧**。
+r5 新增 **§30.3 / §30.4 / §30.5**（全部经由**出厂 bootstrap + 真按钮 + 生产 pump**，
+**不手种任何 flag / budget**）：
+
+    removeItem 失败（真失败）→ 恢复 remove → 重画**不能**把闩洗掉
+    → 模拟可信用户解除（真按红按钮）→ 存储与意图**真正**清除
+    → 20 趟出厂 pump 不再错误暂停在 storage-write-failed → 再次锁顶可 confirmed
+
+新增变异 **`x5` 只删 `topLockStoreClear` 里那行清除** ——
+实测 `pass=426 fail=2`、**exit 1、stderr 空**，红在
+`30.3 恢复后真人解除：不再是 storage-write-failed 暂停` 与 `30.4`，
+即**正是这条新链**在看。
+
+**顺带修掉一处已被 r5 打断的变异锚点。** r5 改了 `page-script.mjs` 的注释（勘误 1），
+而变异 `x1` 的锚点**含那段旧注释**，于是 `x1` 从「红」变成
+`Error: mutation x1 anchor matched 0 times`（**崩溃**）。
+x1 的锚点已重新钉到更正后的注释，意图不变（`topLockStoreSet` 不再清闩），实测仍红。
+
+#### 本轮勘误（三处**证据本身**的毛病，**只登记，不回改旧正文**）
+
+**勘误 1 — 存储闩是**两**个清除点，旧注释说成一处。**
+`page-script.mjs` 里 `topLockStoreSet` 的注释原文写着清除「belongs here and
+nowhere else」——**这句是错的**：`topLockStoreClear` 成功时同样清 `storageWriteFailed`
+（`removeItem` 成功也是一次成功的存储操作）。r5 **只改这段注释**，写明两个清点，
+并写明**不允许**清除它的位置（`load()` / 任何重画 / `topLockTick` / 两个失败分支）。
+**产品逻辑一个字节都没改**；x1 / x5 两条变异合起来证明**两处都还在**。
+
+**勘误 2 — r4 `freeze.md:38` 把 **r2 的 topLock 哈希串进了 r3 的 menu/diag** 对应值。**
+该句原文形如「它们的 r4 SHA 如上表第 3、4 行；r3 的对应值分别是 `1eb9cce8…`
+（顶层 lock 套件）……」——`1eb9cce8…` 是 **r2 的 `src/test-top-lock.mjs`**，
+**与 menu / diag 毫无关系**。正确事实是：**r3 的 `post-SHA256.txt` 根本没有
+`test-topmost-menu.mjs` 与 `test-topmost-diag.mjs` 这两行**（当时漏存），
+所以**它们的 r3 对应值不存在**，不是「等于 r2 的 topLock 哈希」。
+r4 的实际值是 menu `d8e6e288…`、diag `e4bc554e…`。
+
+**勘误 3 — §15.13 第 1 条把 **workspace root** 写成了「仓库根」。**
+原文写「从仓库根跑 `node mmx-status-github/src/structural-gates.mjs`」——
+这条路径是相对 **workspace 根** `G:\mmx-project\fix mmx\` 的，
+**不是**仓库根 `G:\mmx-project\fix mmx\mmx-status-github\`；在仓库根要写
+`node src/structural-gates.mjs`。r5 **实跑三个 CWD**，全部 exit 0 / ALL GREEN：
+
+| CWD | 命令 | 结果 |
+|---|---|---|
+| `…\mmx-status-github\src` | `node structural-gates.mjs` | exit 0，ALL GREEN |
+| `…\mmx-status-github`（**真仓库根**） | `node src/structural-gates.mjs` | exit 0，ALL GREEN |
+| `G:\mmx-project\fix mmx`（**workspace 根**） | `node mmx-status-github/src/structural-gates.mjs` | exit 0，ALL GREEN |
+
+三处 CWD 打印的都是**同一个**被读文件
+`…\mmx-status-github\src\lib\page-script.mjs`——这正是结构门按
+`import.meta.url` 取路径的意义（§15.13 第 1 条的修复本身是对的，**只有那句标签写错了**）。
+
+> **本节位置说明**：本节插在 **§16 之前**，**不是**文件末尾。
+> 这与 §15.13 插在同一位置，属既有惯例；本轮**未改写** §16 及之后的任何一行。
+
+### 15.15 锁顶 r5.1：F1 断言收口 + 三条口径勘误（2026-10-04，**离线，未部署**）
+
+> 本节**只追加**，不改写 §15.12 / §15.13 / §15.14 的任何一行。
+> 证据：`_diag-toplock/r5.1-f1-20261004-final/`（含 `snapshot-r5/`、`suites/`、`counterexamples/`）。
+> **产品字节未动**：`src/lib/page-script.mjs` 仍是 `acf12aa7…`，**逻辑零改动**。
+> **本节不构成**「验收通过」「已部署」或「GUI 已验证」。
+
+#### 15.15.1 F1 那一段的收口（**只改 test 侧**）
+
+§15.14 写的 F1 补强，r5.1 按复审意见**再收紧三处**，**产品一行未动**：
+
+1. **删掉 `dropdown.memoizedProps.open = true` 那行死写。**
+   它写的是一个**产品从不读**的字段（`page-script.mjs` 里没有任何地方读
+   `memoizedProps.open`），所以它看起来像证据，其实不是——它只是让前置断言
+   必然为真。删掉之后，菜单「点击前是开着的」这件事**只由夹具自己的播种负责**。
+2. **前置改成播种自检，并在 `item.dispatch` 之前取一次 `beforeOpen`。**
+   点击前记录 `beforeOpen`，点击后**同一条断言同时要求**
+   `beforeOpen === true && mopts.open === false`。
+   读一次存下来再断言，才使这两端构成一个**跃迁**，而不是两个各自独立、各自可能
+   因别的理由为真的终值。
+3. **注释改述 `mopts` 的身份**：它是**宿主受控契约的替身**，只负责记录产品
+   发出的调用；**不模拟 React 重渲染**，`open=false` 之后宿主如何重渲染
+   **本测试不涉及**。**只有 `mopts` 一份状态源**，没有引入第二个。
+
+**两条新反例**（`counterexamples/`，原输出留档）：
+
+| 反例 | 做法 | 结果 |
+|---|---|---|
+| **CE1** | `onOpenChange` 只 push、不落 `open` | `pass=622 fail=1`、**exit 1**、**正常 FAIL**：**次数断言 PASS**，**状态/跃迁 FAIL** |
+| **CE2** | 把宿主的关闭回调整个拿走（`dropdown.memoizedProps.onOpenChange = undefined`，与 §8.5 同一形状） | `pass=621 fail=2`、**exit 1**、**正常 FAIL**：**次数与状态/跃迁都 FAIL** |
+
+CE2 **不能**靠「从 `mopts` 里删掉 `onOpenChange`」来做：`makeRow` 在
+`opts.onOpenChange` 为假时会**自己补一个默认记录器**，调用照样被记上，
+那样这条反例什么也证明不了（**这一点是实跑才发现的**，第一次写成那样时
+CE2 确实「不符合预期」）。所以 CE2 改成在 fiber 上清掉回调，
+**`makeRow` / `openMenu` 一律未改**。
+
+#### 15.15.2 三条口径勘误（**只登记，不回改旧件**）
+
+1. **r5 的 `snapshot-r4` 是 22 条，不是 20 条。**
+   §15.14 与 r5 `freeze.md` 里写的「清单列出的 20 个文件」**数错了**：
+   `snapshot-r4/SHA256SUMS.txt` 实际列出 **22** 条（含 `r4fixture/README.md`
+   与 `r4fixture/browser/panel.html`）。**22 条逐字节全部实测匹配**这一结论
+   不受影响，错的只是那个计数。r5 原件**不改**，以本条为准。
+2. **「85 条锚点全部保留」不准确。**
+   准确说法是：**85 条变异的 ID、测试意图与红/绿效果全部保留**，
+   但 **`x1` 的锚点文本被重钉过**——因为 r5 改了 `page-script.mjs` 里那段
+   含锚点的注释，旧锚点匹配 0 次会让 `x1` 从红变成**崩溃**（`mutation x1
+   anchor matched 0 times`），而**崩溃不算红**。重钉后 `x1` 实测仍红
+   （`pass=423 fail=5`、exit 1、stderr 0 字节）。**ID 与意图未变，变的是锚点指向的文本。**
+3. **受控状态替身 ≠ React 重渲染。**
+   §15.14 那句「夹具把这个回调建模成宿主应用新状态再渲染，与 React 受控组件一致」
+   **说过头了**：`mopts` 是**替身**，只记录调用，**不模拟重渲染**。
+
+**另两条已证未修的诊断缺口，本批只登记，不动产品**：
+
+- **拒绝路径的 `closeHostMenu` 返回值被丢弃**，导致关闭失败时**没有
+  `lastClose` 诊断**。涉及**三个分支**：`already-top` / `gate-unavailable` /
+  `call-threw`——它们都调用了 `closeHostMenu` 但**不记录返回值**。
+  这意味着「菜单到底关没关成」在拒绝路径上**没有读数**。
+  **本批不修**：属既有缺口，改它要动产品，**不在 r5.1 范围**。
+- `scheduleApply` 的 `pending` 闩锁**掉帧后不自恢复** —— **仍是范围外**。
+
+#### 15.15.3 全量新鲜重跑（原始输出见 `r5.1-f1-20261004-final/`）
+
+- **11 套件**：**全 exit 0 / 全 0 FAIL / stderr 全 0 字节**，合计 **1770** 断言（与 r5 同）
+- **变异矩阵**：`5 suites green, 87/87 mutations red, 0 problem(s)`，exit 0，**0 BAD / 0 CRASH**
+- **结构门三个 CWD**（`src` / **真仓库根** / workspace 根）：**全 exit 0 / ALL GREEN**
+- **未加任何新的产品变异 ID**；产品源 `acf12aa7…` 全程未动
+- **GUI / 真实持久序未测，未部署，部署门不变**
+
+> 本节位置：插在 **§16 之前**，与 §15.13 / §15.14 同一位置，属既有惯例。
+
+### 15.16 2026-10-04 用户新症状的只读诊断：置顶会话不自动到顶 · 状态点语义与一批**未修**缺陷（**只更新文档，代码未修，未部署，GUI 未测**）
+
+> 本节**只追加**，不改写 §15.1–§15.15 的任何一行。
+> 配套工作文档（证据坐标、验收矩阵、条件性风险表在那儿，不在这里重复）：
+> [1003.md §14.30](../1003.md)。
+>
+> **本节的状态一律是**：**文档已更新，代码未修，未部署，GUI 未测。**
+> 本轮只做两件事：只读源码 + 更新这两份文档。**没跑任何测试**（`selftest.mjs` 与
+> `test-waiting-bucket.mjs` 会打开**真实** `runtime-state.sqlite`），
+> **没启停任何服务/进程，没做浏览器、CDP、GUI、电脑操作，没碰 asar，没部署**。
+> 本节**不授予任何新的 host 写能力**。
+
+#### 15.16.1 新症状，以及为什么「手动设置置顶」不能拿来做对照
+
+**用户 2026-10-04 报的新症状**：**已经置顶、而且位置排得很靠下的会话，在对话之后不会自动到顶。**
+
+**定性（已收窄）**：当前**磁盘源码**把置顶区**显式排除在自动排序之外**——
+这是 2026-10-03 既定裁定（15.5「置顶区不再由本项目排序」）在代码里的形态。
+**对用户这次的新预期而言，这是一个尚未覆盖的产品缺口**：需求存在、实现没有，
+且**本轮未获授权去补**。
+**本节不证明**：跨版本历史上它从来不是 bug，也**不证明**用户现场那一次不是 bug
+——**本轮既没有取证现场，也没有做跨版本比对**。这里只陈述**当前磁盘源码的行为**。
+
+排除是**一个分叉沿三函数链传播**的结果，**不是三处各自独立的排除**：
+
+| 环节 | 源码 | 做的事 |
+|---|---|---|
+| 判定 | `src/lib/page-script.mjs:398` `pinnedZoneOf()` | 一路走到文档根；命中 `data-pinned-section` / `data-pinned-drop-zone` / `data-sidebar-drop-id` 为 `pinned-drop-zone` 或 `pinned:` 前缀即判「这是置顶区」；深度用尽时按「**可能是**置顶」处理（宁可漏搬不误搬） |
+| **分叉** | `src/lib/page-script.mjs:424` `findListRoots()` | **唯一的分叉点**：`if (pinnedZoneOf(n)) pinnedSeen.push(n); else roots.push(n);`——置顶列表走 `else` 的**反侧**，永远不进 `roots`；排除计数随 `apply()` 上报为 `reorder.pinnedSkipped` |
+| 消费 | `src/lib/page-script.mjs:512` `applyReorder()` | 只遍历 `found.roots`，把 `[running][waiting]` 用 `insertBefore` 提到队首 |
+
+> ⚠️ **对照实测的坑（重要）**
+> 用户同时提到「**原本没置顶**的会话，对话后**手动设置置顶**是正常的」。
+> **这既不等于「工具的『到最顶』」，也不等于「普通会话列表的自动提升」。**
+> - **用户点的是哪个界面入口**：**本轮没有截图、没有取证，不认定**。
+>   **不能**由「手动置顶正常」推出宿主 pin 曾被以某个参数调用过。
+> - **本工具**已核的那条 `handlePinSession(id, true, 0)` 路径是
+>   `page-script.mjs:2205` `onTopmostActivate()`（15.8「到最顶」菜单项），
+>   授权边界见 1003.md §4.1 的 **T1**。
+>   **用户的原生置顶操作没有被取证，不据此推断它调用了同样的宿主参数。**
+> - 因此这条对照**只能说明**一件事：「用户手动设置置顶」是**另一个操作**，
+>   **不能当作 ordinary activity 自动排序成功的证据**。
+
+**这两个入口都不是「普通会话列表的自动提升」入口**：
+
+- **一次到顶**：`page-script.mjs:2205` `onTopmostActivate()`——15.8 的右键菜单项，
+  用户点一次，只做一次。
+- **红锁顶**：`page-script.mjs:3503` `topLockCall()`——15.10 的红色悬停锁顶按钮。
+  它在**既有单目标授权**范围内做**有界的**后台维持（那是它自己的授权，不是排序授权）。
+  说它「不是后台维护」是错的；准确说法是**它维持的是锁顶意图，不是普通列表的活动排序**。
+- **宿主原生 pin**：用户直接用宿主的置顶交互时，顺序是宿主 `pinned-items-order` 的事，
+  本项目既不代劳也不覆盖。**本轮未取证用户走的是哪条路径。**
+
+**锁顶维持的既有不变量（本节不改，只是复述以免被误读为「放宽」）**：
+锁目标**最高优先**；`order` 缺 ref 时走 `topLockPause`（`page-script.mjs:3453`
+`topLockPauseReasonFor()` → `view-unstable` / `order-missing-id`），
+**保留意图**、暂停重试；**不在后台 repin、不自动 clear**。
+
+**🚫 明确不做（红线）**：
+不恢复置顶区的 DOM hoist、不恢复任何私有数组缓存当排序真相、不用 CSS `order` 假排序。
+理由见 15.5 的事故史（87 个嵌套盒子被 `display:flex !important` → 渲染进程卡死）
+与 15.5「置顶区不再由本项目排序」。
+
+**如果将来要给「普通活动」在置顶区加后台排序**：
+那需要**独立契约 + 独立授权 + 独立验收矩阵**。
+**本节明确不构成对此的批准**，也不构成任何预备实现。
+
+**「无 DOM ＝ 无点 ≠ 无活动」**：
+置顶区折叠时**只渲染 `pinnedItems` 的前 6 项**（1003.md §2 F1，asar `@316733124`
+的 `r.slice(0, 6)`），第 7 名起**根本不进 DOM**。
+所以一个正在跑的置顶会话完全可能**不在 DOM 里**，因而**没有状态点**——
+**这不等于它没有在跑**。
+> 这条 F1 结论来自**历史包取证**。**本轮既没有重新读包，也没有开 GUI**，
+> **不称「最新现场已见」**。
+
+#### 15.16.2 状态点：什么颜色到底代表什么（含「不等于」清单）
+
+| 你看到的 | bucket | 精确触发条件（源码） | **不等于** |
+|---|---|---|---|
+| **绿色满高发光竖条** + 整行淡绿底 + 绿标题 | `running` | `status = 'started'`（`bucketFor` 第 80 行） | 不等于「有输出」「快完成了」；`started` 只说明这一轮在执行 |
+| **黄色满高竖条** | `waiting` | 父**不在**执行，**但有归属 subagent 在跑的证据**：`local_runtime_sessions` 里 `parent_session_id` 非空且 `status='started'` 且 `archived=0`；或 `local_runtime_background_tasks` 里 `kind='subagent'` 且 `status='running'` 且 `ended_at_ms IS NULL` | **不等于**「在等你点审批」；**不等于**「有个 bash 在跑」——`kind='subagent'` 这个过滤是承重的（见下方注）；**也不等于**父会话 idle 一定是它在等 |
+| **橙色小圆点** | `paused` | `status = 'interrupted'`（第 81 行）——运行期被重启打断，这一轮没跑完 | 不等于「用户主动取消」 |
+| **（默认什么都不画）** | `idle` | `aborted`（用户取消是**终态**不是暂停），`includeAborted` 才点亮成 `paused`（第 82 行） | 不等于「已完成」 |
+| **红色圆点**（比其它点大一档） | `error` | 现状是 `status ∈ {error, failed}` **或** `terminal_outcome='failed'`（第 79 行）**或** 有非空 `error_message`（第 83 行） | **这一格的现状有已知缺陷**，见 15.16.3；不要把它当成「这一轮刚失败」 |
+| **灰色小圆点** | `done` | `idle` + `terminal_outcome='completed'`（第 84 行），**且 `--show-done` / `showDone` 打开**（`page-script.mjs` 里 `if (bucket === 'done' && !cfg.showDone) bucket = undefined;`） | 默认不开；**灰点不是「刚完成」的实时信号** |
+
+> **「没有点」不证明任何事。** 它同时可能是：真的 idle / 已完成 / 已取消 /
+> `aborted` 未点亮 / 归档了不在未归档集合里 / id 不在库里 / 这一轮没被采样到 /
+> 会话行根本没在 DOM 里（见上一小节的 F1）。**这几种要分开说，不要合并成「都完成了」。**
+
+> **关于「75% 假阳性」这个旧数字**：`kind='subagent'` 过滤的必要性是**源码事实**
+> （`status-db.mjs:63-64` 只查 `kind='subagent'`，`bash` 根本进不来）。
+> 但**源码注释里那两个比例本身自相矛盾**（一处写「3 of the 5」，一处写「75%」，
+> 而 3/5 ＝ 60%），且**本轮没有重测**。
+> **本节因此不引用任何比例数字**，只保留「过滤是承重的」这个可由源码读出的结论。
+
+**云端会话（Cloud 视图）走的是另一套映射，不要和本地混**（`page-script.mjs:634` `cloudBucketFor()`）：
+
+| 云端事件 | 本工具映射结果 |
+|---|---|
+| `session.start` | `running`（绿竖条，与本地同形） |
+| `session.error` | `error`（红） |
+| `session.finish` / `session.abort` | **从 Map 移除 ＝ 不画点** |
+| 其它（`created` / `title_updated` / `pinned_updated` …） | 忽略 |
+
+**本工具的云端事件映射未实现 `waiting`、也未实现 `paused`。**
+这是对**本工具这四个事件映射**的陈述，**不断言宿主云端是否存在「等子任务」
+或「中断」这类概念**——那是另一回事，本轮没有取证。
+本工具云端状态来自订阅宿主事件总线并**倒序重放**（15.7），
+本地状态来自 SQLite 轮询——**两条链路不要互相外推**。
+
+**几个必须分清的东西**：
+
+- **红色锁图标 ≠ 红色 error 点。** 红锁是 15.10 的**锁顶按钮**（`topLock` 一族属性），
+  `error` 点是 `data-mmx-bucket="error"`。两套东西，形状、触发、语义全不同。
+- **「工具实现里每个 session 行挂一个 `data-mmx-dot`」≠「真实界面上只会有一个符号」。**
+  `ensureDot()`（`page-script.mjs:230`）做的是 `row.querySelector('['+MARK+']')`
+  查不到就 `createElement('span')` + `row.appendChild`——**一行一颗**是工具的写法，
+  **不能据此断言真实渲染出来的观感**。
+- 用户提到的**「第二点」**：**本轮没有看当前截图，因此不认定它是什么**。
+  「原生未读符号」「另一颗 dot」「锁按钮」等**只作候选列出，不作结论**。
+- **只带 `data-agent-id`、不带 `data-session-id` 的行不在画点集合内**：
+  画点入口是 `apply()`（`page-script.mjs:734`），它**只**遍历
+  `document.querySelectorAll('[data-session-id]')`。
+  **若一行两个属性都带，则不能据此排除它**——**本轮未取证，不下断言**。
+  **测试夹具里造的嵌套 `data-session-id` 也不能外推**成「现场真的有嵌套子 agent 行」。
+
+#### 15.16.3 硬缺陷：`bucketFor` 的判据顺序让「上一次失败」压过「当前在跑」
+
+**根因一句话**（`src/lib/status-db.mjs:78-86`）：
+
+```js
+export function bucketFor({ status, terminalOutcome, hasErrorMessage, includeAborted = false }) {
+  if (ERROR.has(status) || terminalOutcome === 'failed') return BUCKET.error;    // ← 第 79 行，最先判
+  if (RUNNING.has(status)) return BUCKET.running;                               // ← 第 80 行
+  if (INTERRUPTED.has(status)) return BUCKET.paused;                            // ← 第 81 行
+  if (ABORTED.has(status)) return includeAborted ? BUCKET.paused : BUCKET.idle; // ← 第 82 行
+  if (hasErrorMessage) return BUCKET.error;                                     // ← 第 83 行
+  if (status === 'idle' && terminalOutcome === 'completed') return BUCKET.done; // ← 第 84 行
+  return BUCKET.idle;                                                           // ← 第 85 行
+}
+```
+
+**两个补充字段抢的**不是同一段**顺序，范围必须分开说**：
+
+- **`terminalOutcome === 'failed'`（第 79 行）排在最前**，因此它同时抢在
+  `running`（:80）、`interrupted`（:81）、`aborted`（:82）**三条之前**。
+- **`hasErrorMessage`（第 83 行）排在这三条之后**，
+  它**只抢**它后面的 `idle + completed → done`（:84）。
+
+**这两个字段不是无条件的「上一轮残留」**：
+它们是**补充描述**，只有**与当前状态组合出矛盾**的那些场景才构成冲突。
+本节只把**组合矛盾**的那些行判成缺口（表 1–6），其余不判。
+`applyWaitingOverlay()`（`status-db.mjs:227`）只在 `cur.bucket === error`
+**且** `ERROR.has(cur.status)`（**当前**状态真是 error/failed）时才豁免；
+所以被补充字段染成 `error` 的会话，**没有子 agent 时保留红点，有子 agent 时会被翻成黄**。
+
+| # | 输入组合 | 当前代码 | 期望 | 证据 | 状态 |
+|---|---|---|---|---|---|
+| 1 | `started` + `terminal_outcome='failed'`，**无**子 agent | 🔴 红 `error` | 🟢 绿 `running` | :79 早于 :80 | **未修** |
+| 2 | `started` + 同上，**有**子 agent | 🟡 黄 `waiting` | 🟢 绿 `running` | :79 早于 :80，且 overlay 的 `ERROR.has` 豁免不成立 | **未修** |
+| 3 | `interrupted` + 同上，**无**子 agent | 🔴 红 | 🟠 橙 `paused` | :79 早于 :81 | **未修** |
+| 4 | `interrupted` + 同上，**有**子 agent | 🟡 黄 | 🟠 橙 `paused` | 同上 | **未修** |
+| 5 | `aborted` + `terminal_outcome='failed'` | 🔴 红 | **取消态本身不是故障**：默认无点（`includeAborted` 才 `paused`） | **:79 早于 :82**（**不是** :83） | **未修** |
+| 6 | `idle` + `completed` + 有 `error_message` | 🔴 红 | 完成态（默认无点 / opt-in 灰 `done`） | :83 早于 :84 | **未修** |
+| 7 | `idle` + `terminal_outcome='failed'`（无子 agent） | 🔴 红保留 | **保留红** | `status-db.mjs:79`；`src/selftest.mjs:40` 锁定 | ✅ **现状正确，基础策略保留** |
+| 8 | 裸 `idle` + `error_message`（无 completed、无子 agent） | 🔴 红保留 | **保留红** | `status-db.mjs:83`；`src/selftest.mjs:41` 锁定 | ✅ **现状正确，基础策略保留** |
+| 9 | `error`/`failed`（**live**）+ 有子 agent | 🔴 红 | 🔴 红 | overlay 显式豁免 | ✅ 现状正确 |
+| 10 | `status` **不在词表内** | **取决于补充字段与子 agent，不是一律无点** | — | `src/selftest.mjs:43` 只锁了「无补充字段、无子 agent ⇒ idle 无点」 | ⚠️ **不判为缺陷**（见下） |
+
+**第 7 / 8 条**：这两条**是现状正确的基础策略，不是待裁决项、也不是未修缺陷**。
+它们的**行为来源是 `status-db.mjs:79` / `:83`**；
+`selftest.mjs:40` / `:41` 只是**把这个既有行为锁住**的测试，
+**不是缺陷的成因，也不该删**——删掉只会让一个已定的产品决策失去保护。
+
+**第 10 条要说清楚「不猜」的边界**：`unknown` 指的是**不凭空把未知状态判成旧的或新的**。
+具体地：
+- 未知 `status` **且**没有 `failed` / 没有 `error_message` / 没有子 agent ⇒ 落到 `idle`，**无点**（`:85`）；
+- 未知 `status` **但**有 `failed` 或有 `error_message` ⇒ **红**（`:79` / `:83`），
+  若此时**存在 subagent**，`applyWaitingOverlay` 还**可能把它翻成黄**。
+**本节不把「所有 unknown 一律判红」或「一律判无点」列为修复要求**——那需要新的产品口径，
+不在本节范围。
+
+**建议的修复层（尚未实施）**：
+
+- 改 **`bucketFor` 的判据顺序**，让**当前状态优先**：
+  `status ∈ {started, interrupted, aborted, error, failed}` 先判，
+  `terminalOutcome` / `error_message` 这类**补充**判据降到它们**后面**。
+- **只加一行 `continue` 去挡 overlay 不会修好上游的 `bucketFor`**：
+  - 表 1 / 3 / 6 这类**当前是红**的行，overlay 里加 `continue` **原样保留红**，问题一点没少；
+  - 表 2 / 4 这类**当前是黄**的行，加 `continue` 会把它们**留成错误红**，比现在更差；
+  - 更重要的是，**它不可能把任何一行凭 `continue` 变成正确的绿或橙**——
+    正确的 `running` / `paused` 必须在**上游**由正确的 `bucketFor` 产生。
+- overlay **已经做对的部分要保留**：按**正确的 bucket** 保护
+  `running` / `paused` / **live** `error`（上表 9）。
+
+**测试覆盖的漏洞（只登记，本轮未新增任何测试）**：
+`src/test-waiting-bucket.mjs` 第 39 行的行工厂是
+`row = (id, status) => ({ id, status, bucket: bucketFor({ status }), title: id })`
+——**只传 `status`，从不传 `terminalOutcome`**；第 139 行（`started -> running`）
+与第 141 行（`interrupted -> paused`）的 `bucketFor` 同样**不带 outcome**。
+所以**现有用例没有覆盖上表 1–6 的 outcome 组合**——这是**覆盖漏洞**，不是回归。
+将来要补的用例至少要覆盖 1 / 2 / 3 / 4 / 5 / 6 六种组合。
+**本轮没有新增测试，也没有跑测试。**
+
+#### 15.16.4 UI 层的语义缺口：颜色之外什么都没给
+
+| 位置 | 现状（源码） | 缺口 |
+|---|---|---|
+| `ensureDot()` `page-script.mjs:230` | 只 `dot.setAttribute(MARK,'1')` + `row.appendChild(dot)`，**没有 `title`、没有 `aria-label`、没有 `role`** | 鼠标用户**看不出颜色代表什么** |
+| 基础 dot 样式 `page-script.mjs:62` | `[data-mmx-dot]{ … pointer-events:none; }` | **不可悬停** → 即使加了 `title` 也弹不出来；`pointer-events:none` 同时意味着**不会挡住**原按钮点击 |
+| 汇总条 `ensureSummary()` | **有计数文字**：`N 个运行中` / `N 个在等子任务`（`textContent` 写死） | **不能说「summary 没有文字」**。但**没有完整图例、没有 `title`、没有 `aria`** |
+| `StatusDb.snapshot()` `status-db.mjs:274-280` | 只输出 `{ id: bucket }` 的**字符串映射** | **没有错误详情、没有等待明细** → 前端**拿不到「为什么是这个颜色」**，也**拿不到那个数** |
+| `collectWaiting()` `status-db.mjs:151-162` | 两条查询**各自每返回一条结果就 `bump(id,'subagent')` 一次**。child 那条是 `SELECT DISTINCT parent_session_id`（`:115-122`），**每个父会话最多一条结果、贡献 1**；background 那条是 `GROUP BY owner_session_id, kind` 且 `kind` 已被固定成 `'subagent'`（`:123-130`），**每个 owner 只产生一条分组结果、贡献 1**——**即使同一 owner 有 5 条 running background 行，也只贡献 1**；`COUNT(*) AS n` **从未被读取** | 只有 `isWaiting`（`:172`）的**「`subagent > 0` 吗」**被真正消费；明细挂在 `cur.waiting` 上，但 `snapshot()` **不带它出库** |
+
+> ⚠️ **由上面两行推出的三条禁语**（本节已逐条自查）：
+> 1. 同一个 session id 内部：`subagent` 的值是 **0 / 1 / 2**——
+>    **child 那路有结果 ⇒ 1，background 那路有结果 ⇒ 1，两路都命中同一个 id ⇒ 2，两路都没有 ⇒ 0（且不产生 detail）**。
+>    它**既不是实体数量，也不是布尔值**；而且**页面根本收不到这个数字**
+>    （`snapshot()` 只给 `{id: bucket}`）。
+>    **不能声称**「tooltip 会显示 N 个子 agent」——**它现在什么都不显示**。
+> 2. **不能声称**会显示 error 原文——`snapshot()` 里没有错误详情可显示。
+> 3. **不能说**「已有独立证据证明 `DISTINCT parent` 与 `COUNT n` 指向不同实体」——
+>    **没有做过这种验证**。
+>    **没有做过这种验证**，两者现在都只贡献一个布尔。
+
+**建议（待实现，本轮未做）**：给每个 bucket 加**静态 `title` / `aria-label`**，
+并提供**可触达的说明或图例**（不是只换颜色），同时**不得破坏**原有按钮的事件、
+指针行为与布局。**本轮一条都没实现。**
+
+#### 15.16.5 条件性风险与边界（逐条标了「已证 / 未测 / 条件性」）
+
+| # | 风险 | 成立条件 | 当前状态 |
+|---|---|---|---|
+| 1 | 同一 id 出现在**两处行**时，`stats.rows / runningOnScreen / waitingOnScreen` **按行重复计数** | 置顶区 + 分组区同会话各一行（`bucketsOf` 注释自己就写了「A row may carry more than one session node」） | **条件性**；现场**未测** |
+| 2 | `applyReorder` 的 `w.querySelector('[data-session-id]')` 是**后代查询**；`row.querySelector('['+MARK+']')` 同理 | 真实 DOM 出现**嵌套** session 行时，可**跨行认领**并**跨行删点** | **离线合成夹具可复现**；**现场结构未证明** |
+| 3 | CSS `… button, … button *{color:…}` 给**所有后代**染色（running 在 `:104-105`、waiting 在 `:149-150`） | 静态范围过宽 | **静态可见**；**实际图标观感未测** |
+| 4 | daemon 掉线后页面**继续用上一次的 `cfg.status`**：`buildRefreshExpression()` 只发 `refresh(statusMap)`，**不带时间戳、没有过期指示** | daemon 崩溃/断连 | 代码路径**已证**；现场**未测** |
+| 5 | 2.5s 轮询可能**整个漏掉**一段短的 `started→idle` | 会话在 2.5s 内起停 | daemon `interval: 2500`（`daemon.mjs:53/185`）、页面 `intervalMs: 3000`（`page-script.mjs:3774/4028`），两拍不同步；**现场未测** |
+| 6 | subagent 行**没有心跳**（`updated_at_ms` 在 24s 采样里字节不变） | 有人想给 `waiting` 加 TTL | **不擅自加 TTL 超时清黄**——会误杀长期合法等待。崩溃留下的孤儿行会**一直黄**，这是**刻意选的**安全失败方向 |
+| 7 | `stats.unknownIds` 在 `page-script.mjs:735` 初始化为 `0`，**全文件再无自增** | — | **诊断死字段**，读它**不能**当作「现场有未知 id」的证据 |
+| 8 | 非置顶行 `active → done` **不保证回到原序** | 排序只把 running/waiting 提到队首，其余保持**当次**原相对序 | 设计如此；**未测** |
+| 9 | `paused` 的恢复：`topLockConfirm()` 在**已证明 order 里目标位于首位**时会恢复 `confirmed` | — | **不能说「永远不自愈」**。但**非首位**的 `paused` **不会后台重发** |
+| 10 | 审批发生时**会话的实际 status 未知** | 宿主是否在该时刻把 status 置为某个具体值 | **本轮未取证**。**不能**把「审批时的 status」当成 `waiting` 的根因或证据 |
+
+#### 15.16.6 2026-10-04 只读核对时的运行身份（**历史快照，不是持续实时结论**）
+
+> 来源：**2026-10-04 的一次只读代理核对**。
+> **本轮（文档轮）没有重新查进程、没有连 CDP、没有开 GUI。**
+
+| 项 | 只读核对当时的读数 |
+|---|---|
+| daemon 进程 | `pid 64448`，`CreationDate 00:00:32` |
+| 命令行 | `node daemon.mjs --port 9331 --interval 2500` |
+| 磁盘 `src/lib/page-script.mjs` mtime | `08:55`，**晚于**上面那个进程的开始时刻 |
+
+**由此能推的和不能推的**：
+
+- ✅ **能推的是模块换字节的机制**：页面脚本是**静态 ESM `import` 注入**的。
+  **磁盘字节换成已加载的模块，需要那个进程重新载入模块**才成立。
+  **普通页面刷新、或者用旧 daemon 重新注入，都仍然复用原模块，不会升级到新字节。**
+  **本轮不批准重启或另起 daemon**，所以这一步**没有发生**。
+- ⚠️ **那次核对只能给出「历史链路推断」**：磁盘 mtime 晚于那时的进程开始时刻，
+  加上上面的机制，指向「那条链当时没有换到新字节」。
+  **这不是 renderer 内的字节直读**，**renderer 里那份注入物的完整身份没有被直接证明**。
+- 🚫 **不要**把「当前跑的就是旧版」当成**持续实时事实**来引用——
+  那是一条**有明确时点**（2026-10-04 那次核对）的历史推断。
+- ❌ 历史 `topmost.available=false` / `reason=no-fiber-root`
+  与本轮普通 activity 观察到的 `no-path` 是**正交**的两件事，**不解释**本轮任何根因。
+
+**两个 hash 别混**：
+
+| 值 | 是什么 |
+|---|---|
+| `acf12aa70f0b7ef16925eee9bc86ab2a32aa73a53f3272ade8fcda3daa4ff72c` | **磁盘 `src/lib/page-script.mjs` 的 SHA256**（= r5.1 产品字节）。本轮 fresh 复核**保持不变** |
+| `cfaa1fbaea3605303ac3f13fe6fbfbc295d71f96` | **git blob hash**（`git hash-object`），**不是 SHA256**。两者算法不同，**不可比较、不可互换** |
+
+**附带已报告风险（只登记，本节不修、也不重新追进程）**：
+
+- **陈旧 pidfile**：`watchdog-daemon.pid` 指向已死进程这件事，是在
+  **2026-10-03 的 §14.24 阶段**核对并记录的，**不在**上面那份 2026-10-04 快照里。
+  按分阶段历史引用即可，见 [1003.md §14.24](../1003.md)；**本节不复述那个 pid 数字**。
+- **watchdog 自激风险与上面那条是**不同的时点**的登记**，
+  同样**只引用分阶段历史**，本轮**不追进程**。
+
+#### 15.16.7 交付门：本节**不解除**任何一道
+
+- **历史已审事实**（**范围不同，不要混算**）：
+  - r5.1 离线：**1770** 断言全绿、**87/87** 变异正常红（§15.15）。
+  - r5.2 离线夹具：**66 / 79 / 156 / 19** 四道门全绿，**16** 条变异全部正常 FAIL、**0 crash**。
+    独立终审结论 **PASS**，**严格限定为 offline 夹具**；带 **3 LOW + 3 INFO**，它们**不全是**文字问题：
+    **LOW-1 / LOW-2 / LOW-3 / INFO-2** 是**口径与覆盖说明**类；
+    **INFO-1** 是**测试 helper 的实现限制**（`zeroAll()` 没清 `retiredRootRecords` / `nextRegId`）；
+    **INFO-3** 是**断言的证据归属限制**（`return ret;` 未绑定具体方法）。
+    报告：[REVIEW.md](../_diag-toplock/rv-r5.2-fixture-20261004-final/REVIEW.md)（**冻件，只读**）。
+  - **两组是不同范围**（前者是测试套件，后者是浏览器夹具），
+    **都不解决 15.16.3 登记的新缺陷**，**都不等于 GUI 通过**。
+    **本节不重开实现轮，也不改 `REVIEW.md` / `freeze.md`。**
+- **本次文档更新改变了活 README / 1003 的字节**，
+  所以 r5.1 冻结清单
+  [`G:\mmx-project\fix mmx\_diag-toplock\r5.1-f1-20261004-final\post-SHA256.txt`](../_diag-toplock/r5.1-f1-20261004-final/post-SHA256.txt)
+  里那 **9 项**的**活文档两项**必然不再匹配，
+  「全部文档仍 9/9」这句话**从此以后不再成立**。
+  **七个源文件仍逐字节匹配，旧清单本身不可改**（它是 r5.1 的历史证据）。
+- **当前工具表里没有 `mcp__node_repl__js`**，所以**不能**用 shell 起 websocket /
+  Playwright / CDP 去**替代**真实验证——那只会把「未测」伪装成「测了」。
+- **真实加载需要专门授权**；`pinned-items-order` 基线 **29 vs 27** 的裁决
+  （`1003.md` §14.23，本 README 历节写作「§14.23」即指此处）**仍未解除**，**不采新基线**。
+- **不启动** daemon / watchdog，**不改** DB / asar，**不 deploy**。
+- **本节不授予任何新的 host 写能力。**
+
+> 本节位置：插在 **§16 之前**，与 §15.13 / §15.14 / §15.15 同一位置，属既有惯例。
+
+#### 15.16.8 2026-10-05 修复批次：已修（离线），**未部署、未生效**
+
+> 本小节**只追加**，不改写 §15.16.1–§15.16.7 的任何一行。
+> **§15.16 的标题、§0 第 3 条、§15.16.7 交付门里的「代码未修」，是 2026-10-04 那一轮的历史事实，逐字保留、不追改；
+> 自本小节起，当前状态以本小节为准。**
+> 配套证据坐标、验收明细、5 个改动文件的 SHA256 在
+> [1003.md §14.30.10](../1003.md)。
+>
+> **本小节不解除任何一道交付门、不授予任何 host 写能力**——§15.16.7 的门逐条仍然成立。
+
+**修了什么（三处，全部离线）**
+
+1. **`bucketFor` 判据顺序**（`src/lib/status-db.mjs:118-127`）——让**当前状态**先判、补充字段后判：
+   `live error` → `running` → `paused` → `aborted`（`includeAborted` 才 `paused`）→
+   `idle + completed` → `terminalOutcome='failed'` → `error_message` → `idle`。
+   据此：§15.16.3 表 **1 / 3 / 5 / 6 四种误红已修**；表 **7 / 8 的基础策略保留红**（**不是**改掉它们）；
+   表 **9** 的 overlay 豁免**不变**；表 **10** 的 `unknown` 边界**不变**。
+2. **A11 汇总去重**（`page-script.mjs` `apply()` 内新增 `seenForSummary`，`:795` 建集、`:864-868` 判定）：
+   `runningOnScreen` / `waitingOnScreen` 按**唯一 session id** 计数；
+   `stats.rows` **仍按行**（未动）；**云端不拆分**（不按 `fromCloud` 分流，云端 running 进同一个数）。
+3. **UI 语义（A9 / A10 的静态部分）**：
+   `ensureDot()`（`:251-270`）加 `role="img"` 与**静态中文** `aria-label` / `title`
+   （文案表 `DOT_SEMANTIC` 在 `:239-245`；`waiting` ＝**有子代理在运行**，**不是**「等待审批」）；
+   汇总条加 `role="group"` 与**静态** `title` / `aria-label` 图例（`:306-312`），
+   **不改 children、不改计数文案、不改插入位置**。
+   **CSS 后代染色、排序、overlay、TTL 均未动。**
+
+**测试证据（离线）**
+
+| 套件 | 断言 | 相对本轮改动前 |
+|---|---|---|
+| `selftest` | **133 / 0 FAIL** | **+17**；原有 12 条断言**一条未动** |
+| `test-waiting-bucket` | **72 / 0** | **+26** |
+| `test-pinned-lifecycle` | **107 / 0** | **+34**（含 §8 出厂引导） |
+| `test-cloud-bucket` | **127 / 0** | 不变（回归） |
+| `test-reorder-pinned` | **50 / 0** | 不变（回归） |
+| `test-top-lock` | **428 / 0** | 不变（回归） |
+| `test-topmost-diag` | **146 / 0** | 不变（回归） |
+| `test-topmost-menu` | **623 / 0** | 不变（回归） |
+| structural-gates | **全绿** | 不变（回归） |
+
+- **先红后绿（TDD）**：在**旧代码**上先拿到红——`selftest` **123 / 10 FAIL**、
+  `test-waiting-bucket` **61 / 11 FAIL**、`test-pinned-lifecycle` **85 / 20 FAIL**。
+- **变异**：`run-mutations` **87 / 87 正常红**，与改前基线**逐字节一致**；
+  唯一变化是 lifecycle 的**基线断言数 73 → 105**（当时），其后**再加 2 条 → 107**。
+- **变异抽验**（人工回退后必须红、且全部**逐字节还原**）：
+  **M1** 回退 `bucketFor` 判据顺序 → **11 + 11 红**；**M2** 删去重 → **4 红**；
+  **M3** 改 `waiting` 文案 → **1 红**（据此补强断言）；**M4** 删 summary `role` → **2 红**；
+  **M5** 新 dot 缺标签 → **7 红**。
+
+**状态声明**
+
+- **代码已修（离线）；未部署；未在真实宿主生效。**
+  页面脚本是**静态 ESM `import` 注入**的（机制见 §15.16.6），
+  **磁盘新字节要被真实加载，必须由 daemon 进程重新载入模块**——那是**专门授权**，**本轮未批**。
+- **GUI 未测**：工具表里仍**没有 `mcp__node_repl__js`**，也没有用 shell / Playwright / CDP 去顶替真实验证。
+- `pinned-items-order` 基线 **29 vs 27** 的裁决（1003.md §14.23）**仍未解除**，**不采新基线**。
+- **未做 git 写**（无 commit / push / checkout / stash）。
+- §15.16 标题与 §0 第 3 条的「代码未修」自本小节起**不再描述当前状态**；
+  它们描述的是 2026-10-04 那一轮，**保留是为了不篡改历史，不是现状声明**。
+
+> 本小节位置：插在 **§16 之前**，与 §15.13 / §15.14 / §15.15 / §15.16 同一位置，属既有惯例。
 ---
 
 ## 16. 沙箱工作流：绝不拿用户正在用的实例做实验
@@ -1902,6 +3510,13 @@ minimax-code-sidebar-status/
     ├── test-autofix-gates.mjs   --fix-app 三闸门测试（32 项，每闸门正例+反例）
     ├── test-reorder-defaults.mjs reorder 默认值 / 逃生舱 / 启动器参数构造 / 杀旧 daemon 筛选（40 项）
     ├── test-waiting-bucket.mjs  waiting 判据 / overlay 优先级锁（含陈旧 error 让位） / kind 过滤回归锁 / 页面侧样式与置顶（52 项，见 15.6）
+    ├── test-reorder-pinned.mjs  50 项：置顶区零搬移（含 15 层深） / 变更检测无缓存键 / 嵌套根多轮收敛 / 预算原子性（切片出厂代码 + 假 DOM，见 15.5）
+    ├── test-topmost-menu.mjs   162 项：「到最顶」能力解析 / 真实行内 Dropdown 拓扑 / 当前半边 fiber / 菜单归属 / 键盘（Space preventDefault、Enter 不挡、方向键不接管）/ 关菜单 / 可见浮层 / 代次失效 / session 快照复核 / 显式 (id,true,0) / 竞态与 fail closed（切片出厂代码 + 假 fiber，见 15.8）
+    ├── test-pinned-lifecycle.mjs 73 项：汇总条位置 / 截断按钮作用域 / 记忆与 restore 共用一个分类器 / 展开逃生控件 / dispose（含代次失效与诊断拆除）/ debounce（切片出厂代码 + 假 DOM，见 15.8）
+    ├── test-topmost-diag.mjs  144 项：最小主证探针 nomenu/nopopup 记在工厂 return 点 / 三次上限与 0-8-16 窗口 / earlyStop 链级 / 快照清理不被 reap 早退挡住 / root 40 与 256 分开 / 镜像路径未编译 / 出厂契约未动（切片出厂代码 + 假 fiber，见 15.9）
+    ├── run-mutations.mjs        把上面四个套件的 31 个变异全跑一遍，打印红/绿矩阵；**有变异没变红、或让套件崩溃，就退出码 1**
+    ├── testlib/
+    │   └── fake-dom.mjs        三个新套件共用的假 DOM（属性选择器 / className / isConnected / textContent 聚合 / 可控定时器 / 假 fiber）
     ├── test-process-filters.ps1 进程过滤器回归（D 组 Test-IsStaleDaemonProcess + 端口参数形态，见 9.5）
     │
     │  ── 启动 / 安装 ──
