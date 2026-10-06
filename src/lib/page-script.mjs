@@ -886,7 +886,18 @@ function __mmxStatusMain(cfg) {
     topLockTick();
     // 新出现的置顶项自动补到最顶。同样串在这一趟里，同样不新增任何调度。
     // 排在 topLockTick 之后：锁的维持先说话，本段在锁顶意图在场时让位。
-    topmostAutoTopTick();
+    //
+    // 一趟只解析一次能力，两段共用【同一份】已证明的 order。它们必须看到同一张
+    // 快照：各自再解析一次不仅多爬一遍 fiber（每行都要沿 .return 走最多 256 层），
+    // 还可能在同一趟里读到两个已经不同的 order，于是"新成员"和"开始对话"判据
+    // 各自建立在不同的一份顺序上。map 是本函数开头已经算好的那份，本段不重查。
+    var sharedTopmostCap = topmostAutoTopCapability();
+    topmostAutoTopTick(sharedTopmostCap);
+    // 已置顶的会话开始对话后浮到置顶区最顶部。三段的让位链在这里定死：
+    //   锁顶维持 > 新成员补到最顶 > 活动会话上浮
+    // 三者共用同一把 hostCallTake，谁在这一趟先拿到闸谁写，另两个本趟放弃，
+    // 不排队、不补写。排序就是语句顺序，不另设一个仲裁器。
+    pinnedPromoteTick(sharedTopmostCap, map);
 
     // The sidebar is virtualised, so rows are constantly created and destroyed.
     // Drop detached rows from the bookkeeping Set, otherwise a long-running
@@ -1571,10 +1582,12 @@ function __mmxStatusMain(cfg) {
     }
     return null;
   }
-  function topmostAutoTopTick() {
+  // capIn 由 apply() 那一趟解析好传进来，让 24 段与下面那段共用同一份已证明的
+  // order。传空就自己解析一次：离线套件是直接调本函数的，那边没有 apply()。
+  function topmostAutoTopTick(capIn) {
     if (disposed) return;
     autoTopState.passes++;
-    var cap = topmostAutoTopCapability();
+    var cap = capIn || topmostAutoTopCapability();
     if (!cap) { autoTopState.unproven++; autoTopState.lastReason = 'view-unstable'; return; }
     var ids = [];
     for (var i = 0; i < cap.order.length; i++) {
@@ -1664,6 +1677,225 @@ function __mmxStatusMain(cfg) {
       hostCallRelease(ticket);
       autoTopState.blocked++;
       autoTopState.lastReason = 'host-rejected';
+    });
+  }
+
+  // ---------------------------------------------------------------------
+  // 已置顶的会话开始对话后，自动浮到置顶区最顶部（R1）
+  //
+  // 用户 2026-10-05 报的头一条：会话【已经置顶】、而且【正在对话】，它仍停在置顶
+  // 区原来的位置，想看它得自己往下翻或者把它拖上去。上面那段（24）管的是"刚点
+  // 置顶的那一项落在最底部"，判据是【成员变了没有】；本段管的是"本来就在置顶区
+  // 里的某一项开始跑起来"，判据是【状态变了没有】。两件事不同源，所以判据必须
+  // 不同：24 段看见任何一个新成员就动一次，本段看见一个旧成员从 idle 变成
+  // running 才动一次。
+  //
+  // 状态从哪来，为什么不是 DOM 行：
+  //   置顶区折叠起来时第 7 名起根本不在 DOM 里（F1 已证），所以"页面里有几行"
+  //   根本不是"顺序有几位"。拿 DOM 行当真相，等于把一份被截断的视图当成完整
+  //   顺序——折叠一次就够把第 7 位以下的会话永久漏掉。这里【一行 DOM 都不查】：
+  //   成员与下标来自宿主自己的 order，状态来自 apply() 这一趟已经算好的那份 map。
+  //   那份 map 是 daemon 的 db.snapshot() 导出的，只含 bucket !== idle 的 id
+  //   （status-db.mjs 的 snapshot() 明确过滤掉 idle），所以 map[id] === 'running'
+  //   就是"此刻在跑"，map 里查不到就是 idle。本函数【不新开任何查询】：另查一次
+  //   SQLite 就是多一个与真实轮询不同步的旁路，而且那条旁路没有第二个轮询节拍。
+  //
+  // 触发判据只有一种，就这一拍动一次手：
+  //   上一趟记的 running 是 false、这一趟 map[id] === 'running'、且它在本趟
+  //   order 里下标 > 0。
+  //     持续 running   : 不再动。一次对话被反复顶到最顶就是这条路走歪了。
+  //     running -> idle: 【不回位】。用户没有要求回位，而且回位就得记住原位，等于
+  //                      给每个置顶项多挂一份状态；不记反而更少写、更少错。
+  //     下标变化       : 永不动作。那是用户自己的拖拽，不是状态变化。判据是状态
+  //                      不是位置——这一条与 24 段"判据是成员不是下标"是同一个
+  //                      教训的两面，别把两段的判据抄串。
+  //
+  // 已知限制，如实记在这里（不是缺陷，是轮询的性质）：
+  //   本段只在 daemon 的轮询节拍上跑，节拍是 2500ms（daemon.mjs 的 intervalMs
+  //   默认 2500）。一个在 2.5s 之内就起完的短对话，可能整段落在两次采样之间，
+  //   一次都没有被观察到，于是这一次不上浮。这不是漏判，是"没看见"；要看见它
+  //   就得提高轮询频率，那会把 SQLite 的读放大到用户能感知的程度，不划算。
+  //
+  // 有界，四道：
+  //   1. 预算按【会话】分，每会话 3 次，住 window 上（存不下就 fail closed，绝不
+  //      给一份用完即弃的预算）。
+  //   2. 一次状态变化最多一次写：基线在判据【之前】推进，这一次变化就被消费掉了。
+  //   3. order 不可证明时暂停，而且【不动基线】。
+  //   4. 目标自己过 cap.probe，绝不借见证行的只读结论；云端数字 id 直接拒绝。
+  var TOPMOST_PROMOTE_KEY = '__mmxStatusPinnedPromoteV1';
+  var TOPMOST_PROMOTE_MAX = 3;
+  var promoteState = {
+    passes: 0, settleMiss: 0, changes: 0, noChange: 0, calls: 0, blocked: 0,
+    refused: 0, unproven: 0, deferred: 0, exhausted: 0, alreadyTop: 0,
+    noBaseline: 0, budget: TOPMOST_PROMOTE_MAX, lastId: '', lastReason: '',
+  };
+  // 上一趟的状态基线，按 id 存 { id, running }。
+  // 刻意【按 id】而不是按下标：让位期间用户可能拖过顺序，按下标记的基线会在那
+  // 一刻整体错位，之后每一次比较都在比错的东西。按 id 记的基线只是顺序旧一点，
+  // 而本段的判据问的是"这一趟谁从 false 变成了 true"，按 id 记这件事仍然是真的。
+  var promotePrev = [];
+  // 上一趟【观察到的】顺序，只用来做"连续两趟相同"的防抖。变化中的那一趟只更新
+  // 它，不碰 promotePrev。
+  var promoteSeen = [];
+  // 与 autoTopRuntime / topLockRuntime 同一套纪律：槽存不下 = 拒绝，绝不是给一份
+  // 用完即弃的预算（那正是 r3 的 w3 缺陷）。
+  function promoteRuntime() {
+    var r = window[TOPMOST_PROMOTE_KEY];
+    if (r && typeof r === 'object') return r;
+    var fresh = { owner: '', budget: 0, reason: '' };
+    try {
+      window[TOPMOST_PROMOTE_KEY] = fresh;
+    } catch (e) {
+      return null;
+    }
+    if (window[TOPMOST_PROMOTE_KEY] !== fresh) return null;
+    return fresh;
+  }
+  // status 是 apply() 那一趟算好的那份状态 map（daemon 的 snapshot 过滤掉 idle），
+  // 原样传进来，本段不重查。capIn 同理，见上面 apply() 里的注释。
+  function pinnedPromoteTick(capIn, status) {
+    if (disposed) return;
+    promoteState.passes++;
+    var cap = capIn || topmostAutoTopCapability();
+    // 证明不了就什么都不做，而且【不动基线】：这样视图恢复之后，让位/不可证明
+    // 期间开始对话的那一项仍然会被认出来。
+    if (!cap) {
+      promoteState.unproven++;
+      promoteState.lastReason = 'view-unstable';
+      return;
+    }
+    var ids = [];
+    for (var i = 0; i < cap.order.length; i++) {
+      var it = cap.order[i];
+      if (it && it.type === 'session' && it.id != null) ids.push(String(it.id));
+    }
+    // 空数组证明不了任何东西：它既可能是"还没加载"，也可能是"用户刚取消全部
+    // 置顶"。不写，并且不动基线。
+    if (!ids.length) {
+      promoteState.unproven++;
+      promoteState.lastReason = 'view-unstable';
+      return;
+    }
+    var st = status || {};
+    var next = [];
+    for (var n = 0; n < ids.length; n++) {
+      next.push({ id: ids[n], running: st[ids[n]] === 'running' });
+    }
+    // 连续两趟 order 一致（成员与顺序都同）才允许动作。宿主冷启动的头几帧还在往
+    // order 里灌数据，一份只出现过一帧的顺序不能当"上一次看到什么"。
+    if (!topmostSameIds(ids, promoteSeen)) {
+      promoteSeen = ids.slice();
+      promoteState.settleMiss++;
+      return;
+    }
+    var prev = promotePrev;
+    // 首趟与基线趟只记录，不写：没有"上一趟的状态"就没有"状态变了"。
+    if (!prev.length) {
+      promoteSeen = ids.slice();
+      promotePrev = next;
+      promoteState.noBaseline++;
+      promoteState.lastReason = 'baseline-armed';
+      return;
+    }
+    // 锁顶意图在场时让位，而且【不推进状态基线】：让位期间开始对话的那一项要留在
+    // 基线之外，锁一释放仍会被认成"刚刚开始对话"并被浮上去。这正是 D1
+    // （24.10b/24.10c）修过的形状，抄同一条，不各自发明。
+    // 本分支里不得出现任何宿主写，deferred 仍然每趟 +1。
+    if (topmostLockView.id) {
+      promoteState.deferred++;
+      promoteState.lastReason = 'toplock-other';
+      return;
+    }
+    // 基线在判据【之前】推进，于是这一次的 idle -> running 被"消费"掉：同一趟
+    // 最多一次写，持续 running 永不再写，会话结束（running -> idle）也不回位。
+    promotePrev = next;
+    // Object.create(null)：这份查找表只认"自家键"。用 {} 的话，一个恰好叫
+    // constructor 的 id 会读到原型上的函数而不是 undefined，那会把一个从没进过
+    // 置顶区的会话误认成"上一趟就在跑"。
+    var wasById = Object.create(null);
+    for (var q = 0; q < prev.length; q++) wasById[prev[q].id] = prev[q].running;
+    var cand = -1;
+    for (var c = 0; c < next.length; c++) {
+      var was = wasById[next[c].id];
+      // 认不出（这一趟之前不在置顶区里）就不管：新成员归 24 段管，两段绝不在同
+      // 一项上对拉。用户取消置顶又重新置顶的那一项也走这一条——它对 24 段来说
+      // 就是新成员，于是自然落到 24 段，本段不需要为它单开一条特殊路径。
+      if (was === undefined) continue;
+      if (was) continue;                       // 上一趟就在跑：没有状态变化
+      if (!next[c].running) continue;          // 这一趟也还没跑
+      cand = c;
+      break;                                    // 一次最多一项：下标最小的那一个
+    }
+    if (cand < 0) { promoteState.noChange++; return; }
+    promoteState.changes++;
+    // 判据要求下标 > 0。已经在最顶的那一项什么也不做，也不消耗预算。
+    if (cand === 0) {
+      promoteState.alreadyTop++;
+      promoteState.lastReason = 'already-top';
+      return;
+    }
+    var id = next[cand].id;
+    promoteState.lastId = id;
+    if (!topmostAutoTopId(id)) {
+      promoteState.refused++;
+      promoteState.lastReason = 'not-local-id';
+      return;
+    }
+    // 目标自己过宿主的只读探针。见证行的结论不能借给别的 id（r3 的 w7/w8）。
+    var readOnly;
+    try { readOnly = !!cap.probe(id, cap.source); } catch (e) { readOnly = true; }
+    if (readOnly) {
+      promoteState.refused++;
+      promoteState.lastReason = 'readonly-session';
+      return;
+    }
+    var rt = promoteRuntime();
+    if (!rt) {
+      promoteState.blocked++;
+      promoteState.lastReason = 'runtime-unavailable';
+      return;
+    }
+    // 换一个会话 = 新的预算；同一个会话用完就停。
+    if (rt.owner !== id) { rt.owner = id; rt.budget = TOPMOST_PROMOTE_MAX; rt.reason = ''; }
+    if (rt.budget < 1) {
+      promoteState.budget = 0;
+      promoteState.exhausted++;
+      promoteState.lastReason = 'budget-exhausted';
+      return;
+    }
+    // 与「到最顶」菜单项、红色锁顶按钮、自动到顶同一把闸。谁先拿到谁写，
+    // 这一趟另一个放弃（null 意味着零宿主写，不排队、不重试到本趟之外）。
+    var ticket = hostCallTake();
+    if (!ticket) {
+      promoteState.blocked++;
+      promoteState.lastReason = 'gate-unavailable';
+      return;
+    }
+    rt.budget--;
+    promoteState.budget = rt.budget;
+    promoteState.calls++;
+    promoteState.lastReason = 'calling';
+    var ret;
+    try {
+      // EXACTLY three arguments, and it is the SAME single write the other three
+      // entries use. No index means "append", which is the bug being corrected.
+      ret = cap.fn(id, true, 0);
+    } catch (e) {
+      hostCallRelease(ticket);
+      promoteState.blocked++;
+      promoteState.lastReason = 'call-threw';
+      return;
+    }
+    // A resolved promise means "the host finished handling it", never "it
+    // worked", so nothing here is reported as a success. The gate is released
+    // by its own settle and by nobody else.
+    Promise.resolve(ret).then(function () {
+      hostCallRelease(ticket);
+      promoteState.lastReason = 'host-returned';
+    }, function () {
+      hostCallRelease(ticket);
+      promoteState.blocked++;
+      promoteState.lastReason = 'host-rejected';
     });
   }
 
@@ -4517,6 +4749,43 @@ function __mmxStatusMain(cfg) {
           owner: autoTopState.owner,
           lastId: autoTopState.lastId,
           lastReason: autoTopState.lastReason,
+        },
+        // The active-session corrector, same shape and same discipline. Its
+        // trigger is a STATE change (idle -> running) on a member that is
+        // already pinned, NOT a position change, so a plain drag by the user
+        // moves no counter except a passing noChange.
+        //
+        // 'running' is the ONLY bucket that reads as "started a turn". The map
+        // arrives with every idle already filtered out, so waiting / paused /
+        // error / done are all "present but not running" and none of them
+        // promotes -- the comparison is equality, not presence.
+        //
+        // changes counts EVERY pass where an idle -> running transition was
+        // found, at any index: the counter is bumped before the index-0 case
+        // is peeled off, so it already contains the already-top transitions.
+        // alreadyTop is that index-0 subset (nothing to do, no budget spent),
+        // and what is left after it is the set of moves attempted -- calls for
+        // the ones that reached the host, refused / blocked / exhausted for the
+        // ones that did not. Same contract as autoTop above, whose counters are
+        // stepped in the same order: machine code and counters only, no id
+        // list, no fiber, no DOM node, no conversation content.
+        pinnedPromote: {
+          passes: promoteState.passes,
+          settleMiss: promoteState.settleMiss,
+          changes: promoteState.changes,
+          noChange: promoteState.noChange,
+          calls: promoteState.calls,
+          blocked: promoteState.blocked,
+          refused: promoteState.refused,
+          unproven: promoteState.unproven,
+          deferred: promoteState.deferred,
+          exhausted: promoteState.exhausted,
+          alreadyTop: promoteState.alreadyTop,
+          noBaseline: promoteState.noBaseline,
+          budget: promoteState.budget,
+          budgetMax: TOPMOST_PROMOTE_MAX,
+          lastId: promoteState.lastId,
+          lastReason: promoteState.lastReason,
         },
       };
     },

@@ -99,6 +99,10 @@
 //   m25  the refusal still counts the call -> "22.1 calls 不增" fails
 //   m26  the refusal no longer closes the host's menu -> "22.1 菜单照样关闭" fails
 //       -> "13.10" fails
+//   m27  the promote criterion is widened from === 'running' to !== undefined,
+//       so waiting / paused / error all promote -> every "26.14 V11 <bucket>"
+//       fails. This one exists because nothing pinned the strictness before:
+//       under exactly this edit the suite used to stay 797/797 green.
 
 //
   //   node test-topmost-menu.mjs
@@ -389,6 +393,25 @@ if (MUT === 'm1') {
   const from = "      topmostReason('gate-unavailable');\n      closeHostMenu(menuFiber);\n      return;";
   if (BLOCK.split(from).length - 1 !== 1) throw new Error('mutation m26 anchor not unique');
   BLOCK = BLOCK.replace(from, "      topmostReason('gate-unavailable');\n      return;   // mutation m26: the refusal no longer closes the menu");
+} else if (MUT === 'm27') {
+  // The defect the second review found in the TESTS, not in the shipped code:
+  // nothing pinned the STRICTNESS of the promote criterion. daemon's snapshot()
+  // exports every bucket except idle, so widening
+  //     running: st[id] === 'running'
+  // to
+  //     running: st[id] !== undefined
+  // makes waiting / paused / error / done all read as "started a turn just now"
+  // and get promoted to index 0. That is the review's exact sandbox edit, and
+  // before 26.14 every one of the 797 assertions stayed green under it.
+  //
+  // This mutation is registered precisely so it can never stay green again.
+  // 26.14 has to go red on the behaviour, not on a source grep: 26.13's checks
+  // read pageSrc off disk, which this mutation does not touch, so a structural
+  // pin alone would have been another hole wearing a pin's clothes.
+  const from = "      next.push({ id: ids[n], running: st[ids[n]] === 'running' });";
+  const to = "      next.push({ id: ids[n], running: st[ids[n]] !== undefined });   // mutation m27";
+  if (BLOCK.split(from).length - 1 !== 1) throw new Error('mutation m27 anchor not unique');
+  BLOCK = BLOCK.replace(from, to);
 } else if (MUT === 'm6') {
   const from = "if (!ev || !ev.isTrusted) { topmostState.blocked++; topmostReason('untrusted-click'); return; }";
   if (!BLOCK.includes(from)) throw new Error('mutation m6 anchor not found');
@@ -2854,8 +2877,21 @@ function makeLockMenuPage(opts = {}) {
     '  autoTick: typeof topmostAutoTopTick === "function"'
     + ' ? function () { return topmostAutoTopTick(); } : null,' +
     '  autoArmed: typeof topmostAutoTopTick === "function",' +
+    // Same fail-as-a-FAIL discipline for the promote corrector: a shipped source
+    // without it has to report ok:false below, not a ReferenceError here.
+    '  promoteTick: typeof pinnedPromoteTick === "function"'
+    + ' ? function (cap, status) { return pinnedPromoteTick(cap, status); } : null,' +
+    '  promoteArmed: typeof pinnedPromoteTick === "function",' +
     '  lockState: topLockState, lockView: topmostLockView,' +
     '  autoState: autoTopState, autoKey: TOPMOST_AUTOTOP_KEY, autoMax: TOPMOST_AUTOTOP_MAX,' +
+    '  promoteState: typeof promoteState === "object" ? promoteState : null,' +
+    // typeof guards, so a shipped source WITHOUT the feature yields
+    // promoteArmed=false and promoteTick=null instead of a ReferenceError out of
+    // the factory. That matters: a throwing factory would replace every 26.x
+    // behavioural assertion with one shared "前置" failure, and the red would
+    // then prove nothing about the behaviour the assertions are written for.
+    '  promoteKey: typeof TOPMOST_PROMOTE_KEY === "undefined" ? "" : TOPMOST_PROMOTE_KEY,' +
+    '  promoteMax: typeof TOPMOST_PROMOTE_MAX === "undefined" ? 0 : TOPMOST_PROMOTE_MAX,' +
     '  gateBusy: hostCallBusy,' +
     '  setDisposed: function (v) { disposed = v; } };');
   const api = factory(win, dom.document);
@@ -3767,6 +3803,406 @@ console.log('\n=== 25. 晚挂载的弹层：探测预算不够导致真机零注
   check('25.14 watch 直接调用的仍然是 tryInjectTopmost（没有第二份注入实现）',
     (PRISTINE_BLOCK.match(/tryInjectTopmost\(/g) || []).length >= 1
     && !/function tryInjectTopmost\b[\s\S]{0,200}observer/i.test(PRISTINE_BLOCK), 'second-impl');
+}
+
+// ===========================================================================
+// 26. 已置顶的会话开始对话后，自动浮到置顶区最顶部（R1）
+//
+// 24 段管的是"刚点置顶的新成员落在最底部"，判据是【成员变了没有】。本段管的是
+// "本来就在置顶区里的某一项开始跑起来"，判据是【状态变了没有】。两件事不同源，
+// 判据也不同，而且必须不同：把 24 段的成员判据抄过来会让一次普通拖拽触发上浮，
+// 把本段的状态判据抄进 24 段会让新成员永远不被补到最顶。
+//
+// 26.x 逐条钉住：置顶第 3 位开始对话补写一次三参、其余项相对次序一个字节不变、
+// 宿主 DOM 行序一个字节不变、会话结束不回位、锁顶在场零写且释放后仍能补上、
+// 纯拖拽零写、云端 id 零写、order 不可证明零写且基线不动、预算有界、已在下标 0
+// 零写、与自动到顶共用同一把闸。
+// ===========================================================================
+function promotePage(opts = {}) {
+  const why = [];
+  try {
+    const p = makeLockMenuPage(opts.page);
+    const host = makeHost(Object.assign(
+      { order: [ref('mvs_a'), ref('mvs_b'), ref('mvs_c')] }, opts.host || {}));
+    if (opts.hostFn) host.fn = opts.hostFn;
+    const row = makeRow(p, opts.id || 'mvs_a', host);
+    if (!p.api.promoteArmed) why.push('出厂没有 pinnedPromoteTick');
+    return { p, host, row, ok: why.length === 0, why: why.join(' | ') };
+  } catch (e) {
+    return { ok: false, why: '组合切片跑不起来：' + (e && e.message ? e.message : String(e)) };
+  }
+}
+// One pass of the shipped promote tick, fed exactly what apply() computes.
+//
+// The status map here is the daemon's db.snapshot() output, which exports only
+// buckets that are NOT idle (status-db.mjs snapshot()). So an ABSENT key is idle,
+// and 'running' means "executing a turn right now". The harness passes it in as a
+// plain object for the same reason the shipped code does: that is the shape
+// cfg.status has on the page. Nothing here queries anything.
+const ptick = async (a, status) => { a.p.api.promoteTick(null, status || {}); await flush(); };
+// The host re-renders into a NEW closure after our write, exactly as React does.
+const settleOrder = (p, host) => commit(p, host, host.order);
+// Arm the two-pass baseline: pass one is the settle miss, pass two records the
+// first trusted (member, running) pair set. Both passes are read-only.
+const armPromote = async (a) => { await ptick(a, {}); await ptick(a, {}); };
+
+console.log('\n=== 26. 活动会话上浮：置顶项开始对话就补一次三参到下标 0 ===');
+{
+  const A = promotePage();
+  check('26.0 前置：上浮这一段在出厂里', A.ok, A.why);
+  if (A.ok) {
+    const domBefore = rowOrder(A.p);
+    const storeWrites = A.p.store.writes();
+    await armPromote(A);
+    check('26.1 首趟/基线趟只记录不写（还没有"上一趟的状态"可比）',
+      A.host.calls.length === 0 && A.p.api.promoteState.calls === 0
+      && A.p.api.promoteState.settleMiss === 1 && A.p.api.promoteState.noBaseline === 1,
+      `calls=${A.host.calls.length} settleMiss=${A.p.api.promoteState.settleMiss} noBaseline=${A.p.api.promoteState.noBaseline}`);
+    // 置顶区第 3 位的 mvs_c 开始对话。
+    await ptick(A, { mvs_c: 'running' });
+    check('26.2 V1 置顶第 3 位开始对话 → 补写一次 handlePinSession(id, true, 0)',
+      A.host.calls.length === 1
+      && JSON.stringify(A.host.calls[0]) === JSON.stringify(['mvs_c', true, 0])
+      && A.p.api.promoteState.calls === 1,
+      `calls=${JSON.stringify(A.host.calls)} apiCalls=${A.p.api.promoteState.calls} reason=${A.p.api.promoteState.lastReason}`);
+    check('26.2 V2 其余置顶项的相对次序一个字节没变',
+      JSON.stringify(ids(A.host)) === JSON.stringify(['mvs_c', 'mvs_a', 'mvs_b']),
+      JSON.stringify(ids(A.host)));
+    check('26.2 V2 backend 也拿到 insertIndex 0，不是 append',
+      A.host.persists.length === 1 && A.host.persists[0][0] === 'mvs_c'
+      && A.host.persists[0][1] === true && A.host.persists[0][2] === 0,
+      JSON.stringify(A.host.persists));
+    check('26.2 V2 宿主自己的 DOM 行序一个字节没动（绝不 insertBefore 造视觉）',
+      JSON.stringify(rowOrder(A.p)) === JSON.stringify(domBefore), JSON.stringify(rowOrder(A.p)));
+    check('26.2 V2 一次 localStorage 写都没有（授权范围只有宿主那一个三参回调）',
+      A.p.store.writes() === storeWrites, `writes=${A.p.store.writes()}`);
+    // 宿主按新顺序重渲染，之后一直跑着：不得再写第二次。
+    settleOrder(A.p, A.host);
+    await ptick(A, { mvs_c: 'running' });
+    await ptick(A, { mvs_c: 'running' });
+    check('26.3 持续 running 不重复写（一次状态变化最多一次调用）',
+      A.host.calls.length === 1 && A.p.api.promoteState.calls === 1,
+      `calls=${A.host.calls.length} apiCalls=${A.p.api.promoteState.calls}`);
+    check('26.3 走的是共享闸：调用结束后闸已释放',
+      A.p.api.gateBusy() === false, 'busy=' + A.p.api.gateBusy());
+  } else {
+    check('26.2 V1/V2 前置：上浮这一段在出厂里', false, A.why);
+  }
+}
+{
+  // 会话结束：running -> idle。【不回位】。用户没要求，而且回位就得记住原位，
+  // 等于给每个置顶项多挂一份状态。
+  const A = promotePage();
+  if (A.ok) {
+    await armPromote(A);
+    await ptick(A, { mvs_c: 'running' });
+    settleOrder(A.p, A.host);
+    await ptick(A, {});                        // 会话结束
+    await ptick(A, {});
+    await ptick(A, {});
+    check('26.4 V3 会话结束不回位（零次新写，顺序停在最顶）',
+      A.host.calls.length === 1
+      && JSON.stringify(ids(A.host)) === JSON.stringify(['mvs_c', 'mvs_a', 'mvs_b'])
+      && A.p.api.promoteState.calls === 1,
+      `calls=${JSON.stringify(A.host.calls)} order=${JSON.stringify(ids(A.host))}`);
+    check('26.4 回位不是靠"记住原位"实现的：基线里只有 running 布尔，没有位置',
+      !/original|origin|restore|home/i.test(
+        pageSrc.slice(pageSrc.indexOf('  function pinnedPromoteTick('),
+          pageSrc.indexOf('\n  }\n', pageSrc.indexOf('  function pinnedPromoteTick(')))),
+      '不得记住原位');
+  } else {
+    check('26.4 前置：上浮这一段在出厂里', false, A.why);
+  }
+}
+{
+  // 锁顶意图在场：让位，而且不推进状态基线。让位期间开始对话的那一项在锁释放
+  // 后必须仍然被认出来——这正是 D1（24.10b/24.10c）修过的形状。
+  const A = promotePage();
+  if (A.ok) {
+    await armPromote(A);
+    A.p.api.lockView.id = 'mvs_a';                        // 锁顶意图在场
+    await ptick(A, { mvs_c: 'running' });                // 让位期间 c 开始对话
+    check('26.5 V4a 锁顶在场时零写（deferred 照记，让位语义没被改坏）',
+      A.host.calls.length === 0 && A.p.api.promoteState.calls === 0
+      && A.p.api.promoteState.deferred >= 1
+      && A.p.api.promoteState.lastReason === 'toplock-other',
+      `calls=${A.host.calls.length} deferred=${A.p.api.promoteState.deferred} reason=${A.p.api.promoteState.lastReason}`);
+    await ptick(A, { mvs_c: 'running' });                // 仍在让位
+    check('26.5 V4a 让位期间基线不推进（第二次让位仍记 deferred，而不是已经写过）',
+      A.host.calls.length === 0 && A.p.api.promoteState.deferred >= 2,
+      `calls=${A.host.calls.length} deferred=${A.p.api.promoteState.deferred}`);
+    A.p.api.lockView.id = '';                             // 锁释放
+    await ptick(A, { mvs_c: 'running' });
+    check('26.5 V4b 锁释放后，让位期间开始对话的那一项仍然被浮到最顶（让位只推迟，不取消）',
+      A.host.calls.length === 1
+      && JSON.stringify(A.host.calls[0]) === JSON.stringify(['mvs_c', true, 0])
+      && A.p.api.promoteState.calls === 1,
+      `calls=${JSON.stringify(A.host.calls)} apiCalls=${A.p.api.promoteState.calls}`);
+    // 预算住在 window 上：重新注入不能顺手把它补满。
+    const rt = A.p.window[A.p.api.promoteKey];
+    check('26.5 预算住在 window 上（不是每趟重新给满的三次）',
+      rt && typeof rt === 'object' && rt.budget === 2 && rt.owner === 'mvs_c',
+      JSON.stringify(rt));
+  } else {
+    check('26.5 前置：上浮这一段在出厂里', false, A.why);
+  }
+}
+{
+  // 纯拖拽：下标变了，状态一个字节没变。用户的拖拽永不触发上浮。
+  const A = promotePage();
+  if (A.ok) {
+    await armPromote(A);
+    commit(A.p, A.host, [ref('mvs_c'), ref('mvs_b'), ref('mvs_a')]);
+    await ptick(A, {});                                  // 变化那一趟：只更新 seen
+    await ptick(A, {});
+    await ptick(A, {});
+    check('26.6 V5 纯拖拽零写（判据是状态变化，不是位置变化）',
+      A.host.calls.length === 0 && A.p.api.promoteState.calls === 0
+      && A.p.api.promoteState.changes === 0,
+      `calls=${A.host.calls.length} changes=${A.p.api.promoteState.changes}`);
+    check('26.6 拖拽那一趟被防抖吃掉一次（连续两趟 order 一致才允许动作）',
+      A.p.api.promoteState.settleMiss === 2, `settleMiss=${A.p.api.promoteState.settleMiss}`);
+  } else {
+    check('26.6 前置：上浮这一段在出厂里', false, A.why);
+  }
+  // 云端数字 id：宿主 order 里出现一个云端会话，它开始"跑"也不许上浮。
+  const B = promotePage({ host: { order: [ref('mvs_a'), ref('mvs_b'), ref('447993841729699')] } });
+  if (B.ok) {
+    await armPromote(B);
+    await ptick(B, { '447993841729699': 'running' });
+    check('26.7 V6 云端数字 id 零写（not-local-id，与自动到顶同一条线）',
+      B.host.calls.length === 0 && B.p.api.promoteState.refused >= 1
+      && B.p.api.promoteState.lastReason === 'not-local-id',
+      `calls=${B.host.calls.length} refused=${B.p.api.promoteState.refused} reason=${B.p.api.promoteState.lastReason}`);
+  } else {
+    check('26.7 前置：上浮这一段在出厂里', false, B.why);
+  }
+  // 目标自己只读：不借见证行的结论。
+  const C = promotePage({ host: { readOnly: ['mvs_c'] } });
+  if (C.ok) {
+    await armPromote(C);
+    await ptick(C, { mvs_c: 'running' });
+    check('26.7 目标自己只读时拒绝（见证行的只读结论不借给别的 id）',
+      C.host.calls.length === 0 && C.p.api.promoteState.refused >= 1
+      && C.p.api.promoteState.lastReason === 'readonly-session',
+      `calls=${C.host.calls.length} refused=${C.p.api.promoteState.refused} reason=${C.p.api.promoteState.lastReason}`);
+  } else {
+    check('26.7 只读 前置：上浮这一段在出厂里', false, C.why);
+  }
+}
+{
+  // order 不可证明：暂停、零写、而且【不动基线】——视图恢复后让位期间开始对话的
+  // 那一项仍然要被认出来。
+  const A = promotePage();
+  if (A.ok) {
+    await armPromote(A);
+    A.host.source = 'cloud';
+    A.host.deps[2] = 'cloud';
+    await ptick(A, { mvs_c: 'running' });
+    await ptick(A, { mvs_c: 'running' });
+    check('26.8 V7 顺序不可证明时零写（暂停，不猜）',
+      A.host.calls.length === 0 && A.p.api.promoteState.calls === 0
+      && A.p.api.promoteState.unproven >= 1,
+      `calls=${A.host.calls.length} unproven=${A.p.api.promoteState.unproven}`);
+    A.host.source = 'local';
+    A.host.deps[2] = 'local';
+    await ptick(A, { mvs_c: 'running' });
+    check('26.8 V7 视图恢复后仍然补上（不可证明那一段没有吃掉这次状态变化）',
+      A.host.calls.length === 1
+      && JSON.stringify(A.host.calls[0]) === JSON.stringify(['mvs_c', true, 0]),
+      `calls=${JSON.stringify(A.host.calls)} reason=${A.p.api.promoteState.lastReason}`);
+  } else {
+    check('26.8 前置：上浮这一段在出厂里', false, A.why);
+  }
+  // 已经在下标 0 的那一个开始对话：什么都不做，也不消耗预算。
+  const B = promotePage();
+  if (B.ok) {
+    await armPromote(B);
+    await ptick(B, { mvs_a: 'running' });
+    check('26.9 V9 已经在下标 0 的那项开始对话时零写（already-top）',
+      B.host.calls.length === 0 && B.p.api.promoteState.alreadyTop >= 1
+      && B.p.api.promoteState.calls === 0,
+      `calls=${B.host.calls.length} alreadyTop=${B.p.api.promoteState.alreadyTop}`);
+    check('26.9 already-top 不消耗预算（那次上浮本来就不需要写）',
+      B.p.api.promoteState.exhausted === 0, `exhausted=${B.p.api.promoteState.exhausted}`);
+  } else {
+    check('26.9 前置：上浮这一段在出厂里', false, B.why);
+  }
+}
+{
+  // 预算：每会话 3 次，耗尽后只读返回。宿主回滚 + 会话再次开始，重复四轮。
+  const A = promotePage();
+  if (A.ok) {
+    const max = A.p.api.promoteMax;
+    const rtKey = A.p.api.promoteKey;
+    let writes = 0;
+    for (let round = 0; round < max + 1; round++) {
+      settleOrder(A.p, A.host);                       // 宿主按上一次的写重渲染
+      commit(A.p, A.host, [ref('mvs_a'), ref('mvs_b'), ref('mvs_c')]);
+      await ptick(A, {});                              // 会话结束
+      await ptick(A, {});
+      await ptick(A, { mvs_c: 'running' });            // 同一会话再次开始对话
+      writes = A.host.calls.length;
+    }
+    check('26.10 V8 同一个会话的上浮次数有界（用完即停，不是无限对拉）',
+      writes === max && A.p.api.promoteState.exhausted >= 1,
+      `calls=${writes} max=${max} exhausted=${A.p.api.promoteState.exhausted} reason=${A.p.api.promoteState.lastReason}`);
+    check('26.10 预算槽在 window 上且已归零',
+      A.p.window[rtKey] && typeof A.p.window[rtKey] === 'object'
+      && A.p.window[rtKey].budget === 0 && A.p.window[rtKey].owner === 'mvs_c',
+      JSON.stringify(A.p.window[rtKey]));
+    // 换一个会话 = 新的预算（不会永久死掉）。
+    commit(A.p, A.host, [ref('mvs_a'), ref('mvs_z'), ref('mvs_c')]);
+    await ptick(A, {});
+    await ptick(A, {});
+    await ptick(A, { mvs_z: 'running' });
+    check('26.10b 换一个会话后预算重新给满',
+      JSON.stringify(A.host.calls[A.host.calls.length - 1]) === JSON.stringify(['mvs_z', true, 0])
+      && A.host.calls.length === max + 1,
+      `last=${JSON.stringify(A.host.calls[A.host.calls.length - 1])} calls=${A.host.calls.length}`);
+  } else {
+    check('26.10 前置：上浮这一段在出厂里', false, A.why);
+  }
+  // 槽存不下 = 拒绝给预算（fail closed），不是给一份用完即弃的。
+  const B = promotePage({ page: { freeze: true } });
+  if (B.ok) {
+    await armPromote(B);
+    await ptick(B, { mvs_c: 'running' });
+    check('26.11 预算槽存不下时 fail closed（零写）',
+      B.host.calls.length === 0, `calls=${JSON.stringify(B.host.calls)}`);
+  } else {
+    check('26.11 前置：上浮这一段在出厂里', false, B.why);
+  }
+}
+{
+  // 让位链：三段共用同一把 hostCallTake。这一趟 autoTop 先拿到闸（宿主挂住不回
+  // 调），于是上浮本趟放弃——零写、不排队、不补写。
+  const A = promotePage({ host: { hang: true } });
+  if (A.ok) {
+    await armPromote(A);
+    A.p.api.autoTick(); await flush();                     // autoTop 自己的两趟基线
+    A.p.api.autoTick(); await flush();
+    commit(A.p, A.host, A.host.order.concat([ref('mvs_new')]));
+    A.p.api.autoTick(); await flush();                     // 变化那一趟：只稳定基线
+    A.p.api.autoTick(); await flush();                     // autoTop 拿到闸并挂住
+    check('26.12 对照：自动到顶先拿到闸（宿主回调不返回）',
+      A.host.calls.length === 1 && A.p.api.gateBusy() === true,
+      `calls=${A.host.calls.length} busy=${A.p.api.gateBusy()}`);
+    await ptick(A, { mvs_c: 'running' });                   // 顺序变了：只稳定基线
+    check('26.12 中间拍被防抖吃掉（上浮还没走到闸）',
+      A.host.calls.length === 1 && A.p.api.promoteState.calls === 0
+      && A.p.api.promoteState.settleMiss >= 1,
+      `calls=${A.host.calls.length} settleMiss=${A.p.api.promoteState.settleMiss}`);
+    await ptick(A, { mvs_c: 'running' });
+    check('26.12 同一把闸被占着时上浮本趟放弃（零写、不排队）',
+      A.host.calls.length === 1 && A.p.api.promoteState.calls === 0
+      && A.p.api.promoteState.blocked >= 1,
+      `calls=${JSON.stringify(A.host.calls)} apiCalls=${A.p.api.promoteState.calls} blocked=${A.p.api.promoteState.blocked}`);
+  } else {
+    check('26.12 前置：上浮这一段在出厂里', false, A.why);
+  }
+  // 别人（非我们实例）在途的票：同一把闸，同样零写。
+  const B = promotePage({ page: { foreignTicket: Object.freeze({ held: 'other' }) } });
+  if (B.ok) {
+    await armPromote(B);
+    await ptick(B, { mvs_c: 'running' });
+    check('26.12 共享闸被别人占着时零写（与菜单项、锁顶、自动到顶同一条）',
+      B.host.calls.length === 0 && B.p.api.promoteState.blocked >= 1,
+      `calls=${B.host.calls.length} blocked=${B.p.api.promoteState.blocked}`);
+  } else {
+    check('26.12 前置：上浮这一段在出厂里', false, B.why);
+  }
+}
+{
+  // 结构：写点唯一、只经由那一个被证明的 handlePin、由 apply() 串进同一趟、
+  // 拿的是 apply() 已经算好的那份状态 map、不新开任何轮询。
+  const cut = BLOCK.indexOf('  function pinnedPromoteTick(');
+  const endCut = cut < 0 ? -1 : BLOCK.indexOf('\n  }\n', cut);
+  const body = cut < 0 ? '' : BLOCK.slice(cut, endCut < 0 ? cut : endCut + 4);
+  check('26.13 上浮这一段在出厂里', cut >= 0 && endCut > cut, 'cut=' + cut);
+  check('26.13 它自己只有那一个三参写点，且经由能力解析出来的 cap.fn',
+    (body.match(/\.fn\(/g) || []).length === 1 && body.indexOf('cap.fn(id, true, 0)') >= 0,
+    'writes=' + (body.match(/\.fn\(/g) || []).length);
+  check('26.13 它不碰 DOM 行序（无 insertBefore / appendChild / removeChild）',
+    !/insertBefore|appendChild|removeChild/.test(body), 'dom-writes');
+  check('26.13 它不写 localStorage（授权范围只有宿主那一个三参回调）',
+    !/localStorage/.test(body), 'storage');
+  check('26.13 它不新增任何轮询（interval / rAF / setTimeout 都不许出现）',
+    !/setInterval|requestAnimationFrame|setTimeout/.test(body), 'polling');
+  check('26.13 它不自己查状态（不碰 cfg / 不自己算 map）',
+    !/\bcfg\b/.test(body) && !/status-db|snapshot\(/.test(body), 'own-query');
+  check('26.13 出厂有且只有一个 pinnedPromoteTick 定义、一个状态槽',
+    (pageSrc.match(/function pinnedPromoteTick\(/g) || []).length === 1
+    && (pageSrc.match(/var TOPMOST_PROMOTE_KEY = '__mmxStatusPinnedPromoteV1';/g) || []).length === 1);
+  const applyCut = pageSrc.indexOf('  function apply() {');
+  const applyEnd = pageSrc.indexOf('\n  }\n', applyCut);
+  const applyBody = pageSrc.slice(applyCut, applyEnd < 0 ? applyCut : applyEnd);
+  check('26.13 它串在 apply() 的同一趟里（不新增 observer / interval / rAF）',
+    applyBody.indexOf('pinnedPromoteTick(sharedTopmostCap, map);') >= 0, 'wired');
+  check('26.13 一趟只解析一次能力，两段共用同一份已证明的 order',
+    (applyBody.match(/topmostAutoTopCapability\(\)/g) || []).length === 1
+    && /topmostAutoTopTick\(sharedTopmostCap\)/.test(applyBody)
+    && /pinnedPromoteTick\(sharedTopmostCap, map\)/.test(applyBody), 'shared-cap');
+  check('26.13 让位链的顺序就是语句顺序：锁顶维持 -> 自动到顶 -> 活动上浮',
+    applyBody.indexOf('topLockTick();') < applyBody.indexOf('topmostAutoTopTick(sharedTopmostCap)')
+    && applyBody.indexOf('topmostAutoTopTick(sharedTopmostCap)') < applyBody.indexOf('pinnedPromoteTick(sharedTopmostCap, map)'),
+    'chain');
+  check('26.13 可观测：api.topmost().pinnedPromote 暴露与 autoTop 同风格的计数',
+    /pinnedPromote: \{[\s\S]*?passes: promoteState\.passes,[\s\S]*?lastReason: promoteState\.lastReason,[\s\S]*?\}/.test(pageSrc)
+    && /budgetMax: TOPMOST_PROMOTE_MAX,/.test(pageSrc), 'counters');
+  check('26.13 2.5s 轮询的已知限制如实写在注释里（短对话可能整段没被采样）',
+    /2500ms/.test(body === '' ? pageSrc : pageSrc.slice(pageSrc.indexOf('  // 已置顶的会话开始对话后'),
+      pageSrc.indexOf('  function pinnedPromoteTick('))), 'limitation');
+}
+{
+  // 26.14 判据的严格性：只有 running 这【一个】桶算"这一趟在跑"。
+  //
+  // 这一段以前没有任何断言钉住它。daemon 的 snapshot() 把 idle 全部过滤掉，所以
+  // map 里出现的一切都是非 idle 桶——waiting（自己没在跑、但它拥有的子代理还在
+  // 跑的那一项）、paused（interrupted）、error、done。把出厂的 === 'running'
+  // 放宽成 !== undefined，这四类就全都成了"刚刚开始对话"，于是会被浮到最顶。
+  // 复审在沙箱里就是这么改的，而当时 797 条断言全绿：一个下标 2 上静默转红、
+  // 只是排队等轮的置顶项，会被推到一个新的顶上位置去。
+  //
+  // 所以这里逐个桶跑一遍，并且断言的是【真实的计数字段】而不是"随便挑个数非零"：
+  //   正确判据下，这一趟 next 里三项的 running 全是 false，cand 停在 -1，
+  //   于是只走 noChange++ 然后 return——changes / refused / alreadyTop 一个都不动，
+  //   宿主那一个三参回调一次都没被叫，后端 persist 一次都没发生。
+  const NON_RUNNING = ['waiting', 'error', 'paused'];
+  const seen = [];
+  for (const bucket of NON_RUNNING) {
+    const A = promotePage();
+    if (!A.ok) {
+      check(`26.14 ${bucket} 前置：上浮这一段在出厂里`, false, A.why);
+      continue;
+    }
+    const storeWrites = A.p.store.writes();
+    await armPromote(A);                        // 基线：三项全部 absent = idle
+    await ptick(A, { mvs_c: bucket });           // 下标 2 的 mvs_c 落在非 running 桶
+    const s = A.p.api.promoteState;
+    seen.push(bucket);
+    check(`26.14 V11 ${bucket} 桶的置顶项不上浮（零次宿主三参写、零次后端 persist）`,
+      A.host.calls.length === 0 && s.calls === 0 && A.host.persists.length === 0,
+      `calls=${JSON.stringify(A.host.calls)} apiCalls=${s.calls} persists=${JSON.stringify(A.host.persists)}`);
+    check(`26.14 V11 ${bucket} 桶不推进判据：changes/refused/alreadyTop 全零，只记一次 noChange`,
+      s.changes === 0 && s.refused === 0 && s.alreadyTop === 0 && s.noChange >= 1
+      && s.lastReason !== 'calling' && s.lastReason !== 'host-returned',
+      `changes=${s.changes} refused=${s.refused} alreadyTop=${s.alreadyTop} noChange=${s.noChange} reason=${s.lastReason}`);
+    check(`26.14 V11 ${bucket} 桶一次 localStorage 写都没有（授权范围只有宿主那一个三参回调）`,
+      A.p.store.writes() === storeWrites, `writes=${A.p.store.writes()}`);
+  }
+  check('26.14 三个非 running 桶都真跑到了（不是空循环的假绿）', seen.length === NON_RUNNING.length,
+    `seen=${seen.join(',')}`);
+  check('26.14 对照：同一个位置换成 running 桶就必须上浮一次（否则上面三条只是恒真）',
+    (await (async () => {
+      const A = promotePage();
+      if (!A.ok) return false;
+      await armPromote(A);
+      await ptick(A, { mvs_c: 'running' });
+      return A.host.calls.length === 1 && A.p.api.promoteState.calls === 1
+        && A.p.api.promoteState.changes === 1
+        && JSON.stringify(A.host.calls[0]) === JSON.stringify(['mvs_c', true, 0]);
+    })()), 'control=running');
 }
 
 console.log(`
