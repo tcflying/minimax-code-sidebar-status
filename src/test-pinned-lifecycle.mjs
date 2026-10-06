@@ -547,7 +547,7 @@ console.log('\n=== 5. dispose 之后不再动页面 ===');
     'window', 'document', 'disposeCloud', 'observer', 'expandGuardObserver', 'handler',
     'onPinnedMoreClick', 'onContextMenu', 'topmostTimers', 'clearTopmostItems', 'timer',
     'rafId', 'pending', 'MARK', 'SUMMARY_ID', 'PINNED_LESS_ID', 'cfg', 'touched', 'GLOBAL',
-    'topmostDiagDispose',
+    'topmostDiagDispose', 'topmostWatch', 'stopTopmostWatch',
     'var disposed = false;\nvar topmostGeneration = 7;\nvar api = {' + disposeSrc +
     '\nreturn { run: api.dispose, generation: function () { return topmostGeneration; } };'
   );
@@ -556,6 +556,13 @@ console.log('\n=== 5. dispose 之后不再动页面 ===');
   // dispose calls it, and a probe that outlived the teardown would keep a
   // detached row reachable for the rest of the page's life.
   let diagDisposed = 0;
+  // The menu watch is a live MutationObserver on the document, so dispose has to
+  // take it down too. It is handed in as a SENTINEL plus a spy rather than being
+  // sliced: what is under test here is that the shipped teardown CALLS the
+  // single teardown entry point and hands it the live watch, not a second copy
+  // of the teardown. The sentinel proves the right object travelled.
+  const WATCH_SENTINEL = { obs: { tag: 'watch' }, stopped: false };
+  const watchStops = [];
   const api = factory(window, document,
     () => { observers.push('cloud'); },
     { disconnect: () => observers.push('observer') },
@@ -565,8 +572,12 @@ console.log('\n=== 5. dispose 之后不再动页面 ===');
     () => { clearCalls.push('topmost-items'); menuItem.remove(); },
     7, 9, true, 'data-mmx-dot', 'mmx-running-summary', 'mmx-pinned-collapse',
     { styleId: 'mmx-status-style' }, touched, '__mmxStatus',
-    () => { diagDisposed++; });
+    () => { diagDisposed++; },
+    WATCH_SENTINEL,
+    (w) => { watchStops.push(w); });
   api.run();
+  check('5.1 dispose 收掉了还在飞的菜单 watch（观察器不许活过 dispose）',
+    watchStops.length === 1 && watchStops[0] === WATCH_SENTINEL, JSON.stringify(watchStops.length));
   check('5.1 dispose 使 toTopmost 代次失效（已派发的回调也作废）', api.generation() === 8,
     `generation=${api.generation()}`);
   check('5.1 dispose 顺带拆掉到最顶诊断的快照', diagDisposed === 1, `topmostDiagDispose×${diagDisposed}`);

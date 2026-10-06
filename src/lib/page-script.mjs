@@ -884,6 +884,9 @@ function __mmxStatusMain(cfg) {
     // 红色悬停锁顶的后台维持。串在【已有的】这一趟里：本模块不新增任何
     // observer / interval / rAF。串行、有预算、不与任何一次宿主写并发。
     topLockTick();
+    // 新出现的置顶项自动补到最顶。同样串在这一趟里，同样不新增任何调度。
+    // 排在 topLockTick 之后：锁的维持先说话，本段在锁顶意图在场时让位。
+    topmostAutoTopTick();
 
     // The sidebar is virtualised, so rows are constantly created and destroyed.
     // Drop detached rows from the bookkeeping Set, otherwise a long-running
@@ -1231,10 +1234,48 @@ function __mmxStatusMain(cfg) {
   // ---------------------------------------------------------------------
   var TOPMOST_LABEL = '到最顶';
   var TOPMOST_ATTR = 'data-mmx-topmost';
-  // Both walks are bounded. The sidebar container sits a handful of fibers
-  // above a row and its hook chain is a few hundred entries, so these are wide
-  // enough for the real tree and still finite if the host ever re-shapes.
-  var TOPMOST_MAX_ANCESTORS = 40;
+  // 「永久置顶到最顶」· 同一个右键菜单里的第二个入口，也是持续锁顶机器在菜单
+  // 侧的唯一入口。刻意【不】复用红色悬停按钮那条 onTopLockActivate：那条路径
+  // 要求传入的节点就是那颗按钮本身（它校验 btn.getAttribute(TOPLOCK_ID_ATTR)），
+  // 而菜单项挂在会话行右侧的浮层里，宿主从来没有给那一行挂过按钮——行内适配器
+  // 认不出 strip/title 时（见锁模块的 TOPLOCK_SITES 与 anchorRefused 计数），
+  // 这一项就是用户唯一能拿到的入口。
+  //
+  // 但状态机仍然只有【一套】：意图只有 localStorage[mmxStatusTopLockV1] 一处、
+  // 预算只有 topLockRuntime 一处、写宿主只有 topLockCall 那一个三参调用、闸
+  // 只有 hostCallTake 一个。下面两条入口共用 topLockArmIntent，不各写一份。
+  var TOPLOCKMENU_LABEL = '永久置顶到最顶';
+  var TOPLOCKMENU_ATTR = 'data-mmx-toplock-menu';
+  // 禁用理由是这一项自己的话术，与「到最顶」那句区分开：同一台机器上"不能置
+  // 顶"和"不能锁顶"对用户是两件事，说同一句话会让用户以为点错了地方。机器码
+  // 仍然只留在 api.topLock().reason 里。
+  //
+  // 这一份文案住在到最顶 这一块里，是因为菜单项是它渲染的：两个模块在离线套件
+  // 里是各自切出来编译的，跨块调用会让其中一个切片编不过。
+  var TOPLOCKMENU_REASON_TEXT = {
+    'no-handle-pin-session': '当前宿主版本不支持锁顶',
+    'ambiguous-handle-pin-session': '宿主置顶回调不唯一，已停用',
+    'unproven-fiber-tree': '无法确认宿主当前渲染树，已停用',
+    'no-fiber-root': '无法确认宿主当前渲染树，已停用',
+    'readonly-session': '该会话只读，无法锁顶',
+    'readonly-probe-threw': '只读判定失败，已停用',
+    'cloud-not-provable': '云端会话暂不支持锁顶',
+    'no-session-row': '未找到会话行',
+    'cap-mismatch': '会话身份与解析结果不一致，已停用',
+  };
+  function topLockMenuReasonText(reason) {
+    var r = String(reason || '');
+    if (TOPLOCKMENU_REASON_TEXT[r]) return TOPLOCKMENU_REASON_TEXT[r];
+    if (r.indexOf('source-not-local:') === 0) return '非本地视图，暂不支持锁顶';
+    return '当前宿主版本不支持锁顶';
+  }
+  // Both walks are bounded. The fiber walk is NOT a handful of hops: measured
+  // 2026-10-05 on this host, walking up from a session row to the HostRoot
+  // takes 176~186 levels, so the previous cap of 40 could never reach the root
+  // and every read failed with no-fiber-root. 256 leaves headroom over the
+  // measured worst case and is still finite if the host ever re-shapes. The
+  // hook chain is a few hundred entries per level, hence 1500.
+  var TOPMOST_MAX_ANCESTORS = 256;
   var TOPMOST_MAX_HOOKS = 1500;
   // The row's menu dropdown lives inside the row, so finding it takes a walk
   // DOWN the row's own subtree. Both bounds are far above the real shape (a row
@@ -1245,6 +1286,10 @@ function __mmxStatusMain(cfg) {
     injected: 0, clicks: 0, calls: 0, noops: 0, blocked: 0, busy: false,
     lastReason: '', lastSessionId: '', lastSource: '', lastClose: '',
     ticket: null,
+    // The second menu item's own count, so an operator can tell "the entry was
+    // never injected" from "it was injected and the click did nothing". The
+    // counter is about OUR node; the lock's own state is in api.topLock().
+    lockInjected: 0,
   };
   var topmostNode = null;
   var topmostTimers = [];
@@ -1252,6 +1297,29 @@ function __mmxStatusMain(cfg) {
   // Every attempt compares its own snapshot against this before doing anything
   // else, which is what makes a superseded chain inert -- see onContextMenu.
   var topmostGeneration = 0;
+  // ---- 探测窗口（2026-10-05 真机零注入的修复）--------------------------
+  // 真机上什么都没注进去，根因不是 class 改名、不是 owner 判定、也不是 fiber
+  // 预算，而是【探测窗口只有 ~16ms】：3 次尝试、固定 8ms 一步，而宿主是【首次
+  // 右击才懒挂】这一行的 portal，挂载晚于那 16ms。事后反证过 sameOwner:true，
+  // 所以归属门是对的，一个字都不许放松。
+  //
+  // 窗口靠两件互相独立的事一起撑开，任何一件单独失效另一件都还在：
+  //   1) 事件：观察器。弹层挂载本身就是一次 DOM 变更，观察器在【同一个微任务】
+  //      里就能把项放进去，所以用户看不见"菜单先出来、我们的项后补"的中间态。
+  //   2) 时间：重试表。逐级拉长而不是固定 8ms，累计 ~836ms。宿主没有
+  //      MutationObserver（或者观察器被别的代码换掉）时，这条路自己就能用。
+  //
+  // 两道上限都是硬的，任何一条先到就收工：重试表跑完（TOPMOST_RETRY_DELAYS
+  // 用尽）、nudge 次数用尽（TOPMOST_MAX_NUDGES）、或者钟过了
+  // TOPMOST_WATCH_DEADLINE。见 stopTopmostWatch。
+  var TOPMOST_RETRY_DELAYS = [0, 16, 50, 120, 250, 400];
+  var TOPMOST_WATCH_DEADLINE = 2000;
+  // nudge 不消耗重试预算（它就是那一拍该做的事），所以观察器必须有【自己的】
+  // 上限：一个不停重绘的页面，否则能在时限内把探测叫醒无穷多次。
+  var TOPMOST_MAX_NUDGES = 24;
+  // 全局只有【一个】观察器。永远不是数组：不是列表就意味着不会有第二个漏在
+  // 外面，任何一次新的右击都必须先拆掉上一个。
+  var topmostWatch = null;
   // ONE inflight gate shared by BOTH host-writing entry points: the 「到最顶」
   // menu item and the 红色悬停锁顶 button. The reason it has to be one gate and
   // not two is in the host itself: handlePinSession optimistically rebuilds the
@@ -1417,6 +1485,188 @@ function __mmxStatusMain(cfg) {
     return { available: false, reason: 'toplock-other', id: id };
   }
 
+  // ---------------------------------------------------------------------
+  // 新出现的置顶项自动补到最顶
+  //
+  // 用户 2026-10-05 反馈：新建会话点宿主自己的「置顶」后，它落在置顶区【最底
+  // 部】。原因在宿主那一侧：行组件收到的那条两参 props 包装把第三参丢了（见本
+  // 块开头那段从 asar 读出来的事实），backend 于是 clampInsertIndex(undefined,
+  // max) 追加到末尾。本段只做一件事：当【已经证明】的 pinned 顺序发生变化、
+  // 且这次新出现的那一项不在下标 0 时，给它补一次 handlePinSession(id,true,0)。
+  //
+  // 判据是【成员】而不是【下标】，这是本段最重要的一条决定。
+  //   下标变了有两种来源，而它们必须被区别对待：
+  //     1. 用户自己把 B 拖到最顶：此时 A 的下标确实从 0 变成了 1。这是一次真
+  //        实操作，我们非但不该纠正，还必须让开；
+  //     2. 我们自己写的「到最顶」：原首位被顶下去，下标同样变了。若照"被顶下
+  //        去就补一次"处理，下一拍就会把刚到最顶的那一项顶回去，等于自己撤销
+  //        用户刚点的菜单。
+  //   只有"上一份可信顺序里没有、这一份里有"的成员才是宿主新放进来的那种。
+  //   所以 24.8 与 24.8b 断言的是【什么都不做】，而不是"也补一次"。
+  //
+  // 三条硬边界，任何一条不成立就一次宿主写都不发生：
+  //   1. 顺序必须来自 topmostCapability —— 也就是 looksLikeHandlePin 认出的那
+  //      唯一一个七依赖 / arity 3 / 字符串判据的宿主 hook，且 source 是 local。
+  //      拿不到就是拿不到：记 unproven，【保留上一份基线】，不猜、不写。
+  //   2. 目标 id 自己要过宿主的只读探针 cap.probe。见证行的只读结论不能借给
+  //      别的 id（这正是 r3 的 w7/w8 两条缺陷的教训）。
+  //   3. 走 hostCallTake 那个共享闸，与「到最顶」菜单项、红色锁顶按钮同一条。
+  // 预算独立于 TOPLOCK_MAX_MAINT，而且像 topLockRuntime 一样住在 window 上：
+  // 一次重新注入不能顺手把用户的三次补写变成又三次。
+  // 稳定两趟才认这次顺序：宿主自己还在往 order 里灌数据时（冷启动的头几帧）
+  // 一份只出现过一帧的顺序不能当"上一次顺序"，否则首次加载就会把刚出现的第二
+  // 项顶到最顶。首趟永远没有基线，所以首趟永远不写。
+  var TOPMOST_AUTOTOP_KEY = '__mmxStatusAutoTopV1';
+  var TOPMOST_AUTOTOP_MAX = 3;
+  // 见证行最多看这么多个：混合视图里第一行可能是云端（能力不可证），而每一行
+  // 都要爬一次 fiber 链，所以取一个有界的前缀，绝不扫全表。
+  var TOPMOST_AUTOTOP_WITNESS_MAX = 4;
+  var autoTopState = {
+    passes: 0, settleMiss: 0, changes: 0, calls: 0, blocked: 0, refused: 0,
+    unproven: 0, deferred: 0, exhausted: 0, noCandidate: 0, alreadyTop: 0,
+    noBaseline: 0, budget: TOPMOST_AUTOTOP_MAX, owner: '', lastId: '', lastReason: '',
+  };
+  // 上一次【已证明】顺序里的会话 id，和【上一趟观察到的】顺序。两者都只是
+  // "上一次看到什么"的记忆，任何持久化槽都不写它。
+  var autoTopIds = [];
+  var autoTopSeen = [];
+  // 与 topLockRuntime 同一套纪律：存不下的窗口 = 拒绝，绝不是给一份用完即弃的
+  // 预算（那正是 r3 的 w3 缺陷）。
+  function autoTopRuntime() {
+    var r = window[TOPMOST_AUTOTOP_KEY];
+    if (r && typeof r === 'object') return r;
+    var fresh = { owner: '', budget: 0, reason: '' };
+    try {
+      window[TOPMOST_AUTOTOP_KEY] = fresh;
+    } catch (e) {
+      return null;
+    }
+    if (window[TOPMOST_AUTOTOP_KEY] !== fresh) return null;
+    return fresh;
+  }
+  // 本地 id 的形状。与锁模块的 topLockValidId 同一条判据，抄一份而不是跨块
+  // 调用，原因同上（两块在离线套件里各自切出来编译）。认不出就不是本地 id。
+  function topmostAutoTopId(id) {
+    if (typeof id !== 'string' || !id) return false;
+    if (/^[0-9]+$/.test(id)) return false;
+    return /^mvs_[A-Za-z0-9]+$/.test(id);
+  }
+  function topmostSameIds(a, b) {
+    if (a.length !== b.length) return false;
+    for (var i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
+  // 一份【已证明】的本地视图，或 null。见证行取有界的前几行：置顶区的行在
+  // DOM 里本来就在最前，所以第一行通常就是它。每一份都走同一条
+  // topmostCapability，所以 fiber 树、唯一 hook、local 源、只读探针这一整套
+  // 证明一步都不会少。
+  function topmostAutoTopCapability() {
+    var rows = document.querySelectorAll('[data-session-id]');
+    var n = rows.length < TOPMOST_AUTOTOP_WITNESS_MAX ? rows.length : TOPMOST_AUTOTOP_WITNESS_MAX;
+    for (var i = 0; i < n; i++) {
+      var cap = topmostCapability(rows[i]);
+      if (!cap.available || !cap.order || !cap.order.length) continue;
+      if (typeof cap.fn !== 'function' || typeof cap.probe !== 'function') continue;
+      return cap;
+    }
+    return null;
+  }
+  function topmostAutoTopTick() {
+    if (disposed) return;
+    autoTopState.passes++;
+    var cap = topmostAutoTopCapability();
+    if (!cap) { autoTopState.unproven++; autoTopState.lastReason = 'view-unstable'; return; }
+    var ids = [];
+    for (var i = 0; i < cap.order.length; i++) {
+      var it = cap.order[i];
+      if (it && it.type === 'session' && it.id != null) ids.push(String(it.id));
+    }
+    // 空数组证明不了任何东西：它既可能是"还没加载"，也可能是"用户刚取消全部
+    // 置顶"。不写，并且不动基线。
+    if (!ids.length) { autoTopState.unproven++; autoTopState.lastReason = 'view-unstable'; return; }
+    // 稳定两趟才认。变化中的那一趟只更新"上一趟看到什么"。
+    if (!topmostSameIds(ids, autoTopSeen)) {
+      autoTopSeen = ids.slice();
+      autoTopState.settleMiss++;
+      return;
+    }
+    var prev = autoTopIds;
+    // 已知边界（本轮不修，记在这里免得以后当成"没想过"）：基线这一次推进发生在下面
+    // 那个唯一写点【之前】。所以宿主拒绝这次补写并把顺序回滚之后，下一趟 prev 与
+    // ids 相同，会在下面那句同序早退处直接返回——首次调用被宿主拒绝后不自动重试，
+    // 同一目标的补写预算在回滚路径上等效 1。要真重试得另开一个批次把基线一并退回
+    // 去，改动面比让位那一处大得多，且失效方向是少补而不是乱写，所以不在这轮顺手改。
+    autoTopIds = ids.slice();
+    if (!prev.length) { autoTopState.noBaseline++; autoTopState.lastReason = 'baseline-armed'; return; }
+    if (topmostSameIds(prev, ids)) return;              // 顺序没变：一次调用都不考虑
+    autoTopState.changes++;
+    // 锁顶意图在场时让位：那是用户按过按钮授权的一次意图，它的代次与维持预算都
+    // 归它，我们在这里插一脚只会和它对拉。
+    // 让位只【推迟】这一次补写，绝不把它取消：这里把成员基线退回上一趟的值，于是
+    // 让位期间到达的新成员留在基线之外，锁一释放仍会被认成新成员并补到 0。若保留
+    // 上面那次推进，它们会被误当成"上一趟就知道了"，锁释放后 prev 与 ids 相同，一
+    // 次调用都不会再发生——用户新建会话点置顶后没到最顶，正是这样留下来的（D1）。
+    // 这一分支里【不得】出现任何宿主写，deferred 也仍然每趟 +1。
+    if (topmostLockView.id) {
+      autoTopIds = prev;
+      autoTopState.deferred++;
+      autoTopState.lastReason = 'toplock-other';
+      return;
+    }
+    // 候选 = 这次【新出现】的成员里下标最小的那个。成员没变就一个候选也没有，
+    // 那是用户自己的拖拽，绝不撤销。
+    var cand = -1;
+    for (var j = 0; j < ids.length; j++) { if (prev.indexOf(ids[j]) < 0) { cand = j; break; } }
+    if (cand < 0) { autoTopState.noCandidate++; autoTopState.lastReason = 'no-new-member'; return; }
+    if (cand === 0) { autoTopState.alreadyTop++; autoTopState.lastReason = 'already-top'; return; }
+    var id = ids[cand];
+    autoTopState.lastId = id;
+    if (!topmostAutoTopId(id)) { autoTopState.refused++; autoTopState.lastReason = 'not-local-id'; return; }
+    var readOnly;
+    try { readOnly = !!cap.probe(id, cap.source); } catch (e) { readOnly = true; }
+    if (readOnly) { autoTopState.refused++; autoTopState.lastReason = 'readonly-session'; return; }
+    var rt = autoTopRuntime();
+    if (!rt) { autoTopState.blocked++; autoTopState.lastReason = 'runtime-unavailable'; return; }
+    // 换一个目标 = 新的预算；同一个目标用完就停（w4 那条"只有可信手势才补满"
+    // 的纪律在这里的形状是：只有【新出现的另一项】才补满）。
+    if (rt.owner !== id) { rt.owner = id; rt.budget = TOPMOST_AUTOTOP_MAX; rt.reason = ''; }
+    autoTopState.owner = rt.owner;
+    if (rt.budget < 1) {
+      autoTopState.budget = 0;
+      autoTopState.exhausted++;
+      autoTopState.lastReason = 'budget-exhausted';
+      return;
+    }
+    var ticket = hostCallTake();
+    if (!ticket) { autoTopState.blocked++; autoTopState.lastReason = 'gate-unavailable'; return; }
+    rt.budget--;
+    autoTopState.budget = rt.budget;
+    autoTopState.calls++;
+    autoTopState.lastReason = 'calling';
+    var ret;
+    try {
+      // EXACTLY three arguments, and it is the SAME single write the other two
+      // entries use. No index means "append", which is the bug being corrected.
+      ret = cap.fn(id, true, 0);
+    } catch (e) {
+      hostCallRelease(ticket);
+      autoTopState.blocked++;
+      autoTopState.lastReason = 'call-threw';
+      return;
+    }
+    // A resolved promise means "the host finished handling it", never "it
+    // worked", so nothing here is reported as a success. The gate is released
+    // by its own settle and by nobody else.
+    Promise.resolve(ret).then(function () {
+      hostCallRelease(ticket);
+      autoTopState.lastReason = 'host-returned';
+    }, function () {
+      hostCallRelease(ticket);
+      autoTopState.blocked++;
+      autoTopState.lastReason = 'host-rejected';
+    });
+  }
+
   // -------------------------------------------------------------------------
   // 到最顶 · 最小主证诊断（只读，不改任何出厂行为，不部署）
   // -------------------------------------------------------------------------
@@ -1442,8 +1692,11 @@ function __mmxStatusMain(cfg) {
   //      不能说"为什么停"，也不能说产品返回了什么。
   var TOPMOST_DIAG_MAX_ATTEMPTS = 3;
   var TOPMOST_DIAG_MAX_EARLY = 4;
-  var TOPMOST_DIAG_ROOT_SHIPPED = TOPMOST_MAX_ANCESTORS;   // 40，与出厂同一个值
-  var TOPMOST_DIAG_ROOT_EXTENDED = 256;                    // 诊断自己的只读上限
+  var TOPMOST_DIAG_ROOT_SHIPPED = TOPMOST_MAX_ANCESTORS;   // 256，与出厂同一个值
+  // The diagnostic's own read-only cap. It MUST stay strictly above the shipped
+  // one, or the over-shipped-cap verdict below can never fire and the whole
+  // point of reporting the two caps separately is lost.
+  var TOPMOST_DIAG_ROOT_EXTENDED = 512;
   var topmostDiag = {
     row: null, chain: 0, gen: 0, capped: false, attempts: [], earlyStop: [],
     popup: null,
@@ -2362,6 +2615,109 @@ function __mmxStatusMain(cfg) {
     });
   }
 
+  function buildTopLockMenuItem(cap, rowEl, sessionId) {
+    var li = document.createElement('li');
+    li.className = 'ant-dropdown-menu-item' + (cap.available ? '' : ' opacity-40 cursor-not-allowed');
+    li.setAttribute('role', 'menuitem');
+    li.setAttribute(TOPLOCKMENU_ATTR, cap.available ? '1' : '0');
+    if (!cap.available) li.setAttribute('aria-disabled', 'true');
+    var inner = document.createElement('div');
+    inner.className = 'matrix-menu-item px-2 py-1 flex items-center';
+    var box = document.createElement('div');
+    box.className = 'relative flex w-full min-w-0 items-center';
+    var label = document.createElement('div');
+    label.className = 'desktop-text-ui-body flex min-w-0 flex-1 items-center';
+    label.textContent = cap.available
+      ? TOPLOCKMENU_LABEL
+      : (TOPLOCKMENU_LABEL + '（' + topLockMenuReasonText(cap.reason) + '）');
+    box.appendChild(label);
+    inner.appendChild(box);
+    li.appendChild(inner);
+    if (cap.available) {
+      // Keyboard reachable, exactly as 到最顶 is: tabindex plus Enter/Space,
+      // with the same isTrusted guard. The known ArrowDown limitation belongs to
+      // rc-menu's roving tabindex and applies to this item identically; see the
+      // long comment in buildTopmostItem rather than restating it here.
+      li.setAttribute('tabindex', '0');
+      li.addEventListener('click', function (ev) { onTopLockMenuActivate(ev, li, rowEl, sessionId); });
+      li.addEventListener('keydown', function (ev) {
+        if (!ev) return;
+        var k = ev.key;
+        var isSpace = (k === ' ' || k === 'Spacebar');
+        if (k !== 'Enter' && !isSpace) return;
+        if (!ev.isTrusted) return;
+        // preventDefault, never stopPropagation: Space's own default action
+        // scrolls the nearest scrollable ancestor, which is the sidebar.
+        if (isSpace && ev.preventDefault) { try { ev.preventDefault(); } catch (e) {} }
+        onTopLockMenuActivate(ev, li, rowEl, sessionId);
+      });
+    }
+    return li;
+  }
+
+  // The menu's own entry into the lock machine. NOT onTopLockActivate: that one
+  // requires the node it is handed to BE the red button, and a menu item never
+  // is one -- a row whose hover cluster we cannot identify never gets a button,
+  // and the menu is then the only way in. The two entries share the gate, the
+  // store, the budget, the generation and the single host write, and they differ
+  // in exactly three things: the event, the node, and the isTrusted wording.
+  function onTopLockMenuActivate(ev, li, rowEl, sessionId) {
+    topLockState.clicks++;
+    // Only a real user gesture. Written as an explicit !== true so this is not a
+    // second copy of the red button's guard text (the offline mutation harness
+    // pins that one to exactly one site).
+    if (!ev || ev.isTrusted !== true) { topLockState.blocked++; topLockReason('untrusted-click'); return; }
+    if (disposed) return;
+    // No preventDefault and no stopPropagation here, exactly as in
+    // onTopmostActivate: a click inside the host's open overlay does not
+    // activate the row and does not re-open the host's own menu, so there is
+    // nothing of ours to suppress and nothing of the host's to intercept. The
+    // host keeps closing its own dropdown through its own onOpenChange.
+    if (!li || !li.isConnected) { topLockState.blocked++; topLockReason('menu-gone'); return; }
+    // The row must still be the same row: a right click on a row the host has
+    // since recycled must never end up locking whatever session took its place.
+    if (!rowEl || !rowEl.isConnected || rowEl.getAttribute('data-session-id') !== sessionId) {
+      topLockState.blocked++;
+      topLockReason('row-gone');
+      return;
+    }
+    // Releasing the current target takes precedence over capability and over the
+    // gate, exactly as it does on the red button: it is the user's way out and
+    // it is a purely local write.
+    var isTarget = !!topLockState.intentId && sessionId === topLockState.intentId;
+    if (isTarget) {
+      topLockReleaseTarget();
+      return;
+    }
+    return topLockArmIntent(rowEl, sessionId);
+  }
+
+  // One implementation for both entries, from the capability re-resolution to
+  // the single host write, lives in the lock block next to onTopLockActivate --
+  // see topLockArmIntent there. Two copies of it would eventually disagree about
+  // the one question that matters ("may we still write the host after a failed
+  // store?"), and they would disagree in the dangerous direction.
+
+  function clearTopLockMenuItem() {
+    var items = document.querySelectorAll('li[' + TOPLOCKMENU_ATTR + ']');
+    for (var i = 0; i < items.length; i++) items[i].remove();
+  }
+
+  // Injected at the SAME point as 到最顶 and immediately after it, so the two
+  // entries are one pair in one menu. Appended, never replacing: the host's own
+  // items and its dividers stay exactly where they are and stay clickable.
+  // Uniqueness is per attribute, so re-injecting a chain that is retried finds
+  // what is already there instead of stacking a second copy.
+  function ensureTopLockMenuItem(ul, rowEl, sessionId) {
+    if (!ul) return null;
+    var existing = ul.querySelector('li[' + TOPLOCKMENU_ATTR + ']');
+    if (existing) return existing;
+    var li = buildTopLockMenuItem(topmostCapability(rowEl), rowEl, sessionId);
+    ul.appendChild(li);
+    topmostState.lockInjected = 1;
+    return li;
+  }
+
   function clearTopmostItems() {
     var items = document.querySelectorAll('li[' + TOPMOST_ATTR + ']');
     for (var i = 0; i < items.length; i++) items[i].remove();
@@ -2388,6 +2744,9 @@ function __mmxStatusMain(cfg) {
     if (existing) {
       topmostNode = existing;
       topmostState.injected = 1;
+      // The pair is one unit: a chain that is retried must end up with BOTH
+      // entries, and never with two copies of either.
+      ensureTopLockMenuItem(ul, row, id);
       topmostDiagRecord('append');
       return true;
     }
@@ -2395,6 +2754,10 @@ function __mmxStatusMain(cfg) {
     ul.appendChild(li);
     topmostNode = li;
     topmostState.injected = 1;
+    // Immediately after 到最顶, from the same injection point. The lock entry is
+    // NOT gated on the lock's mutual exclusion: replacing the current lock target
+    // is exactly what that item is for.
+    ensureTopLockMenuItem(ul, row, id);
     topmostDiagRecord('append');
     return true;
   }
@@ -2407,8 +2770,8 @@ function __mmxStatusMain(cfg) {
   // Capture phase, observation only: no preventDefault, no stopPropagation, no
   // interception of the host's own right click handling. The host opens the
   // menu from the same event, so the popup does not exist yet while we are
-  // still in the capture phase; the bounded retry is what finds it, and every
-  // attempt re-checks the row, so a view switch in between fails closed
+  // still in the capture phase; the bounded watch below is what finds it, and
+  // every attempt re-checks the row, so a view switch in between fails closed
   // instead of injecting into somebody else's menu.
   //
   // RETARGETING. Two things can change under a chain that is already running:
@@ -2433,22 +2796,25 @@ function __mmxStatusMain(cfg) {
   // turn into an item injected into a menu the user has already moved on from.
   function onContextMenu(ev) {
     if (disposed) return;
-    // Any previous item goes first, whatever happened to its menu.
+    // Any previous item goes first, whatever happened to its menu. Both entries:
+    // the lock item carries its own attribute, so it needs its own sweep.
     clearTopmostItems();
+    clearTopLockMenuItem();
     if (!ev || !ev.isTrusted) return;
     var t = ev.target;
     var row = t && t.closest ? t.closest('[data-session-id]') : null;
     if (!row) return;
-    // A new chain supersedes the previous one. Cancelling what is still
-    // queued is the first line and is normally sufficient; the generation bump
-    // underneath it is the second, and it is the one that does not depend on
-    // the cancellation having worked.
-    for (var ct = 0; ct < topmostTimers.length; ct++) {
-      try { window.clearTimeout(topmostTimers[ct]); } catch (e) {}
-    }
     // 上一条链还有排队 timer 就被接管 = 它被掐断了。这是"被掐断"的唯一真实
     // 证据，必须记在 topmostDiagStart 清空 attempts 之前。observation only.
     var hadPending = topmostTimers.length > 0;
+    // 上一条 watch 先拆，再谈新链。顺序是刻意的：观察器是挂在 document 上的
+    // 【长驻监听】，比一个排队 timer 危险得多，所以它必须排在"取消排队"这一步
+    // 之前被处理掉，而不是依赖后面那个 clearTimeout 循环（那个循环只认
+    // topmostTimers 里的 id，认不了一个观察器）。
+    stopTopmostWatch(topmostWatch);
+    for (var ct = 0; ct < topmostTimers.length; ct++) {
+      try { window.clearTimeout(topmostTimers[ct]); } catch (e) {}
+    }
     topmostTimers.length = 0;
     if (hadPending) topmostDiagEarlyStop(topmostDiag.chain, 'superseded');
     var gen = ++topmostGeneration;
@@ -2458,22 +2824,136 @@ function __mmxStatusMain(cfg) {
     // whatever the host put there in the meantime.
     var sessionId = row.getAttribute('data-session-id');
     topmostDiagStart(row, gen);
-    var tries = 0;
-    var attempt = function () {
-      if (disposed) return;
-      if (gen !== topmostGeneration) return;          // superseded chain
-      tries++;
-      if (!row.isConnected) { topmostDiagRecord('connected'); topmostReason('row-gone'); return; }
-      if (row.getAttribute('data-session-id') !== sessionId) {
-        topmostDiagRecord('retarget'); topmostReason('row-retargeted'); return;       // same node, new session
-      }
-      if (tryInjectTopmost(row, sessionId)) return;
-      if (tries >= 3) { topmostDiagCapped(); topmostReason('menu-not-found'); return; }
-      var again = window.setTimeout(function () { dropTopmostTimer(again); attempt(); }, 8);
-      topmostTimers.push(again);
+    startTopmostWatch(row, sessionId, gen);
+  }
+
+  // 唯一的一个收工点。观察器、click 监听、排队 timer、模块槽位都在这里清，
+  // 所以"这个功能不会留下常驻观察器"这句话是关于【一个函数】的陈述，而不是
+  // 关于散在六个出口上的一句承诺。幂等：已经停过的 watch 再停一次什么都不做。
+  //
+  // 六个调用点，全部在这里收口：注入成功、重试预算用尽、nudge 预算用尽、过了
+  // 总时限、行没了或换了身份，以及被新的右击 / 关闭 / dispose 接管。
+  //
+  // 它【不】动 topmostGeneration。代次是"让一条还在跑的链自己失效"的令牌，
+  // 只由真正的接管事件推进（新的右击、菜单关闭、dispose），不由一次正常收工
+  // 推进。把两件事混在一起会让"代次这道门还在不在"这个问题再也测不出来。
+  function stopTopmostWatch(w) {
+    if (!w || w.stopped) return;
+    w.stopped = true;
+    if (w.obs) {
+      var ob = w.obs;
+      w.obs = null;                      // clear BEFORE disconnect: a callback
+      try { ob.disconnect(); } catch (e) {}   // that re-enters finds nothing
+    }
+    if (w.onDismiss) {
+      try { document.removeEventListener('click', w.onDismiss, true); } catch (e) {}
+      w.onDismiss = null;
+    }
+    if (w.timer) {
+      var tid = w.timer;
+      w.timer = 0;
+      dropTopmostTimer(tid);
+      try { window.clearTimeout(tid); } catch (e) {}
+    }
+    if (topmostWatch === w) topmostWatch = null;
+  }
+
+  // 菜单被关掉了。宿主在下一次 click 时收掉自己的弹层，所以那一发 click 就是
+  // "这个菜单不会再出现了"的证据 —— 这时候继续挂着观察器只剩内存和开销。
+  // 捕获阶段、观察性质：不 preventDefault、不 stopPropagation。
+  //
+  // 代次在这里也要推进：一条已经被关掉的链，任何还在路上的回调都必须立刻
+  // 无效，而这一条与"被新的右击接管"是同一类事件。
+  function onTopmostMenuDismissed() {
+    if (!topmostWatch) return;
+    topmostGeneration++;
+    stopTopmostWatch(topmostWatch);
+  }
+
+  // 这一次右击的整个探测窗口。两条互相独立的路，各自有界，共用同一个 attempt
+  // 和同一套身份/代次门禁：
+  //
+  //   路 1 · 事件：观察器挂在 document 上，弹层挂载的那个微任务就重试一次。
+  //          它【不】消耗重试预算（否则 React 自己挂菜单的那一批变更会把预算
+  //          一次烧光），因此有独立的 nudge 上限和总时限。
+  //   路 2 · 时间：TOPMOST_RETRY_DELAYS 逐级拉长的重试表。观察器不存在时
+  //          （老宿主、被换掉的全局）这条路自己就能把菜单找到。
+  //
+  // 归属判定一条都没有放松：两条路都只调 tryInjectTopmost，而 tryInjectTopmost
+  // 只调 popupForMenu，popupForMenu 里那个 nearestMenuOwner(...) !== menuFiber
+  // 一字未改。观察器收到的是"文档变了"这一个事实，它不携带任何归属信息。
+  //
+  // attempt 里【没有】w.stopped 这一道：定时器回调能被取消，能取消它的就是
+  // stopTopmostWatch；那条"已经出队、clearTimeout 够不着"的回调靠的是代次。
+  // 两道门各管一段，混在一起就等于把其中一道变成没人测的装饰。
+  function startTopmostWatch(row, sessionId, gen) {
+    var w = { gen: gen, obs: null, timer: 0, tries: 0, nudges: 0, stopped: false, onDismiss: null, startedAt: Date.now() };
+    topmostWatch = w;
+    var arm = function (delay) {
+      var id = window.setTimeout(function () {
+        w.timer = 0;
+        dropTopmostTimer(id);
+        attempt(false);
+      }, delay);
+      w.timer = id;
+      topmostTimers.push(id);
     };
-    var first = window.setTimeout(function () { dropTopmostTimer(first); attempt(); }, 0);
-    topmostTimers.push(first);
+    var attempt = function (fromNudge) {
+      if (disposed) { stopTopmostWatch(w); return; }
+      if (gen !== topmostGeneration) { stopTopmostWatch(w); return; }   // superseded chain
+      // 总时限。走到这一行说明"这一拍还在跑"，所以它既能救 observer 也能救
+      // 定时器链；两条路都在下面同一处出口。
+      //
+      // 这里【不】写 topmostReason：截止时间到期的含义是"不再往下看了"，而不是
+      // "没找到菜单"这个已经由上一次 attempt 如实记下的事实。理由词表一个字都
+      // 不动（见 test-topmost-diag 的 W15b），掐断的原因走 earlyStop 那条链级
+      // 侧信道，运维看得见是哪一道上限先到。
+      if (Date.now() - w.startedAt > TOPMOST_WATCH_DEADLINE) {
+        topmostDiagEarlyStop(topmostDiag.chain, 'deadline');
+        stopTopmostWatch(w);
+        return;
+      }
+      if (fromNudge) w.nudges++; else w.tries++;
+      if (w.nudges > TOPMOST_MAX_NUDGES) { stopTopmostWatch(w); return; }
+      // Every attempt re-checks the row. A view switch, a recycled node or an
+      // unmount between the right click and the popup all fail closed here
+      // instead of injecting into somebody else's menu.
+      if (!row.isConnected) {
+        topmostDiagRecord('connected'); topmostReason('row-gone'); stopTopmostWatch(w); return;
+      }
+      if (row.getAttribute('data-session-id') !== sessionId) {
+        topmostDiagRecord('retarget'); topmostReason('row-retargeted'); stopTopmostWatch(w); return;  // same node, new session
+      }
+      if (tryInjectTopmost(row, sessionId)) { stopTopmostWatch(w); return; }
+      // The schedule is spent: report the same reason the old 3-try chain
+      // reported, so the diagnostic vocabulary does not change with the budget.
+      if (w.tries >= TOPMOST_RETRY_DELAYS.length) { topmostDiagCapped(); topmostReason('menu-not-found'); stopTopmostWatch(w); return; }
+      // A nudge does NOT re-arm the schedule: the schedule is already running,
+      // and re-arming it on every DOM change is how a repainting page would
+      // keep this alive forever.
+      if (fromNudge) return;
+      arm(TOPMOST_RETRY_DELAYS[w.tries]);
+    };
+    // The observer is an accelerator, never the only path: if the host has no
+    // MutationObserver, or the global was replaced, the schedule above is still
+    // there on its own. Read off the window object rather than off a bare
+    // global, so the page is not silently dependent on an embedding context
+    // that may not have it.
+    var MO = window.MutationObserver;
+    if (typeof MO === 'function') {
+      try {
+        w.obs = new MO(function () { if (!w.stopped) attempt(true); });
+        var target = document.body || document.documentElement;
+        if (target) w.obs.observe(target, { childList: true, subtree: true });
+        else w.obs = null;
+      } catch (e) { w.obs = null; }
+    }
+    // The dismissal listener's lifetime is the watch's lifetime, and not one
+    // beat longer: registered here, removed in stopTopmostWatch. A listener left
+    // on the document forever is the same leak as an observer left attached.
+    w.onDismiss = onTopmostMenuDismissed;
+    try { document.addEventListener('click', w.onDismiss, true); } catch (e) { w.onDismiss = null; }
+    arm(TOPMOST_RETRY_DELAYS[0]);
   }
 
   // The host unmounts the popup on close, which takes our item with it; this
@@ -2533,6 +3013,10 @@ function __mmxStatusMain(cfg) {
   document.addEventListener('click', onPinnedMoreClick, true);
   // Observation only -- nothing is prevented, stopped or replaced here.
   document.addEventListener('contextmenu', onContextMenu, true);
+  // NOTE: the menu watch's own click listener is NOT registered here. It is
+  // registered by startTopmostWatch and removed by stopTopmostWatch, so its
+  // lifetime is exactly the watch's lifetime. A document-level listener owned
+  // by the module would outlive every watch by the lifetime of the page.
 
   // ---------------------------------------------------------------------
   // 红色悬停锁顶 · 单会话持续锁顶（2026-10-03 离线实现，本轮未部署）
@@ -2648,12 +3132,65 @@ function __mmxStatusMain(cfg) {
       mount: ['h-[30px]', 'items-center'],
     },
     {
+      // site 7 · mhd 置顶行. 600 行真机取证，形态处处不同：条是 right-1（不是
+      // right-0.5），60px 那一格是【悬停才出现】的 group-hover:flex（不是
+      // block），两个原生按钮是那一格的【兄弟】、住在条里。
+      //
+      // 这一条必须排在 tf-normal 之前，理由是结构而不是偏好：两者的条共享
+      // 同样那五个 token，所以谁先命中谁说了算，而命中条之后是不回落的
+      // fail-closed。mhd 行若先落到 tf-normal 那一条，它会在自己那条
+      // group-hover:block 的 mount 上失败并整行拒掉——也就是报出来的症状。
+      // 反过来，tf-normal 行的条不带下面这两个 token，这条查不到条，会
+      // continue 到 tf-normal，两种行互不干扰。
+      //
+      // flex items-center 是取证时条上真实存在的 token，登记它们只是为了把
+      // 这一条和 tf-normal 分开；少了它们，两条会抢同一组行。
+      // px 36 而不是 30：宿主给的那一格是 w-[60px]，36 装得下，30 只是把一格
+      // 填了一半，隔着 24px 空白看着像"小了一号"。
+      // 宽度装得下，【高度装不下】：那一格是 h-[30px]，按钮是 36，于是它按
+      // align-items:center 居中之后上下各溢出 3px。这是出厂事实，不是待修的
+      // 缺陷——它之所以无害，是因为格、条、以及我们给格写的那条规则三处都没有
+      // overflow-hidden：任何一处加上就会把图钉上下切掉，"按钮大一点"就变成
+      // "图标缺一截"。34.6b 把这三处连同这个 3px 一起钉住，所以下一次改
+      // 尺寸是一次有意识的决定，而不是一次顺手。
+      // stripWidth 0（不是 60）：我们的按钮【住在那一格里】，不是条里第三个
+      // 按钮。格本身已经算在条的内容里（60 + 两个 30 = 120），再给条写死
+      // 60 + px 只会把宿主那两个 flex 兄弟压扁（它们默认可 shrink，我们的
+      // 按钮 flex:none 不缩）——越大的按钮反而让整条右半边更小。条保持内容
+      // 自适应，reserve 见 TOPLOCK_CELL_WIDTH。
+      name: 'mhd-pinned', px: 36, stripWidth: 0, titleBy: 'title-class',
+      strip: ['absolute', 'right-1', 'top-1/2', '-translate-y-1/2', 'z-[1]',
+        'flex', 'items-center'],
+      mount: ['h-[30px]', 'w-[60px]', 'items-center', 'group-hover:flex',
+        'group-focus-within:flex'],
+      // NO minNativeButtons on purpose: the host's own two buttons are the
+      // mount's siblings inside the strip, so counting them under the mount is
+      // a permanent 0 and the row could never match.
+    },
+    {
       name: 'tf-normal', px: 32, stripWidth: 0, titleBy: 'anchor',
       strip: ['absolute', 'right-1', 'top-1/2', '-translate-y-1/2', 'z-[1]'],
       mount: ['group-hover:block', 'group-focus-within:block'],
     },
   ];
   var TOPLOCK_PROJECT_SHELL = ['rounded-xl', 'p-3', 'gap-6'];
+  // 我们的按钮【住在宿主自己定尺寸的那一格】里的 site（按 site 名索引）。
+  //
+  // 两种落位，承重数字完全不同，绝不能共用一个公式：
+  //   兄弟位（irecent / ipinned）：按钮和宿主自己的按钮并排，所以它【自己占
+  //     一份宽度】——标题让出 宿主原值 + px，条从 stripWidth 涨到
+  //     stripWidth + px。
+  //   格里（mhd-pinned）：按钮进的是宿主预留的 w-[60px] 悬停格，格已经算在
+  //     条的内容里，宿主标题也已经为它留了 60px。这时候再加一次 px 就是把
+  //     标题按【不存在的第二个按钮】再缩一次。所以这里 reserve 取 max(宿主
+  //     原值, 格宽) = 格宽本身，条一条 width 规则都不写。
+  //
+  // 键是 site 名（site 表里没有这个字段，是刻意的：layout key 的算法是既有
+  // 契约，不能动），值是宿主那一格的宽度；site 表里 px 必须 <= 这个值。
+  var TOPLOCK_CELL_WIDTH = { 'mhd-pinned': 60 };
+  // 图标跟着按钮走，按钮多大图标就多大：30px 按钮配 16px 图标（0.53），
+  // 36px 就配 20px（0.55）。SVG 有 viewBox，放大不糊。
+  var TOPLOCK_GLYPH_RATIO = 0.55;
   var TOPLOCK_TITLE_MARGIN = {
     'mr-2': 8, 'mr-8': 32, 'mr-10': 40, 'mr-[60px]': 60,
   };
@@ -3110,30 +3647,50 @@ function __mmxStatusMain(cfg) {
       var mq = '[' + TOPLOCK_MOUNT_ATTR + '="' + key + '"]';
       var rule = TOPLOCK_BASE_CSS;
       var px = place.site.px;
+      // 0 = 我们的按钮是宿主按钮的【兄弟】，自己占一份宽度；非 0 = 它住在
+      // 宿主定尺寸的那一格里，格已经算在条里、也已经被标题预留了。
+      var cell = TOPLOCK_CELL_WIDTH[place.site.name] || 0;
+      // 标题该让出多少：兄弟位是 宿主原值 + px；格里是 max(宿主原值, 格宽)
+      // ——格宽就是宿主自己为这一格留的量，绝不能比它少，也绝不能再多加一个
+      // px（那一格里并没有第二个按钮）。
+      var need = function (hostValue) {
+        return cell ? Math.max(hostValue, cell) : hostValue + px;
+      };
       // AT REST the host's own value stands: our button is inside a container
       // that is display:none until hover, so it occupies no room and must not
       // shrink the title for nothing. Only the always-visible actions branch
       // needs room at rest.
       if (place.alwaysVisible) {
-        rule += q + '{margin-right:' + (place.rest + px) + 'px}';
-        if (place.site.stripWidth) {
+        rule += q + '{margin-right:' + need(place.rest) + 'px}';
+        if (place.site.stripWidth && !cell) {
           rule += sq + '{width:' + (place.site.stripWidth + px) + 'px}';
         }
       }
       if (place.hover !== null && place.hover !== undefined) {
-        rule += '.group:hover ' + q + '{margin-right:' + (place.hover + px) + 'px}';
+        rule += '.group:hover ' + q + '{margin-right:' + need(place.hover) + 'px}';
       }
       if (place.focus !== null && place.focus !== undefined) {
-        rule += '.group:focus-within ' + q + '{margin-right:' + (place.focus + px) + 'px}';
+        rule += '.group:focus-within ' + q + '{margin-right:' + need(place.focus) + 'px}';
       }
-      if (!place.alwaysVisible && place.site.stripWidth) {
+      if (!place.alwaysVisible && place.site.stripWidth && !cell) {
         rule += '.group:hover ' + sq + '{width:' + (place.site.stripWidth + px) + 'px}';
         rule += '.group:focus-within ' + sq + '{width:' + (place.site.stripWidth + px) + 'px}';
       }
       // tf-normal's mount is display:block; our sibling would stack under the
       // host's own menu button. Laying the mount out as a row is a layout-only
       // change on OUR marked element and leaves both buttons intact.
-      rule += mq + '{display:flex;align-items:center}';
+      //
+      // 格里位（mhd）多两件事，都只写在我们自己那一条规则上，宿主的 class 一
+      // 个字都不动：按钮在格子里【居中】（贴着格子左边会和右侧的 12px 空白
+      // 看着没对齐，而格宽正是标题让出的宽度，居中才配得上那个数），以及图
+      // 标跟着按钮放大（按钮从 30 到 36，图标还停在 16 就像"同一个图标换了个
+      // 稍大的盒子"）。选择器是 mount 的后代，按钮就在 mount 里。
+      rule += mq + '{display:flex;align-items:center'
+        + (cell ? ';justify-content:center' : '') + '}';
+      if (cell) {
+        var gpx = Math.round(px * TOPLOCK_GLYPH_RATIO);
+        rule += mq + ' .mmx-toplock-glyph{width:' + gpx + 'px;height:' + gpx + 'px}';
+      }
       r.rules[key] = rule;
       topLockWriteCss();
     }
@@ -3687,6 +4244,28 @@ function __mmxStatusMain(cfg) {
       topLockRelease();
       return;
     }
+    return topLockArmIntent(rowEl, sessionId);
+  }
+
+  // The red button inlines these two calls where they are; the right-click menu
+  // entry calls this. One sequence, one pair of functions, no second copy of any
+  // state.
+  function topLockReleaseTarget() {
+    topLockInvalidateCaps();
+    topLockRelease();
+  }
+
+  // ONE implementation of "re-resolve, then arm the intent, then trigger one
+  // maintenance pass", shared by BOTH entries: the red hover button
+  // (onTopLockActivate) and the right-click menu item
+  // (onTopLockMenuActivate, in the 到最顶 block).
+  //
+  // Deliberately one copy. Two copies would eventually disagree about the only
+  // question that matters here -- "may we still write the host after the store
+  // failed?" -- and they would disagree in the dangerous direction. The two
+  // entries differ in exactly three things: the event, their own node, and the
+  // isTrusted guard. Everything from the capability downwards is this function.
+  function topLockArmIntent(rowEl, sessionId) {
     // 每次点击都重新解析：从不缓存 fiber、fn 或 order 引用（INV-21c）。
     var cap = topmostCapability(rowEl);
     if (!cap.available) {
@@ -3903,6 +4482,9 @@ function __mmxStatusMain(cfg) {
         orderLength: typeof cap.orderLength === 'number' ? cap.orderLength : -1,
         orderFirst: cap.orderFirst || '',
         injected: topmostState.injected,
+        // The second menu item's presence, so "it never appeared" is a number
+        // the operator can read rather than something to infer.
+        lockInjected: topmostState.lockInjected,
         busy: topmostState.busy,
         clicks: topmostState.clicks,
         calls: topmostState.calls,
@@ -3911,6 +4493,31 @@ function __mmxStatusMain(cfg) {
         lastReason: topmostState.lastReason,
         lastClose: topmostState.lastClose,
         lastSessionId: topmostState.lastSessionId,
+        // The auto-top corrector's whole budget, in one plain object: it is a
+        // machine code and counter only -- no fiber, no DOM node, no function,
+        // no session title, no conversation content. unproven is the one that
+        // matters in the field: a rising count means the pinned order could not
+        // be proven, so nothing was written and the last proven baseline was
+        // kept.
+        autoTop: {
+          passes: autoTopState.passes,
+          settleMiss: autoTopState.settleMiss,
+          changes: autoTopState.changes,
+          calls: autoTopState.calls,
+          blocked: autoTopState.blocked,
+          refused: autoTopState.refused,
+          unproven: autoTopState.unproven,
+          deferred: autoTopState.deferred,
+          exhausted: autoTopState.exhausted,
+          noCandidate: autoTopState.noCandidate,
+          alreadyTop: autoTopState.alreadyTop,
+          noBaseline: autoTopState.noBaseline,
+          budget: autoTopState.budget,
+          budgetMax: TOPMOST_AUTOTOP_MAX,
+          owner: autoTopState.owner,
+          lastId: autoTopState.lastId,
+          lastReason: autoTopState.lastReason,
+        },
       };
     },
     // READ ONLY snapshot of the minimal 到最顶 diagnostic. Its whole job is to
@@ -4038,6 +4645,12 @@ function __mmxStatusMain(cfg) {
       try { document.removeEventListener('click', onPinnedMoreClick, true); } catch (e) {}
       try { document.removeEventListener('contextmenu', onContextMenu, true); } catch (e) {}
       for (var tt = 0; tt < topmostTimers.length; tt++) window.clearTimeout(topmostTimers[tt]);
+      // Straight after the timer loop, and for the same reason as in
+      // onContextMenu: a MutationObserver attached to the document outlives
+      // every queued timer, and the loop above cannot reach it. This also
+      // unhooks the watch's own click listener, which lives and dies with the
+      // watch, and cancels the one timer the loop may not have owned.
+      stopTopmostWatch(topmostWatch);
       topmostTimers.length = 0;
       // Second line of defence for the same reason, and for the same reason it
       // is not redundant: the clearTimeout loop above is the one that depends
@@ -4045,6 +4658,12 @@ function __mmxStatusMain(cfg) {
       // working at all.
       topmostGeneration++;
       clearTopmostItems();
+      // The lock's own menu item: our node, in the HOST's overlay, so it has to
+      // come out with us or it would outlive the instance inside a cached popup.
+      // The selector is written as a literal for the same reason the lock
+      // buttons below are: this teardown is sliced on its own by the suites.
+      var topLockMenuItems = document.querySelectorAll('[data-mmx-toplock-menu]');
+      for (var tm = 0; tm < topLockMenuItems.length; tm++) topLockMenuItems[tm].remove();
       topmostDiagDispose();
       window.clearInterval(timer);
       if (rafId) { try { cancelAnimationFrame(rafId); } catch (e) {} rafId = 0; }

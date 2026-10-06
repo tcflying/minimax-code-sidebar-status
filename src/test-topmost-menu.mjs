@@ -268,7 +268,7 @@ if (MUT === 'm1') {
   const fromC = "if (nearestMenuOwner(fiberOf(ul), __rec, menuFiber) !== menuFiber) { topmostDiagPopupFork(__tr, __rec, 'owner-mismatch', false, true, null); continue; }";
   if (!BLOCK.includes(fromC)) throw new Error('mutation m12 anchor not found');
   BLOCK = BLOCK.replace(fromC, 'if (!fiberUnder(fiberOf(ul), menuFiber)) continue;');
-  BLOCK = 'function fiberUnder(f, target) { for (var i = 0; f && i < 40; i++) { if (f === target) return true; f = f.return; } return false; }\n' + BLOCK;
+  BLOCK = 'function fiberUnder(f, target) { for (var i = 0; f && i < 256; i++) { if (f === target) return true; f = f.return; } return false; }\n' + BLOCK;
 } else if (MUT === 'm13') {
   // Space stops calling preventDefault. The sidebar list is the nearest
   // scrollable ancestor of a focused menu item, so Space's own default action
@@ -282,7 +282,12 @@ if (MUT === 'm1') {
   // already dequeued -- which is why the retry test below dequeues one by hand
   // and fires it after the successor chain has started. A test that only let
   // the queue drain would pass here and prove nothing.
-  const from = '      if (gen !== topmostGeneration) return;          // superseded chain';
+  // Anchor only, not the mutation: on 2026-10-05 the same statement grew a
+  // teardown call, so the anchor follows the shipped text. What is removed is
+  // still exactly one thing -- the comparison against the generation -- and the
+  // attempt still has no other gate standing behind it, which is the whole
+  // reason the harness has to dequeue a callback by hand.
+  const from = '      if (gen !== topmostGeneration) { stopTopmostWatch(w); return; }   // superseded chain';
   if (!BLOCK.includes(from)) throw new Error('mutation m14 anchor not found');
   BLOCK = BLOCK.replace(from, '      // generation comparison removed by mutation m14');
 } else if (MUT === 'm15') {
@@ -615,6 +620,11 @@ function makePage(src, winOpts) {
   // fragment on its own would prove nothing about what onTopmostActivate then
   // does with that null, which is precisely the r3 defect.
   if (winOpts && winOpts.foreignTicket) window.__mmxStatusHostGateV1 = { ticket: winOpts.foreignTicket };
+  // The menu watch attaches a MutationObserver, so the page has to be able to
+  // reach one -- and the harness has to be able to see whether it is still
+  // attached. winOpts.noObserver models a host with no MutationObserver at all,
+  // which is the case the retry schedule has to carry by itself.
+  if (!(winOpts && winOpts.noObserver)) window.MutationObserver = dom.observers.MutationObserver;
   if (winOpts && winOpts.freeze) Object.freeze(window);
   const factory = new Function(
     'window',
@@ -628,6 +638,15 @@ function makePage(src, winOpts) {
       ' disposeTopmost: disposeTopmost,' +
       ' generation: function () { return topmostGeneration; },' +
       ' pendingTimers: function () { return topmostTimers.length; },' +
+      // Section 25 reads the watch's own lifecycle. Every accessor is a
+      // `typeof` guard, so a build that has no watch at all (i.e. the shipped
+      // code before this feature) reports null/0 instead of throwing a
+      // ReferenceError: the assertions then fail as ORDINARY fails, which is
+      // the only kind of red that says anything about the behaviour.
+      ' watch: function () { return typeof topmostWatch === "undefined" ? null : topmostWatch; },' +
+      ' watchAttached: function () { return typeof topmostWatch === "undefined" || !topmostWatch ? 0 : (topmostWatch.obs ? 1 : 0); },' +
+      ' watchTries: function () { return typeof topmostWatch === "undefined" || !topmostWatch ? 0 : (topmostWatch.tries || 0); },' +
+      ' watchNudges: function () { return typeof topmostWatch === "undefined" || !topmostWatch ? 0 : (topmostWatch.nudges || 0); },' +
       // Read-only handles onto the diagnostic side channel, so section 13+ can
       // assert the RAW loop record the shipped popupForMenu wrote, instead of
       // re-deriving it. None of them writes: the traces in this file are
@@ -787,6 +806,16 @@ function openMenu(page, dropdown, opts = {}) {
 }
 
 const flush = async () => { for (let i = 0; i < 4; i++) await Promise.resolve(); };
+
+// Beats of the fake timer queue. The shipped retry schedule has a fixed,
+// small number of entries, so the number of beats needed to drain it is a
+// property of the SHIPPED code, not of a test. It is deliberately an
+// over-estimate rather than a restatement of the schedule: running more beats
+// than there are entries is a no-op on an empty queue, while running fewer
+// would leave a chain pending and turn an unrelated assertion into a false
+// red. Section 25 asserts the schedule itself is finite and bounded.
+const BEATS = 24;
+const drain = (p) => { for (let i = 0; i < BEATS; i++) p.timers.run(); };
 
 console.log(`\n=== 0. 出厂代码切片（MMX_MUTATE=${MUT || 'none'}）===`);
 {
@@ -964,8 +993,11 @@ console.log('\n=== 2. 菜单注入：绑定到本次右键的那一个菜单 ===
   p.timers.run();
   const items = ul.querySelectorAll('li[data-mmx-topmost]');
   check('3.1 注入了一项', items.length === 1, `items=${items.length}`);
+  // 追加在宿主原有项之后（不替换）。菜单里现在有【两项】我们自己的东西，所以这
+  // 一条断言说的是"我们的一项排在宿主项之后"，而不是"我们只有一项"。
   check('3.1 追加在宿主原有项之后（不替换）',
-    ul.children[ul.children.length - 1] === items[0], `children=${ul.children.length}`);
+    ul.children[0] === hostItem && ul.children.indexOf(items[0]) > 0,
+    `children=${ul.children.length} topAt=${ul.children.indexOf(items[0])}`);
   check('3.1 宿主原菜单项仍在且仍可点', ul.children[0] === hostItem);
   hostItem.dispatch('click', { isTrusted: true });
   check('3.1 宿主原项的监听没有被摘掉', (p.dom.root.querySelector('.ant-dropdown-menu-item').listenerCount('click')) === 1);
@@ -983,7 +1015,7 @@ console.log('\n=== 2. 菜单注入：绑定到本次右键的那一个菜单 ===
   const other = makeRow(p, 'mvs_other', host);
   const otherMenu = openMenu(p, other.dropdown);
   p.api.onContextMenu({ target: mine.rowEl, isTrusted: true });
-  for (let i = 0; i < 4; i++) p.timers.run();
+  drain(p);
   check('4.2 别的行的菜单不被注入', otherMenu.ul.querySelectorAll('li[data-mmx-topmost]').length === 0,
     `items=${otherMenu.ul.querySelectorAll('li[data-mmx-topmost]').length}`);
   check('4.2 找不到归属菜单时如实上报', p.api.state.lastReason === 'menu-not-found',
@@ -997,7 +1029,7 @@ console.log('\n=== 2. 菜单注入：绑定到本次右键的那一个菜单 ===
   const { rowEl, dropdown } = makeRow(p, 'mvs_copy', host);
   const sub = openMenu(p, dropdown, { submenu: true });
   p.api.onContextMenu({ target: rowEl, isTrusted: true });
-  for (let i = 0; i < 4; i++) p.timers.run();
+  drain(p);
   check('4.3 复制子菜单不被注入', sub.ul.querySelectorAll('li[data-mmx-topmost]').length === 0);
 }
 {
@@ -1010,7 +1042,7 @@ console.log('\n=== 2. 菜单注入：绑定到本次右键的那一个菜单 ===
   attachFiber(ul, fiber({ tag: 5, name: 'ul', props: {}, hooks: null, parent: list }));
   p.dom.root.appendChild(ul);
   p.api.onContextMenu({ target: rowEl, isTrusted: true });
-  for (let i = 0; i < 4; i++) p.timers.run();
+  drain(p);
   check('4.4 空菜单不被注入', ul.querySelectorAll('li[data-mmx-topmost]').length === 0);
 }
 {
@@ -1243,7 +1275,7 @@ console.log('\n=== 4. 竞态与生命周期防护 ===');
   // can ever be outstanding -- it does not grow with the number of clicks.
   check('6.7 反复右键不积压定时器（重试有界）', p.api.pendingTimers() <= 2,
     `pending=${p.api.pendingTimers()}`);
-  for (let i = 0; i < 4; i++) p.timers.run();
+  drain(p);
   check('6.7 重试链跑完后定时器清零', p.api.pendingTimers() === 0, `pending=${p.api.pendingTimers()}`);
   check('6.7 反复右键不产生注入', p.api.state.injected === 0);
 }
@@ -1292,7 +1324,7 @@ console.log('\n=== 7. 真实拓扑：菜单 dropdown 是行的【子】孙，不
   dropdown.sibling = twin;
   const { ul } = openMenu(p, dropdown);
   p.api.onContextMenu({ target: rowEl, isTrusted: true });
-  for (let i = 0; i < 4; i++) p.timers.run();
+  drain(p);
   check('7.3 同一行出现两个右键菜单时 fail closed', ul.querySelectorAll('li[data-mmx-topmost]').length === 0,
     `items=${ul.querySelectorAll('li[data-mmx-topmost]').length}`);
 }
@@ -1304,7 +1336,7 @@ console.log('\n=== 7. 真实拓扑：菜单 dropdown 是行的【子】孙，不
   const { rowEl, hoverDropdown } = makeRow(p, 'mvs_hover', host);
   const { ul } = openMenu(p, hoverDropdown);
   p.api.onContextMenu({ target: rowEl, isTrusted: true });
-  for (let i = 0; i < 4; i++) p.timers.run();
+  drain(p);
   check('7.4 hover「…」菜单不被注入', ul.querySelectorAll('li[data-mmx-topmost]').length === 0,
     `items=${ul.querySelectorAll('li[data-mmx-topmost]').length}`);
 }
@@ -1317,7 +1349,7 @@ console.log('\n=== 7. 真实拓扑：菜单 dropdown 是行的【子】孙，不
   const other = makeRow(p, 'mvs_other2', host);
   const otherMenu = openMenu(p, other.dropdown);
   p.api.onContextMenu({ target: mine.rowEl, isTrusted: true });
-  for (let i = 0; i < 4; i++) p.timers.run();
+  drain(p);
   check('7.5 别的行的菜单不被注入（fiber 身份绑定）',
     otherMenu.ul.querySelectorAll('li[data-mmx-topmost]').length === 0);
 }
@@ -1411,7 +1443,8 @@ console.log('\n=== 8. 键盘可达 + 菜单关闭 ===');
     `propsCalls=${opts.propsCalls} openChanges=${JSON.stringify(opts.openChanges)}`);
   p.api.onContextMenu({ target: rowEl, isTrusted: true });
   p.timers.run();
-  check('8.6 宿主项与我们的项并存', ul.children.length === 2, `children=${ul.children.length}`);
+  check('8.6 宿主项与我们的项并存', ul.children.length === 3 && ul.children[0] === hostItem,
+    `children=${ul.children.length} first=${ul.children[0] === hostItem ? 'host' : 'ours'}`);
 }
 
   // ---------------------------------------------------------------------------
@@ -1645,7 +1678,7 @@ console.log('\n=== 11. 代次：换目标后旧的重试链必须失效 ===');
     ids.indexOf(oldTid) < 0, `before=${before} after=${JSON.stringify(ids)}`);
   check('11.2 只剩新链自己的那一条（不叠加）',
     ids.length === 1 && ids[0] !== oldTid, JSON.stringify(ids));
-  for (let i = 0; i < 4; i++) p.timers.run();
+  drain(p);
   check('11.2 过期链一个项都没注入', menuA.ul.querySelectorAll('li[data-mmx-topmost]').length === 0,
     `inA=${menuA.ul.querySelectorAll('li[data-mmx-topmost]').length}`);
   check('11.2 当前链正常注入', menuB.ul.querySelectorAll('li[data-mmx-topmost]').length === 1,
@@ -1711,7 +1744,7 @@ console.log('\n=== 12. 可见性：不得注入到用户看不见的浮层 ===')
   const { ul } = openMenu(p, dropdown);
   ul.__hidden = true;
   p.api.onContextMenu({ target: rowEl, isTrusted: true });
-  for (let i = 0; i < 4; i++) p.timers.run();
+  drain(p);
   check('12.1 不可见的浮层里没有注入',
     ul.querySelectorAll('li[data-mmx-topmost]').length === 0,
     `items=${ul.querySelectorAll('li[data-mmx-topmost]').length}`);
@@ -1826,7 +1859,7 @@ function tMenuFiber(page) {
 }
   // depth = how many .return hops separate the popup's own fiber from menuFiber.
   // depth 0 is the host's shape (the popup hangs directly off the dropdown);
-  // depth 39 is the last legal iteration; depth 40 is one past the cap.
+  // depth 255 is the last legal iteration; depth 256 is one past the cap.
 function tPopupChain(page, menuFiber, depth) {
   let cur = menuFiber;
   for (let i = 0; i < depth; i++) cur = tFiber(page, {}, cur);
@@ -1954,8 +1987,8 @@ console.log('\n=== 13. 四道门：各自只在真实出口记，null 就是"没
     JSON.stringify(cand(tr, 0)));
   check('13.16 accepted 之后循环立刻返回，没有再开下一个候选',
     tr.scanned === 1 && tr.forkCopy === 0, JSON.stringify([tr.scanned, tr.forkCopy]));
-  check('13.17 accepted 候选的 owner 三态：found / hops=3 / cap=40',
-    cand(tr, 0).ownerEnd === 'found' && cand(tr, 0).hops === 3 && cand(tr, 0).ownerCap === 40,
+  check('13.17 accepted 候选的 owner 三态：found / hops=3 / cap=256',
+    cand(tr, 0).ownerEnd === 'found' && cand(tr, 0).hops === 3 && cand(tr, 0).ownerCap === 256,
     JSON.stringify(cand(tr, 0)));
   check('13.18 visible 是由 hidden / accepted 两个出口本身写进去的，没有第二次求值',
     page.calls.filter((c) => c.indexOf('eiv:') === 0).length === 1,
@@ -1963,7 +1996,7 @@ console.log('\n=== 13. 四道门：各自只在真实出口记，null 就是"没
 }
 
   // ---------------------------------------------------------------------------
-console.log('\n=== 14. owner 四态：39 / 40 是真边界 ===');
+console.log('\n=== 14. owner 四态：255 / 256 是真边界 ===');
 {
   // One helper, driven by a chain of an exact length, so the two sides of the
   // cap differ by exactly one hop and BOTH product consequences are visible.
@@ -1974,31 +2007,31 @@ console.log('\n=== 14. owner 四态：39 / 40 是真边界 ===');
     const got = page.api.popupForMenu(mf);
     return { page, mf, ul, got, tr: rawTrace(page), c: cand(rawTrace(page), 0) };
   };
-  const a = at((page, mf) => tPopup(page, { chain: tPopupChain(page, mf, 39) }));
-  check('14.1 恰 39 跳：ownerEnd=found, hops=39, ownerFound=true',
-    a.c.ownerEnd === 'found' && a.c.hops === 39 && a.c.ownerFound === true,
+  const a = at((page, mf) => tPopup(page, { chain: tPopupChain(page, mf, 255) }));
+  check('14.1 恰 255 跳：ownerEnd=found, hops=255, ownerFound=true',
+    a.c.ownerEnd === 'found' && a.c.hops === 255 && a.c.ownerFound === true,
     JSON.stringify([a.c.ownerEnd, a.c.hops, a.c.ownerFound]));
-  check('14.1b 恰 39 跳：产品 accept 并返回那个 ul 本身',
+  check('14.1b 恰 255 跳：产品 accept 并返回那个 ul 本身',
     a.got === a.ul && a.tr.accepted === 1, JSON.stringify({ got: a.got === a.ul, accepted: a.tr.accepted }));
-  check('14.1c found 时 ownerCap 记的是出厂那个 40', a.c.ownerCap === 40, String(a.c.ownerCap));
+  check('14.1c found 时 ownerCap 记的是出厂那个 256', a.c.ownerCap === 256, String(a.c.ownerCap));
   check('14.1d 拿到的是 want 自己（同一个对象）时配对为 false',
     a.c.ownerIsAlternateOfMenuFiber === false, String(a.c.ownerIsAlternateOfMenuFiber));
 
-  const b = at((page, mf) => tPopup(page, { chain: tPopupChain(page, mf, 40) }));
-  check('14.2 恰 40 跳：ownerEnd=budget（走到 null 才 chain-ended，这里 fiber 仍非空）, hops=40',
-    b.c.ownerEnd === 'budget' && b.c.hops === 40, JSON.stringify([b.c.ownerEnd, b.c.hops]));
-  check('14.2b 恰 40 跳：产品返回 null 并记 owner-mismatch',
+  const b = at((page, mf) => tPopup(page, { chain: tPopupChain(page, mf, 256) }));
+  check('14.2 恰 256 跳：ownerEnd=budget（走到 null 才 chain-ended，这里 fiber 仍非空）, hops=256',
+    b.c.ownerEnd === 'budget' && b.c.hops === 256, JSON.stringify([b.c.ownerEnd, b.c.hops]));
+  check('14.2b 恰 256 跳：产品返回 null 并记 owner-mismatch',
     b.got === null && b.c.outcome === 'owner-mismatch' && b.c.ownerFound === false,
     JSON.stringify([b.got === null, b.c.outcome, b.c.ownerFound]));
 
   // A chain LONGER than the cap changes nothing about the recorded end: the
-  // walk stops at the shipped 40, so hops is 40 -- not 44. Reporting 44 would
-  // be claiming the diagnostic walked further than the shipped code does.
-  const c44 = at((page, mf) => tPopup(page, { chain: tPopupChain(page, mf, 44) }));
-  check('14.3 44 跳的链仍停在出厂上限上：budget 且 hops=40（不是 44）',
-    c44.c.ownerEnd === 'budget' && c44.c.hops === 40, JSON.stringify([c44.c.ownerEnd, c44.c.hops]));
-  check('14.3b 上溯求值次数恰为 40，没有为了诊断多走一步',
-    c44.page.calls.filter((x) => x.indexOf('mp:') === 0).length === 40,
+  // walk stops at the shipped 256, so hops is 256 -- not 260. Reporting 260
+  // would be claiming the diagnostic walked further than the shipped code does.
+  const c44 = at((page, mf) => tPopup(page, { chain: tPopupChain(page, mf, 260) }));
+  check('14.3 260 跳的链仍停在出厂上限上：budget 且 hops=256（不是 260）',
+    c44.c.ownerEnd === 'budget' && c44.c.hops === 256, JSON.stringify([c44.c.ownerEnd, c44.c.hops]));
+  check('14.3b 上溯求值次数恰为 256，没有为了诊断多走一步',
+    c44.page.calls.filter((x) => x.indexOf('mp:') === 0).length === 256,
     String(c44.page.calls.filter((x) => x.indexOf('mp:') === 0).length));
 
   const shortChain = (page) => {
@@ -2251,11 +2284,11 @@ console.log('\n=== 18. 异常隔离：在助手自己的 try 内按序位真注�
         return mf;
       },
     },
-    'accept-39': {
+    'accept-255': {
       reach: ALL.filter((p) => p !== 'nmo-miss'),
       build: (page) => {
         const mf = tMenuFiber(page);
-        tPopup(page, { chain: tPopupChain(page, mf, 39) });
+        tPopup(page, { chain: tPopupChain(page, mf, 255) });
         return mf;
       },
     },
@@ -2267,11 +2300,11 @@ console.log('\n=== 18. 异常隔离：在助手自己的 try 内按序位真注�
         return mf;
       },
     },
-    'budget-40': {
+    'budget-256': {
       reach: ALL.filter((p) => p !== 'nmo-found'),
       build: (page) => {
         const mf = tMenuFiber(page);
-        tPopup(page, { chain: tPopupChain(page, mf, 40) });
+        tPopup(page, { chain: tPopupChain(page, mf, 256) });
         return mf;
       },
     },
@@ -2408,8 +2441,8 @@ console.log('\n=== 19. 跨候选按序位：第二个候选被故障时第一个
   // Two candidates, both of which run out before the cap (so nmo-miss hits twice).
   const twoMiss = (page) => {
     const mf = tMenuFiber(page);
-    tPopup(page, { chain: tPopupChain(page, mf, 40) });
-    tPopup(page, { chain: tPopupChain(page, mf, 41) });
+    tPopup(page, { chain: tPopupChain(page, mf, 256) });
+    tPopup(page, { chain: tPopupChain(page, mf, 257) });
     return mf;
   };
   const cRefFound = go({}, twoFound).tr;
@@ -2464,7 +2497,7 @@ console.log('\n=== 19. 跨候选按序位：第二个候选被故障时第一个
   const joint = (page) => {
     const mf = tMenuFiber(page);
     tPopup(page, { chain: foreignChain(page, 3) });
-    tPopup(page, { chain: tPopupChain(page, mf, 40) });
+    tPopup(page, { chain: tPopupChain(page, mf, 256) });
     tPopup(page, { chain: foreignChain(page, 4) });
     return mf;
   };
@@ -2483,7 +2516,7 @@ console.log('\n=== 19. 跨候选按序位：第二个候选被故障时第一个
     jArm.tr.scanned === 2 && jRef.tr.scanned === 3, `armed=${jArm.tr.scanned} ref=${jRef.tr.scanned}`);
   check('19.4f 候选 1 逐字段与未注入参照相同（没被后两个候选覆写）',
     same(cand(jArm.tr, 0), cand(jRef.tr, 0)), JSON.stringify(cand(jArm.tr, 0)));
-  check('19.4g 候选 1 留着的仍是自己跑出来的值，不是后两个候选的（hops=3 而非 40 或 4）',
+  check('19.4g 候选 1 留着的仍是自己跑出来的值，不是后两个候选的（hops=3 而非 256 或 4）',
     cand(jArm.tr, 0).hops === 3 && cand(jArm.tr, 0).ownerEnd === 'found',
     JSON.stringify(cand(jArm.tr, 0)));
   check('19.4h 参照那一次三条明细全在，所以 armed 少掉的两条确实来自这次故障',
@@ -2766,6 +2799,974 @@ console.log('\n=== 22. r4：共享闸在这个入口也必须能拒绝（真实�
       p.window[GATE] && typeof p.window[GATE] === 'object' && 'ticket' in p.window[GATE],
       String(p.window[GATE]));
   }
+}
+
+// ===========================================================================
+// 23. 「永久置顶到最顶」：同一个右键菜单里的第二个入口
+//
+// 23 节跑的是【两段出厂代码拼起来】：到最顶 那一段（BLOCK，前面每一节都在
+// 用）与 红色悬停锁顶 那一段（LOCK_SRC，与 test-top-lock.mjs 同一对锚点切出
+// 来的同一段字）。为什么要拼：菜单里这一项是持续锁顶机器的一个入口，证明它
+// 就必须驱动真正的锁代码；用一个桩，证明的只是那个桩。
+//
+// 拼装不出来（出厂还没有这一段）时整节记 FAIL，而不是抛异常把整份文件带
+// 崩：缺失必须是一条读得懂的失败，不该是一次进程级崩溃。
+//
+// 这一项与「到最顶」的四条共线：同一个注入点、自己的 data-mmx-* 属性、自
+// 己的文案与禁用理由、以及——最要紧的——同一条 hostCallTake 写闸。
+// ===========================================================================
+const LOCK_SRC = pageSrc.slice(
+  pageSrc.indexOf('  // 红色悬停锁顶 · 单会话持续锁顶'),
+  pageSrc.indexOf('  var timer = window.setInterval'));
+const LOCK_KEY = 'mmxStatusTopLockV1';
+const MENU_LOCK_ATTR = 'data-mmx-toplock-menu';
+const MENU_LOCK_LABEL = '永久置顶到最顶';
+
+function makeMenuStorage(initial) {
+  const map = new Map(Object.entries(initial || {}));
+  const st = { writes: 0, reads: 0 };
+  return {
+    getItem(k) { st.reads++; return map.has(k) ? map.get(k) : null; },
+    setItem(k, v) { st.writes++; map.set(k, String(v)); },
+    removeItem(k) { st.writes++; map.delete(k); },
+    dump: () => Object.fromEntries(map),
+    writes: () => st.writes,
+    reads: () => st.reads,
+  };
+}
+function makeLockMenuPage(opts = {}) {
+  const dom = makeDom();
+  const timers = makeTimers();
+  const store = makeMenuStorage(opts.stored);
+  const win = { setTimeout: timers.setTimeout, clearTimeout: timers.clearTimeout, localStorage: store };
+  if (opts.foreignTicket) win.__mmxStatusHostGateV1 = { ticket: opts.foreignTicket };
+  if (opts.freeze) Object.freeze(win);
+  const factory = new Function('window', 'document',
+    'var disposed = false;\n' + BLOCK + PRELUDE + LOCK_SRC +
+    '\nreturn {' +
+    '  topmostCapability: topmostCapability, tryInjectTopmost: tryInjectTopmost,' +
+    '  onContextMenu: onContextMenu, clearTopmostItems: clearTopmostItems,' +
+    // Bound only if the shipped source has them: a source without them has to
+    // fail as a FAIL below instead of a ReferenceError.
+    '  lockMenu: typeof onTopLockMenuActivate === "function"'
+    + ' ? function (ev, li, row, id) { return onTopLockMenuActivate(ev, li, row, id); } : null,' +
+    '  armed: typeof onTopLockMenuActivate === "function",' +
+    '  autoTick: typeof topmostAutoTopTick === "function"'
+    + ' ? function () { return topmostAutoTopTick(); } : null,' +
+    '  autoArmed: typeof topmostAutoTopTick === "function",' +
+    '  lockState: topLockState, lockView: topmostLockView,' +
+    '  autoState: autoTopState, autoKey: TOPMOST_AUTOTOP_KEY, autoMax: TOPMOST_AUTOTOP_MAX,' +
+    '  gateBusy: hostCallBusy,' +
+    '  setDisposed: function (v) { disposed = v; } };');
+  const api = factory(win, dom.document);
+  return { dom, timers, window: win, store, api };
+}
+// One driver for every 23.x block. A missing entry point, a missing injected
+// item or a throwing handler all come back as ok:false with a readable why, so
+// the block below reports FAILs instead of aborting the file.
+function lockMenu(opts = {}) {
+  const why = [];
+  try {
+    const p = makeLockMenuPage(opts.page);
+    const host = makeHost(Object.assign({ order: [ref('mvs_a'), ref('mvs_b'), ref('mvs_c')] }, opts.host || {}));
+    const row = makeRow(p, opts.id || 'mvs_menu', host);
+    const menu = openMenu(p, row.dropdown);
+    p.api.onContextMenu({ target: row.rowEl, isTrusted: true });
+    p.timers.run();
+    const ul = menu.ul;
+    const top = ul.querySelector('li[data-mmx-topmost]');
+    const lock = ul.querySelector('li[' + MENU_LOCK_ATTR + ']');
+    if (!top) why.push('到最顶 项未注入');
+    if (!lock) why.push('锁顶菜单项未注入');
+    if (!p.api.armed) why.push('出厂没有 onTopLockMenuActivate');
+    return { p, host, row, ul, top, lock, ok: why.length === 0, why: why.join(' | ') };
+  } catch (e) {
+    return { ok: false, why: '组合切片跑不起来：' + (e && e.message ? e.message : String(e)) };
+  }
+}
+const clickOn = (li, extra) => li.dispatch('click', Object.assign({ isTrusted: true }, extra || {}));
+const intentOf = (p) => { try { return JSON.parse(p.store.dump()[LOCK_KEY] || 'null'); } catch (e) { return null; } };
+
+console.log('\n=== 23. 注入面：两项并存、各自的属性与文案 ===');
+{
+  const L = lockMenu();
+  check('23.0 前置：两项都注入到同一个菜单里', L.ok, L.why);
+  if (L.ok) {
+    check('23.1 两个选择器各自只命中一项，且互不误伤',
+      L.ul.querySelectorAll('li[data-mmx-topmost]').length === 1
+      && L.ul.querySelectorAll('li[' + MENU_LOCK_ATTR + ']').length === 1
+      && L.top.getAttribute(MENU_LOCK_ATTR) === null
+      && L.lock.getAttribute('data-mmx-topmost') === null,
+      `top=${L.top.getAttribute('data-mmx-topmost')} lock=${L.lock.getAttribute(MENU_LOCK_ATTR)}`);
+    check('23.1 锁顶项紧挨在「到最顶」之后（同一个注入点，追加而非替换）',
+      L.ul.children.indexOf(L.lock) === L.ul.children.indexOf(L.top) + 1,
+      `top@${L.ul.children.indexOf(L.top)} lock@${L.ul.children.indexOf(L.lock)}`);
+    check('23.1 宿主自己的项仍然排在最前、仍然可点',
+      L.ul.children[0] !== L.top && L.ul.children[0] !== L.lock
+      && L.ul.children[0].className.indexOf('ant-dropdown-menu-item') >= 0
+      && L.ul.children[0].listenerCount('click') === 1,
+      `first=${L.ul.children[0].className}`);
+    check('23.2 文案是独立的一句，与「到最顶」不同',
+      L.lock.textContent === MENU_LOCK_LABEL && L.top.textContent !== MENU_LOCK_LABEL
+      && L.lock.textContent.indexOf('到最顶') >= 0 && L.lock.textContent.length > '到最顶'.length,
+      `lock=${L.lock.textContent} top=${L.top.textContent}`);
+    check('23.2 沿用宿主的菜单项样式与 role',
+      L.lock.className.indexOf('ant-dropdown-menu-item') >= 0
+      && L.lock.getAttribute('role') === 'menuitem'
+      && !!L.lock.querySelector('.matrix-menu-item'),
+      L.lock.className);
+    check('23.2 独立属性是 1/0（1=可用）', L.lock.getAttribute(MENU_LOCK_ATTR) === '1'
+      && L.lock.getAttribute('aria-disabled') === null, String(L.lock.getAttribute(MENU_LOCK_ATTR)));
+    check('23.3 键盘可达性与「到最顶」一致：tabindex + Enter/Space + isTrusted 守卫',
+      L.lock.getAttribute('tabindex') === '0' && L.top.getAttribute('tabindex') === '0'
+      && L.lock.listenerCount('keydown') === 1 && L.lock.listenerCount('click') === 1,
+      `tabindex=${L.lock.getAttribute('tabindex')} kd=${L.lock.listenerCount('keydown')}`);
+  }
+}
+{
+  // 不可证能力的行：两项都注入为禁用，且各自说自己的理由。
+  const L = lockMenu({ host: { readOnly: ['mvs_menu'] } });
+  check('23.4 前置：只读行上两项都注入了', L.ok, L.why);
+  if (L.ok) {
+    const lockText = L.lock.textContent;
+    const topText = L.top.textContent;
+    check('23.4 禁用态带 aria-disabled 且不挂键盘/点击入口',
+      L.lock.getAttribute(MENU_LOCK_ATTR) === '0' && L.lock.getAttribute('aria-disabled') === 'true'
+      && L.lock.getAttribute('tabindex') === null && L.lock.listenerCount('keydown') === 0,
+      `attr=${L.lock.getAttribute(MENU_LOCK_ATTR)} tabindex=${L.lock.getAttribute('tabindex')}`);
+    check('23.4 两项的禁用理由各说各的（锁顶说的是"锁顶"）',
+      lockText.indexOf(MENU_LOCK_LABEL) === 0 && topText.indexOf('到最顶') === 0
+      && lockText.indexOf('无法锁顶') >= 0 && topText.indexOf('无法锁顶') < 0
+      && lockText !== topText,
+      `lock=${lockText} | top=${topText}`);
+    check('23.4 禁用项点下去零宿主写', await (async () => {
+      clickOn(L.lock);
+      await flush();
+      return L.host.calls.length === 0;
+    })(), `calls=${L.host.calls.length}`);
+  }
+}
+{
+  // 键盘：与「到最顶」同一条约定（Enter/Space 激活，Space 挡默认行为）。
+  const L = lockMenu({ id: 'mvs_key' });
+  if (L.ok) {
+    let prevented = 0;
+    L.lock.dispatch('keydown', { isTrusted: true, key: 'Enter', target: L.lock, preventDefault() { prevented++; } });
+    await flush();
+    check('23.5 Enter 激活锁顶（显式三参，不是两参 props 路径）',
+      L.host.calls.length === 1 && JSON.stringify(L.host.calls[0]) === JSON.stringify(['mvs_key', true, 0])
+      && L.host.persists.length === 1 && L.host.persists[0][2] === 0,
+      `calls=${JSON.stringify(L.host.calls)} persists=${JSON.stringify(L.host.persists)}`);
+    check('23.5 Enter 不需要 preventDefault（没有会滚侧边栏的默认行为）', prevented === 0,
+      `prevented=${prevented}`);
+    L.lock.dispatch('keydown', { isTrusted: false, key: ' ', target: L.lock, preventDefault() { prevented++; } });
+    await flush();
+    check('23.5 合成 keydown 连 handler 都进不去（零写、零计数、零 preventDefault）',
+      L.host.calls.length === 1 && L.p.api.lockState.clicks === 1 && prevented === 0,
+      `calls=${L.host.calls.length} clicks=${L.p.api.lockState.clicks} prevented=${prevented}`);
+    clickOn(L.lock, { isTrusted: false });
+    await flush();
+    check('23.5b 合成 click 被 handler 自己的门挡住（零写、blocked+1）',
+      L.host.calls.length === 1 && L.p.api.lockState.clicks === 2
+      && L.p.api.lockState.blocked === 1 && L.p.api.lockState.reason === 'untrusted-click',
+      `calls=${L.host.calls.length} reason=${L.p.api.lockState.reason}`);
+  } else {
+    check('23.5 前置：两项都注入到同一个菜单里', false, L.why);
+  }
+}
+
+console.log('\n=== 23B. 入口语义：落意图、解除、能力不足，与红按钮同一套 ===');
+{
+  const L = lockMenu({ id: 'mvs_arm' });
+  check('23B.0 前置：两项都注入到同一个菜单里', L.ok, L.why);
+  if (L.ok) {
+    clickOn(L.lock);
+    await flush();
+    const st = L.p.api.lockState;
+    check('23B.1 一次点击 = 落意图（store-first）+ 一次三参宿主写',
+      JSON.stringify(intentOf(L.p)) === JSON.stringify({ version: 1, source: 'local', id: 'mvs_arm' })
+      && st.intentId === 'mvs_arm' && L.host.calls.length === 1
+      && JSON.stringify(L.host.calls[0]) === JSON.stringify(['mvs_arm', true, 0]),
+      `intent=${JSON.stringify(intentOf(L.p))} calls=${JSON.stringify(L.host.calls)}`);
+    check('23B.1 落盘先于宿主写（存失败就不许写宿主）',
+      L.p.store.writes() === 1 && L.p.store.dump()[LOCK_KEY] !== undefined,
+      `writes=${L.p.store.writes()}`);
+    check('23B.1 走的是共享闸：调用后闸已释放',
+      L.p.api.gateBusy() === false, 'busy=' + L.p.api.gateBusy());
+    // 再点一次 = 解除当前目标。纯本地，不调宿主。
+    L.host.calls.length = 0;
+    clickOn(L.lock);
+    await flush();
+    check('23B.2 再点同一项 = 解除（纯本地，一次宿主写都不发生）',
+      L.host.calls.length === 0 && intentOf(L.p) === null
+      && L.p.api.lockState.intentId === '' && L.p.api.lockState.releases === 1,
+      `calls=${L.host.calls.length} releases=${L.p.api.lockState.releases}`);
+    // 闸被别人占着：意图照常更新（一次本地写），宿主零写。
+    L.host.calls.length = 0;
+    const held = lockMenu({ id: 'mvs_busy', page: { foreignTicket: Object.freeze({ held: 'other' }) } });
+    check('23B.3 前置：别人的票在共享槽上', held.ok
+      && held.p.api.gateBusy() === true, held.ok ? String(held.p.api.gateBusy()) : held.why);
+    if (held.ok) {
+      clickOn(held.lock);
+      await flush();
+      check('23B.3 他人在途时【零宿主写】，但意图照常落盘',
+        held.host.calls.length === 0 && held.p.api.lockState.intentId === 'mvs_busy'
+        && intentOf(held.p) && intentOf(held.p).id === 'mvs_busy'
+        && held.p.api.lockState.reason === 'busy',
+        `calls=${held.host.calls.length} reason=${held.p.api.lockState.reason}`);
+    }
+  }
+}
+{
+  // 能力不足 / 行已换人：只记理由，零写。
+  // A read-only list that is empty at injection time and filled afterwards: the
+  // item mounts ENABLED, and the capability is gone by the time it is clicked.
+  // That is the path where the handler has to refuse; the 23.4 case (disabled at
+  // mount) is covered above.
+  const roList = [];
+  const ro = lockMenu({ id: 'mvs_ro', host: { readOnly: roList } });
+  check('23B.4 前置：可用项已注入', ro.ok && ro.lock.getAttribute(MENU_LOCK_ATTR) === '1', ro.why);
+  if (ro.ok) {
+    roList.push('mvs_ro');
+    clickOn(ro.lock);
+    await flush();
+    check('23B.4 点击时能力已失效：只记 reason，零宿主写、零落盘',
+      ro.host.calls.length === 0 && ro.p.api.lockState.blocked === 1
+      && ro.p.api.lockState.reason === 'readonly-session' && ro.p.store.writes() === 0,
+      `reason=${ro.p.api.lockState.reason} calls=${ro.host.calls.length} writes=${ro.p.store.writes()}`);
+  } else {
+    check('23B.4 前置：可用项已注入', false, ro.why);
+  }
+  const gone = lockMenu({ id: 'mvs_gone' });
+  if (gone.ok) {
+    // 虚拟化把行换给了别的会话：绝不能按新行去锁顶。
+    gone.row.rowEl.setAttribute('data-session-id', 'mvs_other');
+    clickOn(gone.lock);
+    await flush();
+    check('23B.5 行已经换了会话时拒绝（row-gone，零写）',
+      gone.host.calls.length === 0 && gone.p.api.lockState.reason === 'row-gone'
+      && gone.p.store.writes() === 0,
+      `reason=${gone.p.api.lockState.reason} calls=${gone.host.calls.length}`);
+    // 菜单项自己被摘掉（宿主关掉了浮层）之后，回执也必须作废。
+    const dropped = lockMenu({ id: 'mvs_drop' });
+    if (dropped.ok) {
+      dropped.lock.remove();
+      clickOn(dropped.lock);
+      await flush();
+      check('23B.5 菜单项已被摘掉时拒绝（menu-gone，零写）',
+        dropped.host.calls.length === 0 && dropped.p.api.lockState.reason === 'menu-gone',
+        `reason=${dropped.p.api.lockState.reason}`);
+    } else {
+      check('23B.5 前置：两项都注入到同一个菜单里', false, dropped.why);
+    }
+  } else {
+    check('23B.5 前置：两项都注入到同一个菜单里', false, gone.why);
+  }
+}
+{
+  // 结构：不复用红按钮的入口，也不复制一份状态机。
+  // The menu entry lives in the 到最顶 block; the shared implementation lives in
+  // the lock block, right next to the red button's own entry.
+  const menuFn = (BLOCK.match(/function onTopLockMenuActivate\(/g) || []).length;
+  const armDefs = (pageSrc.match(/function topLockArmIntent\(/g) || []).length;
+  const armCalls = (pageSrc.match(/topLockArmIntent\(/g) || []).length;
+  const redCalls = (LOCK_SRC.match(/topLockArmIntent\(/g) || []).length;
+  check('23B.6 出厂有且只有一个 onTopLockMenuActivate', menuFn === 1, 'n=' + menuFn);
+  check('23B.6 共用实现 topLockArmIntent 只有一处定义，两条入口各调一次',
+    armDefs === 1 && armCalls === 3 && redCalls === 2,
+    `defs=${armDefs} refs=${armCalls} redRefs=${redCalls}`);
+  check('23B.6 菜单入口没有直接调宿主（写点只在共用实现与到最顶那一段里）',
+    (function () {
+      const m = BLOCK.match(/function onTopLockMenuActivate\([\s\S]*?\n  \}\n/);
+      return !!m && m[0].indexOf('topLockCall') < 0 && m[0].indexOf('.fn(') < 0;
+    })(), 'handler 内不得出现写点');
+  check('23B.6 菜单入口自己没有 isTrusted 的第二份判据（门只有一处措辞差异）',
+    (function () {
+      const m = BLOCK.match(/function onTopLockMenuActivate\([\s\S]*?\n  \}\n/);
+      if (!m) return false;
+      const n = (m[0].match(/isTrusted/g) || []).length;
+      return n === 1 && m[0].indexOf('ev.isTrusted !== true') >= 0;
+    })(), 'handler 内只有一道门，且写成必须为 true');
+}
+
+// ===========================================================================
+// 24. 新出现的置顶项自动补到最顶
+//
+// 事实（用户 2026-10-05 反馈）：点宿主自己的「置顶」后，新会话落在置顶区
+// 【最底部】。原因是那条两参 onPinSession(id, pinned) 把第三参丢了，backend
+// 侧 clampInsertIndex(undefined, max) 于是追加到末尾。
+//
+// 本段只在"新出现"上动手，刻意【不】对"下标变了"动手：用户自己把 B 拖到最顶
+// 时 A 的下标也确实从 0 变成了 1，那不是需要纠正的移动，是我们必须让开的
+// 一次真实操作。判据是【成员】不是【下标】。
+//
+// 24.x 逐条钉住：只认新成员、只在不在 0 时补一次三参、绝不搬动其余项、共享
+// 闸、窗口预算、有界（一次变化最多一次调用）、不可证明时暂停且保留基线、
+// 锁顶意图在场时让位、绝不写 localStorage、绝不动宿主 DOM 行序。
+// ===========================================================================
+function autoPage(opts = {}) {
+  const why = [];
+  try {
+    const p = makeLockMenuPage(opts.page);
+    const host = makeHost(Object.assign(
+      { order: [ref('mvs_a'), ref('mvs_b'), ref('mvs_c')] }, opts.host || {}));
+    // Swapped BEFORE the row is built: the hook closes over the function object
+    // it was given, so replacing host.fn afterwards would prove nothing.
+    if (opts.hostFn) host.fn = opts.hostFn;
+    const row = makeRow(p, opts.id || 'mvs_a', host);
+    if (!p.api.autoArmed) why.push('出厂没有 topmostAutoTopTick');
+    return { p, host, row, ok: why.length === 0, why: why.join(' | ') };
+  } catch (e) {
+    return { ok: false, why: '组合切片跑不起来：' + (e && e.message ? e.message : String(e)) };
+  }
+}
+// The host commits a new array and re-renders into a NEW closure, exactly as
+// React does. h.deps[1] is the closure's captured order, so this is the only
+// honest way to make a later read see the committed order.
+function commit(p, host, next) {
+  host.order = next.map((r) => ({ ...r }));
+  host.deps[1] = host.order;
+}
+// One pass of the shipped auto-top, then let the host's own async callback
+// finish: the call is recorded synchronously, the ORDER and the persisted
+// insertIndex only land after its awaits, and the gate is released by that
+// settle. Reading the order before the settle would be reading a state the real
+// page passes through and never rests in.
+const tick = async (a) => { a.p.api.autoTick(); await flush(); };
+const ids = (h) => h.order.map((r) => r.id);
+const rowOrder = (p) => p.dom.querySelectorAll('[data-session-id]').map((r) => r.getAttribute('data-session-id'));
+
+console.log('\n=== 24. 自动到最顶：新成员不在首位就补一次三参 ===');
+{
+  const A = autoPage();
+  check('24.0 前置：自动到顶这一段在出厂里', A.ok, A.why);
+  if (A.ok) {
+    const domBefore = rowOrder(A.p);
+    const storeWrites = A.p.store.writes();
+    // 冷启动：首趟看见 [a,b,c] 但没有基线，第二趟才把它确认为基线。
+    await tick(A); await tick(A);
+    check('24.1 首趟不写（还没有"上一次顺序"可比）',
+      A.host.calls.length === 0 && A.p.api.autoState.changes === 0,
+      `calls=${A.host.calls.length} changes=${A.p.api.autoState.changes}`);
+    check('24.1 基线要连续两趟相同才认（冷启动半截的 order 不算数）',
+      A.p.api.autoState.settleMiss === 1 && A.p.api.autoState.changes === 0,
+      `settleMiss=${A.p.api.autoState.settleMiss}`);
+    // 用户点宿主自己的「置顶」：新成员 mvs_new 追加到末尾。
+    commit(A.p, A.host, A.host.order.concat([ref('mvs_new')]));
+    await tick(A);
+    check('24.2 变化的第一趟只更新基线，不写（顺序还没稳）',
+      A.host.calls.length === 0 && A.p.api.autoState.calls === 0,
+      `calls=${A.host.calls.length}`);
+    await tick(A);
+    check('24.3 新成员不在下标 0 → 补一次 handlePinSession(id, true, 0)',
+      A.host.calls.length === 1 && JSON.stringify(A.host.calls[0]) === JSON.stringify(['mvs_new', true, 0])
+      && A.p.api.autoState.calls === 1,
+      `calls=${JSON.stringify(A.host.calls)}`);
+    check('24.3 backend 也拿到 insertIndex 0，不是 append',
+      A.host.persists.length === 1 && A.host.persists[0][0] === 'mvs_new' && A.host.persists[0][2] === 0,
+      JSON.stringify(A.host.persists));
+    check('24.4 只搬那一项：其余置顶项的相对次序一个字节没变',
+      JSON.stringify(ids(A.host)) === JSON.stringify(['mvs_new', 'mvs_a', 'mvs_b', 'mvs_c']),
+      JSON.stringify(ids(A.host)));
+    check('24.4 宿主自己的 DOM 行序一个字节没动（绝不 insertBefore 造视觉）',
+      JSON.stringify(rowOrder(A.p)) === JSON.stringify(domBefore), JSON.stringify(rowOrder(A.p)));
+    check('24.4 一次 localStorage 写都没有（授权范围只有宿主那一个三参回调）',
+      A.p.store.writes() === storeWrites, `writes=${A.p.store.writes()}`);
+    // 提交后的顺序回到"没有新成员"的状态：不该再写第二次。
+    commit(A.p, A.host, A.host.order);
+    await tick(A); await tick(A);
+    check('24.5 同一次变化最多一次调用（提交后不再补）',
+      A.host.calls.length === 1 && A.p.api.autoState.calls === 1,
+      `calls=${A.host.calls.length}`);
+    check('24.6 走的是共享闸：调用结束后闸已释放',
+      A.p.api.gateBusy() === false, 'busy=' + A.p.api.gateBusy());
+  }
+}
+{
+  // 边界一：新成员已经在首位 → 一次调用都不发生。
+  const A = autoPage();
+  if (A.ok) {
+    await tick(A); await tick(A);
+    commit(A.p, A.host, [ref('mvs_new')].concat(A.host.order));
+    await tick(A); await tick(A);
+    check('24.7 新成员已经落在下标 0 时不写（already-top）',
+      A.host.calls.length === 0 && A.p.api.autoState.alreadyTop >= 1,
+      `calls=${A.host.calls.length} alreadyTop=${A.p.api.autoState.alreadyTop}`);
+  } else {
+    check('24.7 前置：自动到顶这一段在出厂里', false, A.why);
+  }
+  // 边界二：只有下标变了、成员没变 → 一次调用都不发生（这是用户自己的拖拽）。
+  const B = autoPage();
+  if (B.ok) {
+    await tick(B); await tick(B);
+    commit(B.p, B.host, [ref('mvs_c'), ref('mvs_b'), ref('mvs_a')]);
+    await tick(B); await tick(B);
+    check('24.8 成员没变、只是下标变了 → 不写（用户的拖拽我们不撤销）',
+      B.host.calls.length === 0 && B.p.api.autoState.noCandidate >= 1,
+      `calls=${B.host.calls.length} noCandidate=${B.p.api.autoState.noCandidate}`);
+  } else {
+    check('24.8 前置：自动到顶这一段在出厂里', false, B.why);
+  }
+  // 边界三：只有【旧】成员被顶下去（我们自己写的「到最顶」）→ 一次调用都不发生。
+  const C = autoPage();
+  if (C.ok) {
+    await tick(C); await tick(C);
+    commit(C.p, C.host, [ref('mvs_c'), ref('mvs_a'), ref('mvs_b')]);
+    await tick(C); await tick(C);
+    check('24.8b 旧首位被顶下去时不动它（否则会撤销用户刚点的「到最顶」）',
+      C.host.calls.length === 0, `calls=${JSON.stringify(C.host.calls)}`);
+  } else {
+    check('24.8b 前置：自动到顶这一段在出厂里', false, C.why);
+  }
+}
+{
+  // 不可证明：非本地视图。暂停、不写，并且【保留上一份基线】。
+  const A = autoPage();
+  if (A.ok) {
+    await tick(A); await tick(A);
+    commit(A.p, A.host, A.host.order.concat([ref('mvs_new')]));
+    A.host.source = 'cloud';
+    A.host.deps[2] = 'cloud';
+    await tick(A); await tick(A);
+    const unproven = A.p.api.autoState.unproven;
+    check('24.9 顺序不可证明时暂停：零写、计数、基线保留',
+      A.host.calls.length === 0 && unproven > 0 && A.p.api.autoState.calls === 0,
+      `calls=${A.host.calls.length} unproven=${unproven}`);
+    // 视图恢复回来：那一次变化仍然要被处理（基线还是上一次可信顺序）。
+    A.host.source = 'local';
+    A.host.deps[2] = 'local';
+    await tick(A); await tick(A);
+    check('24.9b 视图恢复后补上（基线没有被"不可证明"那一段吃掉）',
+      A.host.calls.length === 1 && JSON.stringify(A.host.calls[0]) === JSON.stringify(['mvs_new', true, 0]),
+      `calls=${JSON.stringify(A.host.calls)}`);
+  } else {
+    check('24.9 前置：自动到顶这一段在出厂里', false, A.why);
+  }
+}
+{
+  // 锁顶意图在场：让位。锁的维持才是用户按过按钮授权的那一次。
+  const A = autoPage();
+  if (A.ok) {
+    await tick(A); await tick(A);
+    commit(A.p, A.host, A.host.order.concat([ref('mvs_new')]));
+    A.p.api.lockView.id = 'mvs_a';
+    await tick(A); await tick(A);
+    check('24.10 锁顶意图在场时让位（不与锁对拉，零宿主写）',
+      A.host.calls.length === 0 && A.p.api.autoState.deferred >= 1,
+      `calls=${A.host.calls.length} deferred=${A.p.api.autoState.deferred}`);
+  } else {
+    check('24.10 前置：自动到顶这一段在出厂里', false, A.why);
+  }
+  // D1 回归：让位只【推迟】一次补写，绝不把它取消掉。
+  // 锁顶意图在场期间用户又建了一个会话并点了自己的置顶，宿主把它追加到末尾。
+  // 那一趟我们让位（零宿主写）；锁一释放，同一个新成员必须【仍然】被补到下标 0。
+  // 旧实现把成员基线在让位判断【之前】就推进了，于是这个新成员被当成了"上一趟
+  // 就已经知道"，锁释放后 prev 与 ids 相同，一次调用都不会再发生——用户新建会话
+  // 置顶后没到最顶，这个症状就是这么留下来的。
+  const D = autoPage();
+  if (D.ok) {
+    await tick(D); await tick(D);                          // 基线 = [a,b,c]
+    commit(D.p, D.host, D.host.order.concat([ref('mvs_new')]));
+    D.p.api.lockView.id = 'mvs_a';                         // 锁顶意图在场
+    await tick(D); await tick(D);                          // 让位那一趟
+    check('24.10b 让位那一趟零宿主写（deferred 计数照记，让位语义没被改坏）',
+      D.host.calls.length === 0 && D.p.api.autoState.calls === 0
+      && D.p.api.autoState.deferred === 1 && D.p.api.autoState.lastReason === 'toplock-other',
+      `calls=${D.host.calls.length} apiCalls=${D.p.api.autoState.calls} deferred=${D.p.api.autoState.deferred} reason=${D.p.api.autoState.lastReason}`);
+    D.p.api.lockView.id = '';                              // 锁释放
+    await tick(D); await tick(D);
+    check('24.10c 锁释放后，让位期间到达的新成员仍被补到下标 0（让位只推迟，不取消）',
+      D.host.calls.length === 1
+      && JSON.stringify(D.host.calls[0]) === JSON.stringify(['mvs_new', true, 0])
+      && D.p.api.autoState.calls === 1,
+      `calls=${JSON.stringify(D.host.calls)} apiCalls=${D.p.api.autoState.calls} reason=${D.p.api.autoState.lastReason}`);
+    await tick(D); await tick(D);
+    await tick(D); await tick(D);
+    check('24.10d 补完之后不重复写（同一趟变化仍然最多一次调用）',
+      D.host.calls.length === 1 && D.p.api.autoState.calls === 1,
+      `calls=${JSON.stringify(D.host.calls)} apiCalls=${D.p.api.autoState.calls}`);
+  } else {
+    check('24.10b 前置：自动到顶这一段在出厂里', false, D.why);
+  }
+  // 闸被别人占着：零写。
+  const B = autoPage({ page: { foreignTicket: Object.freeze({ held: 'other' }) } });
+  if (B.ok) {
+    await tick(B); await tick(B);
+    commit(B.p, B.host, B.host.order.concat([ref('mvs_new')]));
+    await tick(B); await tick(B);
+    check('24.11 共享闸被别人占着时零写（同一把闸）',
+      B.host.calls.length === 0 && B.p.api.autoState.blocked >= 1,
+      `calls=${B.host.calls.length} blocked=${B.p.api.autoState.blocked}`);
+  } else {
+    check('24.11 前置：自动到顶这一段在出厂里', false, B.why);
+  }
+  // 只读的目标：不写。
+  const C = autoPage({ host: { readOnly: ['mvs_new'] } });
+  if (C.ok) {
+    await tick(C); await tick(C);
+    commit(C.p, C.host, C.host.order.concat([ref('mvs_new')]));
+    await tick(C); await tick(C);
+    check('24.12 目标自己只读时拒绝（见证行的结论不借给别的 id）',
+      C.host.calls.length === 0 && C.p.api.autoState.refused >= 1,
+      `calls=${C.host.calls.length} refused=${C.p.api.autoState.refused}`);
+  } else {
+    check('24.12 前置：自动到顶这一段在出厂里', false, C.why);
+  }
+}
+{
+  // 预算：同一个目标用完就停；换一个目标重新给三次；预算住在 window 上。
+  const A = autoPage();
+  if (A.ok) {
+    const max = A.p.api.autoMax;
+    const rtKey = A.p.api.autoKey;
+    let writes = 0;
+    for (let round = 0; round < max + 1; round++) {
+      // 宿主回滚：mvs_new 从顺序里消失，基线跟着退回去。
+      commit(A.p, A.host, [ref('mvs_a'), ref('mvs_b'), ref('mvs_c')]);
+      await tick(A); await tick(A);
+      // 用户又点了一次置顶。
+      commit(A.p, A.host, A.host.order.concat([ref('mvs_new')]));
+      await tick(A); await tick(A);
+      writes = A.host.calls.length;
+    }
+    check('24.13 同一个目标的补写次数有界（用完即停，不是无限对拉）',
+      writes === max && A.p.api.autoState.exhausted >= 1,
+      `calls=${writes} max=${max} exhausted=${A.p.api.autoState.exhausted}`);
+    check('24.13 预算住在 window 上（重新注入不能顺手补满）',
+      A.p.window[rtKey] && typeof A.p.window[rtKey] === 'object' && A.p.window[rtKey].budget === 0
+      && A.p.window[rtKey].owner === 'mvs_new', JSON.stringify(A.p.window[rtKey]));
+    // 换一个目标 = 新的预算（用户又 pin 了别的会话）。
+    commit(A.p, A.host, [ref('mvs_a'), ref('mvs_b'), ref('mvs_c')]);
+    await tick(A); await tick(A);
+    commit(A.p, A.host, A.host.order.concat([ref('mvs_z')]));
+    await tick(A); await tick(A);
+    check('24.13b 换一个新目标后预算重新给满（不会永久死掉）',
+      JSON.stringify(A.host.calls[A.host.calls.length - 1]) === JSON.stringify(['mvs_z', true, 0])
+      && A.p.api.autoState.calls === max + 1,
+      `last=${JSON.stringify(A.host.calls[A.host.calls.length - 1])} calls=${A.p.api.autoState.calls}`);
+  } else {
+    check('24.13 前置：自动到顶这一段在出厂里', false, A.why);
+  }
+}
+{
+  // 槽存不下 = 拒绝给预算，而不是给一份用完即弃的。
+  const A = autoPage({ page: { freeze: true } });
+  if (A.ok) {
+    await tick(A); await tick(A);
+    commit(A.p, A.host, A.host.order.concat([ref('mvs_new')]));
+    await tick(A); await tick(A);
+    check('24.14 预算槽存不下时 fail closed（零写）',
+      A.host.calls.length === 0, `calls=${JSON.stringify(A.host.calls)}`);
+  } else {
+    check('24.14 前置：自动到顶这一段在出厂里', false, A.why);
+  }
+  // 宿主回调抛异常 / 拒绝：闸必须被释放，不能把闸卡死。
+  // The stub carries the two markers the selector looks for, so it is still
+  // recognised as THE handlePinSession -- otherwise this would prove only that
+  // an unrecognised hook is ignored.
+  const boom = function (e, l, c) {
+    const s = SessionInfo.getSessionInfo(e, undefined, 'local');
+    PinService.pinSession(e, l, c);
+    throw new Error('host-boom');
+  };
+  const B = autoPage({ hostFn: boom });
+  if (B.ok) {
+    await tick(B); await tick(B);
+    commit(B.p, B.host, B.host.order.concat([ref('mvs_new')]));
+    await tick(B); await tick(B);
+    check('24.15 宿主抛异常时闸被释放（不会把共享闸卡死）',
+      B.p.api.gateBusy() === false && B.p.api.autoState.lastReason === 'call-threw'
+      && B.host.calls.length === 0,
+      `busy=${B.p.api.gateBusy()} reason=${B.p.api.autoState.lastReason} calls=${JSON.stringify(B.host.calls)}`);
+  } else {
+    check('24.15 前置：自动到顶这一段在出厂里', false, B.why);
+  }
+}
+{
+  // 结构：写点唯一，且只能经由那一个被证明的 handlePin。
+  // Sliced to the END OF THE FUNCTION, not to the end of the block: a slice that
+  // ran on would report the neighbours' DOM writes and storage as this one's.
+  const cut = BLOCK.indexOf('  function topmostAutoTopTick(');
+  const endCut = cut < 0 ? -1 : BLOCK.indexOf('\n  }\n', cut);
+  const body = cut < 0 ? '' : BLOCK.slice(cut, endCut < 0 ? cut : endCut + 4);
+  check('24.16 自动到顶这一段在出厂里', cut >= 0 && endCut > cut, 'cut=' + cut);
+  check('24.16 它自己只有那一个三参写点，且经由能力解析出来的 cap.fn',
+    (body.match(/\.fn\(/g) || []).length === 1
+    && body.indexOf('cap.fn(id, true, 0)') >= 0,
+    'writes=' + (body.match(/\.fn\(/g) || []).length);
+  check('24.16 它不碰 DOM 行序（无 insertBefore / appendChild / removeChild）',
+    !/insertBefore|appendChild|removeChild/.test(body), 'dom-writes');
+  check('24.16 它不写 localStorage（授权范围只有宿主那一个三参回调）',
+    !/localStorage/.test(body), 'storage');
+  check('24.16 它不新增任何轮询（interval / rAF / setTimeout 都不许出现）',
+    !/setInterval|requestAnimationFrame|setTimeout/.test(body), 'polling');
+}
+
+  // ---------------------------------------------------------------------------
+  // Section 25 came out of a real-machine failure, not out of review: on the
+  // actual host NOTHING was injected -- not 到最顶, not the lock item, zero
+  // nodes carrying either attribute, zero menu styles in the sheet.
+  //
+  // The read-only proof of what went wrong is in section 12's instrumented
+  // build and needs no new claim here: popupForMenu was reached and SUCCEEDED at
+  // finding the row's own menu fiber (menuFiberFound, trigger "contextMenu",
+  // menuLen 10), every candidate popup it saw belonged to a DIFFERENT row
+  // (owner-mismatch, all three tries), and the popup that actually belonged to
+  // this row showed up AFTER the chain had already given up. The chain gave up
+  // because it made three attempts on a fixed 8ms step -- a total window of
+  // ~16ms -- and the host mounts that row's portal lazily, on the first right
+  // click, which is later than 16ms.
+  //
+  // So the defect is a BUDGET, and the two things that can widen it are an
+  // event (the mount itself) and time (a backoff schedule). This section pins
+  // both, and it pins the two properties that make widening safe rather than
+  // merely effective:
+  //
+  //   A. the owner gate is NOT part of the fix. Uniqueness is the safety floor.
+  //      Everything below that reaches a late popup re-uses popupForMenu
+  //      verbatim, and 25.x asserts the owner comparison is still there, still
+  //      one occurrence, still an identity comparison.
+  //   B. the observer is short-lived by construction. A MutationObserver left
+  //      attached to the document is a permanent listener on every React
+  //      repaint for the rest of the session; there is no "it is fine, it
+  //      returns early" version of that. Every exit below asserts
+  //      dom.observers.live() === 0.
+  // ---------------------------------------------------------------------------
+console.log('\n=== 25. 晚挂载的弹层：探测预算不够导致真机零注入 ===');
+{
+  check('25.0 前置条件：本节开始时没有任何观察器挂着', makeDom().observers.live() === 0,
+    'live=' + makeDom().observers.live());
+  // A read-only view of the shipped watch, straight out of the source. These
+  // are the cheapest possible tripwires for "someone widened the budget and
+  // forgot the ceiling", and they are checked against PRISTINE_BLOCK so they
+  // are about the shipped text and not about a mutation's leftovers.
+  const STOP_AT = PRISTINE_BLOCK.indexOf('  function stopTopmostWatch(');
+  const WATCH_SRC = STOP_AT < 0 ? '' : PRISTINE_BLOCK.slice(STOP_AT,
+    PRISTINE_BLOCK.indexOf('\n  function onContextMenu(', STOP_AT));
+  check('25.0 前置：出厂里有一个 watch（探测窗口有上限，而不是靠事件无限挂着）',
+    PRISTINE_BLOCK.indexOf('  function startTopmostWatch(') >= 0, 'no-watch');
+  check('25.0 前置：出厂里有一个唯一的停表函数（disconnect 只有这一处）',
+    STOP_AT >= 0, 'no-stop');
+  check('25.0 停表函数里真的调了 disconnect', /\.disconnect\(\)/.test(WATCH_SRC), 'no-disconnect');
+  check('25.0 观察器在整个 watch 里只被 new 出来一次（不是每次重试一个）',
+    (PRISTINE_BLOCK.match(/new (?:window\.)?MutationObserver|new MO\(/g) || []).length === 1,
+    'new=' + (PRISTINE_BLOCK.match(/new (?:window\.)?MutationObserver|new MO\(/g) || []).length);
+  check('25.0 observe 也只调用一次（观察器建了就得立刻挂上，不是建了不用）',
+    (PRISTINE_BLOCK.match(/\.observe\(/g) || []).length === 1,
+    'observe=' + (PRISTINE_BLOCK.match(/\.observe\(/g) || []).length);
+  check('25.0 重试表存在且是逐级拉长的（不是又一个固定 8ms）',
+    /var TOPMOST_RETRY_DELAYS = \[/.test(PRISTINE_BLOCK), 'no-schedule');
+  check('25.0 总时限常量在，且不大于 2s',
+    (PRISTINE_BLOCK.match(/var TOPMOST_WATCH_DEADLINE = (\d+);/) || [])[1] <= 2000,
+    'deadline=' + (PRISTINE_BLOCK.match(/var TOPMOST_WATCH_DEADLINE = (\d+);/) || [])[1]);
+  check('25.0 有独立的 nudge 上限（观察器不消耗重试预算，就得自己也有界）',
+    /var TOPMOST_MAX_NUDGES = \d+;/.test(PRISTINE_BLOCK), 'no-nudge-cap');
+}
+{
+  // THE defect, reproduced. The row's dropdown does not exist when the right
+  // click is delivered; it is mounted four beats later, which is the case the
+  // 3x8ms chain cannot survive. Every step is the shipped code.
+  const p = makePage();
+  const host = makeHost();
+  const { rowEl, dropdown } = makeRow(p, 'mvs_late', host);
+  // The watch registers a document-level CAPTURE click handler (the dismiss
+  // hook, page-script.mjs:2940) and removes exactly that one on stop (:2834).
+  // Both live on the same document, so "the observer is gone" (25.1's existing
+  // check) and "the listener is gone" are DIFFERENT claims: an observer can be
+  // torn down while a capture listener survives, and that surviving listener
+  // keeps running on every real click for the rest of the session. There is no
+  // other assertion in the file that can see it -- disposals and re-injections
+  // would each stack one more -- so the count is sampled here, before the right
+  // click that starts the watch, and demanded back afterwards.
+  const clickBase = p.dom.document.docListenerCount('click');
+  p.api.onContextMenu({ target: rowEl, isTrusted: true });
+  check('25.1 前置：此刻宿主还没挂这一行的弹层',
+    p.dom.querySelectorAll('.ant-dropdown-menu').length === 0);
+  // Three beats: the whole of the old window (t=0, 8, 16). The old chain is
+  // already finished here; the new one is not.
+  for (let i = 0; i < 3; i++) p.timers.run();
+  check('25.1 三拍之后仍未注入（菜单确实还没出现）',
+    p.dom.querySelectorAll('li[data-mmx-topmost]').length === 0,
+    'items=' + p.dom.querySelectorAll('li[data-mmx-topmost]').length);
+  // Now the host does what it does on a first right click: mounts the portal.
+  const { ul } = openMenu(p, dropdown);
+  await flush();
+  await flush();
+  check('25.1 第四拍才出现的弹层被找到并注入（真机零注入的直接回归）',
+    ul.querySelectorAll('li[data-mmx-topmost]').length === 1,
+    'items=' + ul.querySelectorAll('li[data-mmx-topmost]').length);
+  check('25.1 锁项作为同一对一起进去（不是一个孤零零的 到最顶）',
+    ul.querySelectorAll('li[data-mmx-toplock-menu]').length === 1,
+    'lock=' + ul.querySelectorAll('li[data-mmx-toplock-menu]').length);
+  check('25.1 注入计数与屏幕上的项数一致',
+    p.api.state.injected === 1, 'injected=' + p.api.state.injected);
+  check('25.1 注入后不留观察器（成功即拆）',
+    p.dom.observers.live() === 0, 'live=' + p.dom.observers.live());
+  // Paired with the sample taken before the right click. The SUCCESS path is
+  // the one that has to be proven leak-free: it is the path a user actually
+  // takes, it runs once per menu, and it is the path where the teardown is
+  // reached by returning early out of a delivery rather than by draining.
+  check('25.1 成功注入后 document 上的 click 监听回到基线（成对摘除，不留泄漏）',
+    p.dom.document.docListenerCount('click') === clickBase,
+    `now=${p.dom.document.docListenerCount('click')} base=${clickBase}`);
+}
+{
+  // The observer on its own, with the retry queue never pumped at all. This is
+  // what separates "we wait longer" from "we are told": the fake timer queue is
+  // the harness's model of wall clock, and a test that never runs it has a
+  // right click whose only other progress is the DOM mount.
+  const p = makePage();
+  const host = makeHost();
+  const { rowEl, dropdown } = makeRow(p, 'mvs_push', host);
+  p.api.onContextMenu({ target: rowEl, isTrusted: true });
+  check('25.2 前置：定时器队列里只有那一次首拍（后面再没排过）', p.timers.size() === 1,
+    'queued=' + p.timers.size());
+  const { ul } = openMenu(p, dropdown);
+  await flush();
+  check('25.2 弹层挂载的同一个微任务里就注入了（不是靠下一拍定时器）',
+    ul.querySelectorAll('li[data-mmx-topmost]').length === 1,
+    'items=' + ul.querySelectorAll('li[data-mmx-topmost]').length);
+  check('25.2 前置条件：那一次定时器一次都没跑过（队列在收工时被清空，不是被跑空的）',
+    p.timers.size() === 0, 'queued=' + p.timers.size());
+  check('25.2 观察器确实被用过（否则上面那条不可能发生在同一个微任务里）',
+    p.dom.observers.live() === 0 && p.dom.observers.deliveries() >= 1,
+    `live=${p.dom.observers.live()} delivered=${p.dom.observers.deliveries()}`);
+  check('25.2 观察器在成功之后已经断开（live 归零而不是一直挂着）',
+    p.dom.observers.live() === 0, 'live=' + p.dom.observers.live());
+}
+{
+  // 25.2 says the observer fires; this says the observer may not be a loophole
+  // in the owner gate. A DIFFERENT row's popup mounts, ours does not: the late
+  // mount is not ours, and no amount of eagerness may put an item in it.
+  const p = makePage();
+  const host = makeHost();
+  const mine = makeRow(p, 'mvs_mine2', host);
+  const other = makeRow(p, 'mvs_other2', host);
+  p.api.onContextMenu({ target: mine.rowEl, isTrusted: true });
+  const otherMenu = openMenu(p, other.dropdown);
+  await flush();
+  await flush();
+  check('25.3 观察器路径不会把项注入别的行的菜单',
+    otherMenu.ul.querySelectorAll('li[data-mmx-topmost]').length === 0,
+    'items=' + otherMenu.ul.querySelectorAll('li[data-mmx-topmost]').length);
+  check('25.3 并且不会注入锁项',
+    otherMenu.ul.querySelectorAll('li[data-mmx-toplock-menu]').length === 0);
+  // Ours arrives afterwards: the same observer, the same row, and it is found.
+  const mineMenu = openMenu(p, mine.dropdown);
+  await flush();
+  check('25.3 自己的弹层后来出现时仍然拿得到那一项',
+    mineMenu.ul.querySelectorAll('li[data-mmx-topmost]').length === 1,
+    'items=' + mineMenu.ul.querySelectorAll('li[data-mmx-topmost]').length);
+}
+{
+  // rc-trigger/antd keep a closed overlay mounted with display:none, and the
+  // first right click can therefore find a HIDDEN popup of the right owner
+  // before the visible one exists. "Non-hidden" is not a new rule here: it is
+  // the existing elementIsVisible gate inside popupForMenu, and this asserts
+  // the watch did not route around it by injecting on sight of a class name.
+  const p = makePage();
+  const host = makeHost();
+  const { rowEl, dropdown } = makeRow(p, 'mvs_hiddenmount', host);
+  const hidden = openMenu(p, dropdown);
+  hidden.ul.__hidden = true;
+  p.api.onContextMenu({ target: rowEl, isTrusted: true });
+  await flush();
+  check('25.4 观察器不会往隐藏浮层里注入',
+    hidden.ul.querySelectorAll('li[data-mmx-topmost]').length === 0,
+    'items=' + hidden.ul.querySelectorAll('li[data-mmx-topmost]').length);
+  check('25.4 injected 也不谎报为 1', p.api.state.injected === 0, 'injected=' + p.api.state.injected);
+  // And the visible sibling of the same owner is still findable afterwards.
+  const visible = openMenu(p, dropdown);
+  await flush();
+  await flush();
+  check('25.4 同一 owner 的可见浮层随后仍被找到',
+    visible.ul.querySelectorAll('li[data-mmx-topmost]').length === 1,
+    'items=' + visible.ul.querySelectorAll('li[data-mmx-topmost]').length);
+  check('25.4 收尾不留观察器', p.dom.observers.live() === 0, 'live=' + p.dom.observers.live());
+}
+{
+  // 生命周期 (1)：菜单永远不出现。预算耗尽必须自己收工。
+  const p = makePage();
+  const host = makeHost();
+  const { rowEl } = makeRow(p, 'mvs_nomenu2', host);       // no menu fiber at all
+  const clickBase5 = p.dom.document.docListenerCount('click');
+  p.api.onContextMenu({ target: rowEl, isTrusted: true });
+  check('25.5 前置：观察器已挂上', p.dom.observers.live() === 1, 'live=' + p.dom.observers.live());
+  drain(p);
+  check('25.5 预算跑完不留观察器', p.dom.observers.live() === 0, 'live=' + p.dom.observers.live());
+  check('25.5 预算跑完不留定时器', p.api.pendingTimers() === 0, 'pending=' + p.api.pendingTimers());
+  // Same claim as 25.1, on the OTHER exit. A watch that ends by exhausting its
+  // budget tears down by a different route than one that ends by succeeding,
+  // and the budget exit is the one a right click on a row whose menu never
+  // mounts takes -- i.e. it is not a rare path, it is the path every dead
+  // popup takes. If only the success exit were sampled, the budget exit could
+  // keep the dismiss handler alive forever and no assertion in the file would
+  // notice.
+  check('25.5 预算跑完后 document 上的 click 监听回到基线（成对摘除，不留泄漏）',
+    p.dom.document.docListenerCount('click') === clickBase5,
+    `now=${p.dom.document.docListenerCount('click')} base=${clickBase5}`);
+  check('25.5 如实上报 menu-not-found（reason 文案没有因为改预算而变）',
+    p.api.state.lastReason === 'menu-not-found', 'reason=' + p.api.state.lastReason);
+  check('25.5 零注入', p.api.state.injected === 0, 'injected=' + p.api.state.injected);
+}
+{
+  // 生命周期 (2)：连续 nudge 也不能让它活成常驻。菜单不存在，但页面一直在重绘。
+  const p = makePage();
+  const host = makeHost();
+  const { rowEl } = makeRow(p, 'mvs_busy', host);
+  p.api.onContextMenu({ target: rowEl, isTrusted: true });
+  for (let i = 0; i < 40; i++) {
+    p.dom.el('span', { class: 'noise' });
+    p.dom.root.appendChild(p.dom.el('span', { class: 'noise' }));
+    await flush();
+  }
+  check('25.6 连续 DOM 变化不会把观察器留成常驻',
+    p.dom.observers.live() === 0, 'live=' + p.dom.observers.live());
+  check('25.6 收尾不留定时器', p.api.pendingTimers() === 0, 'pending=' + p.api.pendingTimers());
+  check('25.6 零注入', p.api.state.injected === 0, 'injected=' + p.api.state.injected);
+}
+{
+  // 生命周期 (3)：再次右击（代次前进）立即拆掉上一条链的观察器。
+  const p = makePage();
+  const host = makeHost();
+  const a = makeRow(p, 'mvs_supA', host);
+  const b = makeRow(p, 'mvs_supB', host);
+  p.api.onContextMenu({ target: a.rowEl, isTrusted: true });
+  check('25.7 前置：A 的观察器挂着', p.dom.observers.live() === 1, 'live=' + p.dom.observers.live());
+  p.api.onContextMenu({ target: b.rowEl, isTrusted: true });
+  check('25.7 第二次右击后观察器仍然只有一条（旧的被拆、新的接上）',
+    p.dom.observers.live() === 1, 'live=' + p.dom.observers.live());
+  const bMenu = openMenu(p, b.dropdown);
+  await flush();
+  check('25.7 新链注入的是新目标', bMenu.ul.querySelectorAll('li[data-mmx-topmost]').length === 1,
+    'items=' + bMenu.ul.querySelectorAll('li[data-mmx-topmost]').length);
+  check('25.7 观察器已断开', p.dom.observers.live() === 0, 'live=' + p.dom.observers.live());
+}
+{
+  // 生命周期 (4)：dispose。
+  const p = makePage();
+  const host = makeHost();
+  const { rowEl, dropdown } = makeRow(p, 'mvs_disp2', host);
+  p.api.onContextMenu({ target: rowEl, isTrusted: true });
+  check('25.8 前置：观察器挂着', p.dom.observers.live() === 1, 'live=' + p.dom.observers.live());
+  p.api.disposeTopmost();
+  check('25.8 dispose 之后观察器断开', p.dom.observers.live() === 0, 'live=' + p.dom.observers.live());
+  const { ul } = openMenu(p, dropdown);
+  await flush();
+  check('25.8 dispose 之后即使弹层出现也不注入',
+    ul.querySelectorAll('li[data-mmx-topmost]').length === 0,
+    'items=' + ul.querySelectorAll('li[data-mmx-topmost]').length);
+}
+{
+  // 生命周期 (5)：菜单被关掉。宿主在下一次 click 时收掉自己的弹层，那一发
+  // click 就是"这个菜单不会再出现了"的证据，此时继续挂着观察器没有意义。
+  const p = makePage();
+  const host = makeHost();
+  const { rowEl, dropdown } = makeRow(p, 'mvs_closed', host);
+  p.api.onContextMenu({ target: rowEl, isTrusted: true });
+  check('25.9 前置：观察器挂着', p.dom.observers.live() === 1, 'live=' + p.dom.observers.live());
+  p.dom.document.dispatch('click', { isTrusted: true, target: p.dom.root });
+  check('25.9 菜单关闭（一次 click）后观察器立即断开',
+    p.dom.observers.live() === 0, 'live=' + p.dom.observers.live());
+  const { ul } = openMenu(p, dropdown);
+  await flush();
+  check('25.9 关闭之后迟到的弹层不再注入',
+    ul.querySelectorAll('li[data-mmx-topmost]').length === 0,
+    'items=' + ul.querySelectorAll('li[data-mmx-topmost]').length);
+  check('25.9 关闭之后不留定时器', p.api.pendingTimers() === 0, 'pending=' + p.api.pendingTimers());
+}
+{
+  // 生命周期 (6)：行没了。宿主把行卸载，链没有任何东西可以注入。
+  const p = makePage();
+  const host = makeHost();
+  const { rowEl, dropdown } = makeRow(p, 'mvs_gone', host);
+  p.api.onContextMenu({ target: rowEl, isTrusted: true });
+  check('25.10 前置：观察器挂着', p.dom.observers.live() === 1, 'live=' + p.dom.observers.live());
+  rowEl.remove();
+  const { ul } = openMenu(p, dropdown);
+  await flush();
+  check('25.10 行已卸载后观察器断开', p.dom.observers.live() === 0, 'live=' + p.dom.observers.live());
+  check('25.10 行已卸载后不注入', ul.querySelectorAll('li[data-mmx-topmost]').length === 0,
+    'items=' + ul.querySelectorAll('li[data-mmx-topmost]').length);
+  check('25.10 理由写的是 row-gone（不是 menu-not-found）',
+    p.api.state.lastReason === 'row-gone', 'reason=' + p.api.state.lastReason);
+}
+{
+  // 生命周期 (7)：总时限。nudge 预算和重试预算都还在，但钟已经过了上限，
+  // 于是这一拍不再探测，直接收工。
+  const p = makePage();
+  const host = makeHost();
+  const { rowEl, dropdown } = makeRow(p, 'mvs_late9', host);
+  p.api.onContextMenu({ target: rowEl, isTrusted: true });
+  check('25.11 前置：观察器挂着', p.dom.observers.live() === 1, 'live=' + p.dom.observers.live());
+  const realNow = Date.now;
+  try {
+    Date.now = () => realNow.call(Date) + 60000;
+    const { ul } = openMenu(p, dropdown);
+    await flush();
+    check('25.11 过了总时限之后不再注入（哪怕弹层这时才出现）',
+      ul.querySelectorAll('li[data-mmx-topmost]').length === 0,
+      'items=' + ul.querySelectorAll('li[data-mmx-topmost]').length);
+  } finally {
+    Date.now = realNow;
+  }
+  check('25.11 过了总时限之后观察器断开', p.dom.observers.live() === 0, 'live=' + p.dom.observers.live());
+}
+{
+  // 没有 MutationObserver 的宿主。观察器是加速器，不是唯一的路：重试表
+  // 自己必须能把菜单找到，否则这一段会把整个修复绑死在一个 API 上。
+  const p = makePage(undefined, { noObserver: true });
+  const host = makeHost();
+  const { rowEl, dropdown } = makeRow(p, 'mvs_noMO', host);
+  check('25.12 前置：出厂代码不会在没有观察器时崩掉', p.window.MutationObserver === undefined);
+  p.api.onContextMenu({ target: rowEl, isTrusted: true });
+  check('25.12 前置：没有观察器被挂上（这条只考验重试表）',
+    p.dom.observers.live() === 0, 'live=' + p.dom.observers.live());
+  // 同样把弹层拖到旧预算（3 拍）之后才挂：只靠重试表也必须够到。
+  for (let i = 0; i < 3; i++) p.timers.run();
+  check('25.12 三拍之后仍未注入', p.api.state.injected === 0, 'injected=' + p.api.state.injected);
+  const { ul } = openMenu(p, dropdown);
+  drain(p);
+  check('25.12 只靠重试表也能找到迟到的弹层',
+    ul.querySelectorAll('li[data-mmx-topmost]').length === 1,
+    'items=' + ul.querySelectorAll('li[data-mmx-topmost]').length);
+  check('25.12 重试表跑完后不留定时器', p.api.pendingTimers() === 0, 'pending=' + p.api.pendingTimers());
+  check('25.12 没有观察器也就没有观察器要拆',
+    p.dom.observers.live() === 0, 'live=' + p.dom.observers.live());
+}
+{
+  // 观察宿主菜单本身不能被影响。捕获阶段、观察性质：不 preventDefault，
+  // 不 stopPropagation，不在宿主的事件上挂任何东西。
+  const p = makePage();
+  const host = makeHost();
+  const { rowEl, dropdown } = makeRow(p, 'mvs_quiet', host);
+  const ev = { target: rowEl, isTrusted: true };
+  p.api.onContextMenu(ev);
+  openMenu(p, dropdown);
+  await flush();
+  check('25.13 右击事件没有被 preventDefault',
+    ev.defaultPrevented === false || ev.defaultPrevented === undefined, 'defaultPrevented=' + ev.defaultPrevented);
+  check('25.13 右击事件没有被 stopPropagation',
+    ev.cancelBubble !== true, 'cancelBubble=' + ev.cancelBubble);
+  check('25.13 watch 不往宿主菜单上挂监听器（item 上的 click 监听数不因它增加）',
+    p.dom.querySelectorAll('li.ant-dropdown-menu-item').every((n) => n.listenerCount('click') <= 1));
+}
+{
+  // 归属门本身：这一条是"别把唯一性改松"的保险丝。popupForMenu 的接受条件
+  // 必须仍是【同一个 fiber 身份】，不是"在这个 dropdown 底下"、不是"最新出现
+  // 的那个"、也不是"任何带 .ant-dropdown-menu 的"。
+  const n = (PRISTINE_BLOCK.match(/nearestMenuOwner\(fiberOf\(ul\), __rec, menuFiber\) !== menuFiber/g) || []).length;
+  check('25.14 归属判定仍是同一个 fiber 身份的严格比较，且只此一处', n === 1, 'sites=' + n);
+  const cut = PRISTINE_BLOCK.indexOf('  function popupForMenu(');
+  const body = PRISTINE_BLOCK.slice(cut, PRISTINE_BLOCK.indexOf('\n  }\n', cut));
+  check('25.14 归属门排在可见性门之前（先证明是谁的，再证明看得见）',
+    body.indexOf('!== menuFiber') < body.indexOf('elementIsVisible(ul)'), 'order');
+  check('25.14 popupForMenu 没有被 watch 改写：它仍然是"扫全部、逐个验证"',
+    /querySelectorAll\('\.ant-dropdown-menu'\)/.test(body) && /for \(var i = 0; i < pops\.length; i\+\+\)/.test(body),
+    'scan');
+  check('25.14 watch 直接调用的仍然是 tryInjectTopmost（没有第二份注入实现）',
+    (PRISTINE_BLOCK.match(/tryInjectTopmost\(/g) || []).length >= 1
+    && !/function tryInjectTopmost\b[\s\S]{0,200}observer/i.test(PRISTINE_BLOCK), 'second-impl');
 }
 
 console.log(`

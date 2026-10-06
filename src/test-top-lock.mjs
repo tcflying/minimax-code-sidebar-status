@@ -416,7 +416,7 @@ if (MUT) {
 }
 
 // Rebuild the two harnesses from whatever source is in play right now.
-const CAP_CONSTS = MUTATED.slice(MUTATED.indexOf('  var TOPMOST_MAX_ANCESTORS = 40;'), MUTATED.indexOf('  var topmostState = {'));
+const CAP_CONSTS = MUTATED.slice(MUTATED.indexOf('  var TOPMOST_MAX_ANCESTORS = 256;'), MUTATED.indexOf('  var topmostState = {'));
 const CAP_BLOCK = CAP_CONSTS + MUTATED.slice(MUTATED.indexOf('  function fiberOf(node) {'), MUTATED.indexOf('  function rowMenuFiber(rowEl) {'));
 const GATE_BLOCK = MUTATED.slice(
   MUTATED.indexOf("  var TOPLOCK_GATE_KEY = '__mmxStatusHostGateV1';"),
@@ -427,6 +427,17 @@ if (!GATE_BLOCK.includes('function topLockBlocksTopmost')
   throw new Error('the cross-entry gate block is missing from the shipped source');
 }
 const LOCK_SRC = MUTATED.slice(MUTATED.indexOf('  // 红色悬停锁顶 · 单会话持续锁顶'), MUTATED.indexOf('  var timer = window.setInterval'));
+// The right-click menu entry lives in the 到最顶 block, so harness B -- which
+// slices the lock block only -- has to borrow that one function verbatim. It is
+// self-contained: everything it calls (topLockState, topLockReason,
+// topLockReleaseTarget, topLockArmIntent) is lock-block state, which is exactly
+// why the menu entry can never hold a second copy of the machine.
+const MENU_ENTRY_SRC = MUTATED.slice(
+  MUTATED.indexOf('  function onTopLockMenuActivate('),
+  MUTATED.indexOf('  // One implementation for both entries'));
+if (!MENU_ENTRY_SRC.includes('topLockArmIntent(rowEl, sessionId)')) {
+  throw new Error('the menu-side lock entry is missing from the shipped 到最顶 block');
+}
 const LOCK_PRISTINE = LOCK_SRC;
 const BLOCK = LOCK_SRC;
 // The seam is a PROVEN SHAPE now, not a substitutable constant, so both
@@ -899,6 +910,50 @@ const IPINNED_TITLE = 'min-w-0 flex-1 transition-all mr-2 group-hover:mr-[60px] 
 const IRECENT_STRIP = 'absolute right-0.5 top-1/2 z-[1] flex w-[60px] -translate-y-1/2 justify-end';
 const IRECENT_MOUNT = 'hidden group-hover:flex group-focus-within:flex h-[30px] items-center justify-end';
 
+// site 7 · mhd 置顶行. 600 行真机取证出来的形态，三处和别的 site 都不一样：
+//   1. 条是 right-1（不是 right-0.5），而且自带 flex items-center；
+//   2. 60px 那一格是【悬停才出现】的 mount（group-hover:flex，不是 block）；
+//   3. 两个原生按钮是 mount 的【兄弟】、住在条里，不在 mount 里。
+// 第 3 条是这个 site 不能带 minNativeButtons 的唯一原因：mount 里一个原生
+// 按钮都没有，带上就是恒 0，永远匹配不上。
+const MHD_STRIP = 'absolute right-1 top-1/2 -translate-y-1/2 z-[1] flex items-center';
+const MHD_MOUNT = 'hidden h-[30px] w-[60px] items-center group-hover:flex group-focus-within:flex';
+
+// The row the OLD site table could not cover: its strip satisfies the
+// tf-normal entry (right-1 + the five shared tokens) while its mount satisfies
+// the ipinned entry (h-[30px] items-center), so no single entry ever claimed
+// it and every pass refused the row. The fixture reproduces the real DOM: the
+// two native buttons are appended to the STRIP, beside the mount.
+function makeMhdRow(page, id, host) {
+  const row = page.dom.el('div', { 'data-session-id': id, class: 'group relative rounded-lg' });
+  const main = page.dom.el('button', {
+    type: 'button',
+    class: 'mavis-sidebar-item w-full flex gap-2 pl-2 pr-0.5 h-[30px] text-left transition-colors rounded-lg',
+  }, [page.dom.el('div', { class: IPINNED_TITLE })]);
+  const strip = page.dom.el('div', { class: MHD_STRIP });
+  const mount = page.dom.el('div', { class: MHD_MOUNT });
+  strip.appendChild(mount);
+  strip.appendChild(nativeButton(page.dom, 'sidebar.action_unpin'));
+  strip.appendChild(nativeButton(page.dom, 'sidebar.action_more'));
+  row.appendChild(main);
+  row.appendChild(strip);
+  page.dom.root.appendChild(row);
+  const fiberRoot = { current: null };
+  const cur = fiber({ tag: 3, name: 'HostRoot', parent: null });
+  cur.stateNode = fiberRoot;
+  const stale = fiber({ tag: 3, name: 'HostRoot', parent: null });
+  stale.stateNode = fiberRoot;
+  cur.alternate = stale;
+  stale.alternate = cur;
+  const decoyHooks = [[host.decoy, host.decoyDeps]];
+  const container = fiber({ name: 'SidebarContainer', props: {}, hooks: hookChain(decoyHooks.concat([[host.fn, host.deps], [() => {}, []]])), parent: cur });
+  const rowComponent = fiber({ name: 'SessionRow', props: { session: { id } }, parent: container });
+  const rowDiv = fiber({ tag: 5, name: 'div', props: { 'data-session-id': id }, parent: rowComponent });
+  fiberRoot.current = cur;
+  attachFiber(row, rowDiv);
+  return { row, main, strip, mount, title: main.querySelector('div') };
+}
+
 function nativeButton(dom, label) {
   return dom.el('button', { type: 'button', 'data-pinned-no-drag': 'true', class: NATIVE_BTN, 'aria-label': label });
 }
@@ -963,11 +1018,19 @@ function makeLockPage(opts = {}) {
     // The shared gate is sliced from the 到最顶 block verbatim, not re-declared:
     // a re-declaration here would be a second implementation, and a mutation
     // of the real one would leave the assertions below green for no reason.
-    GATE_BLOCK + CAP_BLOCK + BLOCK +
+    GATE_BLOCK + CAP_BLOCK + BLOCK + MENU_ENTRY_SRC +
     '\nreturn { topLockRow, topLockTick, topLockPrune, onTopLockActivate, topLockLoad,' +
     ' topLockHostView, topLockPresence, topLockConfirm, topLockValidId, topLockButtonSpec,' +
     ' topLockStoreSet, topLockStoreClear, topLockRelease,' +
+    // The menu-side entry point, bound only if the shipped source has it: a
+    // source without it has to fail as a FAIL below, never as a ReferenceError.
+    ' lockMenu: typeof onTopLockMenuActivate === "function"'
+    + ' ? function (ev, li, row, id) { return onTopLockMenuActivate(ev, li, row, id); } : null,' +
     ' topLockCapability: topmostCapability, state: topLockState, caps: topLockCaps,' +
+    // The site table itself, so a test can prove an entry is PRESENT, ORDERED
+    // and free of the fields the real markup makes useless (see 33.4 / 33.5)
+    // instead of only proving that some row happened to get a button.
+    ' sites: TOPLOCK_SITES,' +
     ' view: topmostLockView, busy: hostCallBusy, take: hostCallTake,'
     + ' release: hostCallRelease, rt: topLockRuntime,'
     + ' key: TOPLOCK_KEY, maxMaint: TOPLOCK_MAX_MAINT,' +
@@ -3170,6 +3233,392 @@ console.log('\n=== 31. r4：闸 / 运行时 / CSS 三个槽都不可写时，样
   const reg = page.window[CSS];
   check('31.6 CSS 槽不可写时注册表是【私有】的（没有把不可写的槽当成共享状态）',
     reg === 'slot-a-string', String(reg));
+}
+
+// ===========================================================================
+// 32. 右键菜单里的第二个入口（「永久置顶到最顶」）
+//
+// 23 节在到最顶 那一侧的套件里证明了这个入口的【菜单面】；这里证明它在锁这
+// 一侧与红色悬停按钮产出【同一份】状态：同一处意图、同一份预算、同一个代次、
+// 同一次三参调用、同一个写闸。两条入口的差别只应该有三样：事件本身、自己的
+// 节点、以及各自的 isTrusted 门。任何多出来的差别都是第二份状态机的味道。
+//
+// 32.9 那一段用的是 harness A（整包 bootstrap），因为"apply() 真的会调用自动
+// 到顶"这件事只有整包能证明：切片里没有调用点。
+// ===========================================================================
+const TOPLOCK_KEY_S = 'mmxStatusTopLockV1';
+{
+  const A = makeLockPage();
+  const host = A.host;
+  // A real row, built by the lock suite's own fixture, so the capability really
+  // resolves: a bare div with a data-session-id and no fiber would only prove
+  // that no-fiber-root is refused.
+  // mvs_c, not mvs_a: the default fixture already has mvs_a at order[0], and
+  // arming a row that is already first is the deliberate no-op branch.
+  const rowA = makeRow(A, 'mvs_c', host).rowEl;
+  // The menu-side entry point, driven through the shipped handler with a menu
+  // item of its own -- the red button is NOT required to exist for this path,
+  // which is the entire reason the entry is not onTopLockActivate.
+  const li = A.dom.el('li', { 'data-mmx-toplock-menu': '1' });
+  A.dom.root.appendChild(li);
+  check('32.0 前置：出厂有菜单入口这一段', typeof A.api.lockMenu === 'function',
+    typeof A.api.lockMenu);
+  if (typeof A.api.lockMenu === 'function') {
+    A.api.lockMenu({ isTrusted: true }, li, rowA, 'mvs_c');
+    await settleAll();
+    check('32.1 菜单入口 = 落意图 + 一次显式三参调用 [F10]',
+      host.calls.length === 1 && JSON.stringify(host.calls[0]) === JSON.stringify(['mvs_c', true, 0])
+      && A.api.state.intentId === 'mvs_c'
+      && JSON.parse(A.localStorage.dump()[TOPLOCK_KEY_S]).id === 'mvs_c',
+      `calls=${JSON.stringify(host.calls)} intent=${A.api.state.intentId}`);
+    check('32.1 目标真的落到 order[0]',
+      host.order[0].id === 'mvs_c', JSON.stringify(host.order.map((r) => r.id)));
+    check('32.1 红按钮那颗节点一个都没有（这一条路径不依赖它）',
+      lockButtons(A).length === 0, 'buttons=' + lockButtons(A).length);
+    // The same intent through the same machine: a second activation releases it.
+    host.calls.length = 0;
+    A.api.lockMenu({ isTrusted: true }, li, rowA, 'mvs_c');
+    await settleAll();
+    check('32.2 再点一次 = 解除（纯本地，零宿主写）',
+      host.calls.length === 0 && A.api.state.intentId === '' && A.api.state.releases === 1
+      && A.localStorage.dump()[TOPLOCK_KEY_S] === undefined,
+      `calls=${host.calls.length} releases=${A.api.state.releases}`);
+    // An untrusted event never reaches the machine.
+    A.api.lockMenu({ isTrusted: false }, li, rowA, 'mvs_c');
+    await settleAll();
+    check('32.3 合成事件不落意图也不写宿主',
+      host.calls.length === 0 && A.api.state.intentId === '' && A.api.state.reason === 'untrusted-click',
+      `reason=${A.api.state.reason}`);
+    // A row the host has since recycled is not this session any more.
+    rowA.setAttribute('data-session-id', 'mvs_other');
+    A.api.lockMenu({ isTrusted: true }, li, rowA, 'mvs_c');
+    await settleAll();
+    check('32.4 行已换人时拒绝（row-gone，零写）',
+      host.calls.length === 0 && A.api.state.reason === 'row-gone' && A.api.state.intentId === '',
+      `reason=${A.api.state.reason}`);
+    // A menu item the host already unmounted must not act either.
+    rowA.setAttribute('data-session-id', 'mvs_c');
+    li.remove();
+    A.api.lockMenu({ isTrusted: true }, li, rowA, 'mvs_c');
+    await settleAll();
+    check('32.4b 菜单项已被摘掉时拒绝（menu-gone，零写）',
+      host.calls.length === 0 && A.api.state.reason === 'menu-gone',
+      `reason=${A.api.state.reason}`);
+  }
+}
+{
+  // Both entries, one machine: the intent the menu entry writes is the very one
+  // the red button releases, and the gate is the same object.
+  const A = makeLockPage();
+  const host = A.host;
+  const rows = {};
+  for (const id of ['mvs_c', 'mvs_b']) rows[id] = makeRow(A, id, host).rowEl;
+  const liA = A.dom.el('li', { 'data-mmx-toplock-menu': '1' });
+  const liB = A.dom.el('li', { 'data-mmx-toplock-menu': '1' });
+  A.dom.root.appendChild(liA);
+  A.dom.root.appendChild(liB);
+  if (typeof A.api.lockMenu === 'function') {
+    A.api.lockMenu({ isTrusted: true }, liA, rows['mvs_c'], 'mvs_c');
+    await settleAll();
+    const genAfterMenu = A.api.gen();
+    // The RED button on another row replaces the intent, exactly as the comment
+    // above topLockBlocksTopmost says it does.
+    const btn = A.dom.el('button', { 'data-mmx-toplock': '1', 'data-mmx-toplock-id': 'mvs_b' });
+    rows['mvs_b'].appendChild(btn);
+    A.api.onTopLockActivate({ isTrusted: true, preventDefault() {}, stopPropagation() {} }, btn, 'mvs_b');
+    await settleAll();
+    check('32.5 菜单入口写的意图，红按钮能接手（同一份意图）',
+      A.api.state.intentId === 'mvs_b' && A.api.gen() > genAfterMenu
+      && JSON.parse(A.localStorage.dump()[TOPLOCK_KEY_S]).id === 'mvs_b',
+      `intent=${A.api.state.intentId} gen=${A.api.gen()}`);
+    check('32.5 两次入口各一次三参调用，没有多余的宿主写',
+      host.calls.length === 2
+      && JSON.stringify(host.calls.map((c) => c[0])) === JSON.stringify(['mvs_c', 'mvs_b']),
+      JSON.stringify(host.calls));
+    // The gate the menu entry takes is the SAME object the red entry takes.
+    const GATE = '__mmxStatusHostGateV1';
+    const B = makeLockPageOn(A.window);
+    check('32.5b 第二个实例看到的是同一个意图（意图在存储，不在闭包里）',
+      B.api.state.intentId === '' || B.api.state.intentId === 'mvs_b',
+      'intent=' + B.api.state.intentId);
+    void GATE;
+  }
+}
+{
+  // 32.6: the gate. Both entries must be refused by the SAME gate, and a
+  // refusal must still leave the intent alone.
+  const A = makeLockPage({ seedGate: { ticket: Object.freeze({ held: 'other-instance' }) } });
+  const host = A.host;
+  const row = makeRow(A, 'mvs_c', host).rowEl;
+  const li = A.dom.el('li', { 'data-mmx-toplock-menu': '1' });
+  A.dom.root.appendChild(li);
+  if (typeof A.api.lockMenu === 'function') {
+    check('32.6 前置：闸被别人的票占着', A.api.busy() === true, String(A.api.busy()));
+    A.api.lockMenu({ isTrusted: true }, li, row, 'mvs_c');
+    await settleAll();
+    check('32.6 他人在途时菜单入口零宿主写（与红按钮同一条闸）',
+      host.calls.length === 0 && A.api.state.calls === 0
+      && A.api.state.intentId === 'mvs_c' && A.api.state.reason === 'busy',
+      `calls=${host.calls.length} reason=${A.api.state.reason} intent=${A.api.state.intentId}`);
+    check('32.6 别人的票没有被我们释放', A.api.busy() === true, String(A.api.busy()));
+  }
+}
+{
+  // 32.9: the WHOLE shipped bootstrap. Only this can prove apply() really calls
+  // the auto-top pass, because the call site is outside both sliced blocks.
+  const page = makeBoot();
+  const host = makeHost({ order: [ref('mvs_a'), ref('mvs_b')] });
+  bootRows(page, ['mvs_a', 'mvs_b'], host);
+  const t0 = page.api.topmost();
+  check('32.9 整包 apply() 真的跑过自动到顶这一趟（出厂接线）',
+    !!t0.autoTop && t0.autoTop.passes >= 1, JSON.stringify(t0.autoTop));
+  check('32.9 空闲时零补写', host.calls.length === 0, 'calls=' + JSON.stringify(host.calls));
+  if (t0.autoTop && t0.autoTop.passes >= 1) {
+    // Two passes on an UNCHANGED order first: the auto-top only trusts an order
+    // it has seen twice in a row, and the very first baseline is armed the same
+    // way. Changing the order on pass one would mean the new member was part of
+    // the baseline before there ever was a baseline -- which is the fail-closed
+    // branch, and this test is not about it (24.2 covers that).
+    await pump(page, 2);
+    // The user pins a new session with the HOST's own control, so the order
+    // grows at the end -- the reported bug. makeHost's deps[1] is a live getter
+    // over host.order (that is what makes a stale closure observable at all), so
+    // assigning the array is the whole commit.
+    host.order = host.order.concat([{ type: 'session', id: 'mvs_new' }]);
+    await pump(page, 4);
+    check('32.9b 新出现的置顶项被补到最顶（整包里真实发生）',
+      host.calls.length === 1 && JSON.stringify(host.calls[0]) === JSON.stringify(['mvs_new', true, 0]),
+      'calls=' + JSON.stringify(host.calls));
+    check('32.9b 其余置顶项一个都没被搬动',
+      JSON.stringify(host.order.map((r) => r.id)) === JSON.stringify(['mvs_new', 'mvs_a', 'mvs_b']),
+      JSON.stringify(host.order.map((r) => r.id)));
+    // A menu item injected into a row is a node we own: dispose takes it out.
+    const stray = page.dom.el('li', { 'data-mmx-toplock-menu': '1' });
+    page.dom.root.appendChild(stray);
+    check('32.9c 前置：dispose 之前那个节点在', stray.isConnected === true);
+    page.api.dispose();
+    check('32.9c dispose 摘掉菜单里的锁顶项（不留在宿主浮层里）',
+      page.dom.querySelectorAll('[data-mmx-toplock-menu]').length === 0,
+      'left=' + page.dom.querySelectorAll('[data-mmx-toplock-menu]').length);
+  }
+}
+
+// ===========================================================================
+console.log('\n=== 33. mhd 置顶行：旧 site 表覆盖不到的那一形态（真机取证 600 行一致）===');
+{
+  // 33.0 The row itself, on the real classes: strip right-1 + flex items-center,
+  // hover-only w-[60px] mount, TWO native buttons that are the mount's SIBLINGS.
+  const page = makeBoot();
+  const host = makeHost({ order: [ref('mvs_a'), ref('mvs_h')] });
+  const hrow = makeMhdRow(page, 'mvs_h', host);
+  makeRow(page, 'mvs_a', host);
+  page.run();
+
+  // RED BEFORE THE FIX, GREEN AFTER: the old table refused every pass on this
+  // row, so the button count was 0 and the refusal counter ran (the reported
+  // symptom, anchorRefused growing by one per row per pass).
+  check('33.1 mhd 行的按钮挂得上（旧 site 表下这里是 0 注入）', hasButton(page, 'mvs_h'),
+    'injected=' + page.api.topLock().injected + ' refused=' + page.api.topLock().anchorRefused);
+  check('33.2 这行一次都没有被拒', page.api.topLock().anchorRefused === 0,
+    'refused=' + page.api.topLock().anchorRefused);
+  const b = buttonFor(page, 'mvs_h');
+  check('33.3 按钮进的是那一格 mount（不是行、不是条）',
+    b.parentElement === hrow.mount, b.parentElement.getAttribute('class'));
+  check('33.3b 两个原生按钮是 mount 的兄弟，仍原样住在条里',
+    hrow.strip.children.length === 3 && nativeButtons(hrow.strip).length === 2
+    && nativeButtons(hrow.strip)[0].parentElement === hrow.strip
+    && nativeButtons(hrow.strip)[1].parentElement === hrow.strip,
+    'children=' + hrow.strip.children.length + ' native=' + nativeButtons(hrow.strip).length);
+  check('33.3c 宿主条的 class 一字未改', hrow.strip.getAttribute('class') === MHD_STRIP);
+  check('33.3d 宿主 mount 的 class 一字未改', hrow.mount.getAttribute('class') === MHD_MOUNT);
+  check('33.3e 标题 class 里没有多出任何 mmx 字样（只加自有属性）',
+    hrow.title.getAttribute('class') === IPINNED_TITLE, hrow.title.getAttribute('class'));
+  check('33.3f 我们的按钮按 36px 规格（宿主给的是 60px 悬停格，装得下）',
+    String(b.getAttribute('class')).indexOf('h-[36px]') >= 0
+    && String(b.getAttribute('class')).indexOf('w-[36px]') >= 0
+    && b.getAttribute('data-mmx-toplock-px') === '36', b.getAttribute('class'));
+
+  // 33.4 The cross-entry case that made this a bug at all: a tf-normal row and
+  // an mhd row in the SAME page. The two strips share five tokens, so if the
+  // new entry were ordered after tf-normal, tf-normal would claim the mhd
+  // strip, fail on its own mount shape and refuse the row (fail-closed, no
+  // fall-through) -- exactly the reported symptom.
+  check('33.4 同页两种条同时挂得上（tf-normal 不被新条目抢，mhd 也不被 tf-normal 抢）',
+    hasButton(page, 'mvs_a') && hasButton(page, 'mvs_h'),
+    'a=' + hasButton(page, 'mvs_a') + ' h=' + hasButton(page, 'mvs_h'));
+  check('33.4b 两种行各自进各自那一格',
+    buttonFor(page, 'mvs_a').parentElement.getAttribute('class') === HOVER_MOUNT_CLASS
+    && buttonFor(page, 'mvs_h').parentElement === hrow.mount);
+
+  // 33.5 The site table itself, so "it works" cannot be re-broken by reordering
+  // the entries or by bolting on a native-button count the real markup makes
+  // permanently zero (the buttons live in the strip, not in the mount).
+  const A = makeLockPage();
+  const sites = A.api.sites;
+  const names = sites.map((s) => s.name);
+  const mhdIdx = names.indexOf('mhd-pinned');
+  const tfIdx = names.indexOf('tf-normal');
+  check('33.5 site 表里有 mhd-pinned 这一条', mhdIdx >= 0, names.join(','));
+  check('33.5b 它排在 tf-normal 之前（同一组条 token，顺序就是判据）',
+    mhdIdx >= 0 && tfIdx >= 0 && mhdIdx < tfIdx, names.join(','));
+  check('33.5c 它不带 minNativeButtons（原生按钮在 mount 外，带了恒 0）',
+    mhdIdx >= 0 && sites[mhdIdx].minNativeButtons === undefined,
+    mhdIdx >= 0 ? String(sites[mhdIdx].minNativeButtons) : '(no entry)');
+  check('33.5d 它按 36px 按钮登记，且条宽登记为 0（按钮在宿主那 60px 悬停格里，不加宽条）',
+    mhdIdx >= 0 && sites[mhdIdx].px === 36 && sites[mhdIdx].stripWidth === 0,
+    mhdIdx >= 0 ? JSON.stringify([sites[mhdIdx].px, sites[mhdIdx].stripWidth]) : '(no entry)');
+  check('33.5e 旧三条 site 一个都没动（irecent 仍带 2，ipinned / tf-normal 仍不带）',
+    names.indexOf('irecent') === 0 && sites[0].minNativeButtons === 2
+    && sites[names.indexOf('ipinned')].minNativeButtons === undefined
+    && sites[names.indexOf('tf-normal')].minNativeButtons === undefined
+    && sites[names.indexOf('tf-normal')].titleBy === 'anchor', names.join(','));
+}
+
+// ===========================================================================
+console.log('\n=== 34. 按钮放大到 36px：承重数字（条宽 / reserve / 图标）必须一起跟上 ===');
+{
+  // 34.0 Three row shells in ONE page, so the numbers below are per SITE and not
+  // "whatever the last row wrote". mhd's button sits INSIDE the host's own
+  // hover-only 60px cell; the other two sit BESIDE the host's buttons, so only
+  // they owe the title and the strip their own width.
+  const page = makeBoot();
+  const host = makeHost({ order: [ref('mvs_a'), ref('mvs_h'), ref('mvs_p'), ref('mvs_r')] });
+  const hrow = makeMhdRow(page, 'mvs_h', host);
+  const prow = makeTwoButtonRow(page, 'mvs_p', host, { kind: 'ipinned' });
+  const rrow = makeTwoButtonRow(page, 'mvs_r', host, { kind: 'irecent' });
+  makeRow(page, 'mvs_a', host);
+  page.run();
+  const css = styleCss(page);
+  const hBtn = buttonFor(page, 'mvs_h');
+  const pBtn = buttonFor(page, 'mvs_p');
+  const rBtn = buttonFor(page, 'mvs_r');
+  const hKey = String(hrow.title.getAttribute('data-mmx-toplock-reserve') || '');
+  const pKey = String(prow.main.querySelector('div').getAttribute('data-mmx-toplock-reserve') || '');
+  const rKey = String(rrow.strip.getAttribute('data-mmx-toplock-strip') || '');
+
+  // 34.1 Only the mhd row got bigger. The other two sites are untouched -- a
+  // global px bump would have silently resized buttons on rows the user never
+  // complained about.
+  check('34.1 只有 mhd 行的按钮是 36px；ipinned / irecent 仍是 30px',
+    hasButton(page, 'mvs_h') && hasButton(page, 'mvs_p') && hasButton(page, 'mvs_r')
+    && String(hBtn.getAttribute('class')).indexOf('h-[36px] w-[36px]') >= 0
+    && String(pBtn.getAttribute('class')).indexOf('h-[30px] w-[30px]') >= 0
+    && String(rBtn.getAttribute('class')).indexOf('h-[30px] w-[30px]') >= 0,
+    [hBtn.getAttribute('class'), pBtn.getAttribute('class')].join(' | '));
+
+  // 34.2 THE load-bearing number. The host's title already reserves 60px on
+  // hover/focus, and that 60px IS the cell our button now lives in, so the
+  // reserve stays 60. 90 (the old 60 + our 30) and 96 (a naive 60 + the new
+  // 36) are both wrong and both must be absent FOR THIS KEY. (Another site's
+  // key legitimately carries 90 -- see 34.5 -- so the scan is per key.)
+  const hR = '[data-mmx-toplock-reserve="' + hKey + '"]{margin-right:';
+  check('34.2 mhd 的 reserve 停在宿主自己那 60px（60+30=90 与 60+36=96 都不许出现）',
+    hKey.length > 4
+    && css.indexOf('.group:hover ' + hR + '60px}') >= 0
+    && css.indexOf('.group:focus-within ' + hR + '60px}') >= 0
+    && css.indexOf(hR + '90px}') < 0 && css.indexOf(hR + '96px}') < 0
+    && css.indexOf(hR + '66px}') < 0,
+    hKey + ' :: ' + css.slice(-240));
+
+  // 34.3 The strip must not be pinned to a width any more. Forcing 60 + 36
+  // would squeeze the host's own two 30px buttons (they are the strip's flex
+  // siblings and shrink), which is how a bigger button used to make the WHOLE
+  // right side of the row smaller.
+  check('34.3 mhd 的条不再有我们写的定宽（宿主两个 30px 原生按钮不被压扁）',
+    hrow.strip.getAttribute('data-mmx-toplock-strip') === null
+    && css.indexOf('data-mmx-toplock-strip="' + hKey + '"') < 0
+    && hrow.strip.getAttribute('class') === MHD_STRIP, hrow.strip.getAttribute('class'));
+  check('34.3b 宿主两个原生按钮仍是 30px 规格、class 一字未改',
+    nativeButtons(hrow.strip).length === 2
+    && nativeButtons(hrow.strip).every((b) => String(b.getAttribute('class'))
+      .indexOf('h-[30px] w-[30px]') >= 0)
+    && nativeButtons(hrow.strip)[0].getAttribute('class') === NATIVE_BTN
+    && nativeButtons(hrow.strip)[1].getAttribute('class') === NATIVE_BTN,
+    nativeButtons(hrow.strip).map((b) => b.getAttribute('class')).join(' | '));
+  check('34.3c 条里的内容一个不多一个不少（mount + 2 原生 + 我们自己）',
+    hrow.strip.children.length === 3, 'children=' + hrow.strip.children.length);
+
+  // 34.4 The cell is the host's, so the host's own 60px reserve is exactly
+  // right -- but only if the button is centred in it. Left-aligned, the button
+  // would sit 12px short of the space the title gives up.
+  check('34.4 我们的按钮在宿主那 60px 格里居中（mount 规则带 justify-content:center）',
+    hrow.mount.getAttribute('data-mmx-toplock-mount') === hKey
+    && css.indexOf('[data-mmx-toplock-mount="' + hKey + '"]{display:flex;align-items:center;justify-content:center}') >= 0,
+    hKey + ' :: ' + css.slice(-240));
+  // 34.4b The glyph has to grow with the button, or 36px of button still shows
+  // a 16px pin and reads as "the same icon, slightly bigger box".
+  check('34.4b 图标跟着按钮放大到 20px（比例与 30px 时的 16px 一致）',
+    css.indexOf('[data-mmx-toplock-mount="' + hKey + '"] .mmx-toplock-glyph{width:20px;height:20px}') >= 0
+    && css.indexOf('.mmx-toplock-glyph{width:16px') >= 0, css.slice(-200));
+
+  // 34.5 The other two sites keep the OLD arithmetic (host reserve + px, and
+  // stripWidth + px). Proof the change is per-site, not a global constant swap.
+  check('34.5 ipinned 仍是 60+30=90（它在宿主按钮【旁边】，得自己让出宽度）',
+    pKey.length > 4
+    && css.indexOf('.group:hover [data-mmx-toplock-reserve="' + pKey + '"]{margin-right:90px}') >= 0
+    && css.indexOf('data-mmx-toplock-strip="' + pKey + '"') < 0, pKey);
+  check('34.5b irecent 的定宽条仍是 60+30=90px 写在悬停/聚焦态',
+    /^m\d+h\d+f\d+p\d+a\d+w60$/.test(rKey)
+    && css.indexOf('.group:hover [data-mmx-toplock-strip="' + rKey + '"]{width:90px}') >= 0
+    && css.indexOf('.group:focus-within [data-mmx-toplock-strip="' + rKey + '"]{width:90px}') >= 0,
+    rKey);
+  check('34.5c 三个 site 的 key 互不相同（规则不会互相覆盖）',
+    hKey !== pKey && hKey !== rKey && pKey !== rKey, [hKey, pKey, rKey].join(' '));
+
+  // 34.6 The invariant that makes 36 legal at all: our button has to FIT the
+  // host-sized cell it lives in. Read back from the shipped table + the
+  // emitted rule, so a future px bump fails here instead of overflowing.
+  const A34 = makeLockPage();
+  const mhd36 = A34.api.sites.filter((s) => s.name === 'mhd-pinned')[0];
+  const cellRule = (css.match(new RegExp('\\[data-mmx-toplock-mount="'
+    + hKey + '"\\]\\{display:flex;align-items:center[^}]*\\}')) || [''])[0];
+  const hoverRule = (css.match(new RegExp('\\.group:hover \\[data-mmx-toplock-reserve="'
+    + hKey + '"\\]\\{margin-right:(\\d+)px\\}')) || [0, '0'])[1];
+  check('34.6 36px 装得进宿主那一格（reserve 反推出的格宽 >= 按钮）',
+    !!mhd36 && mhd36.px === 36 && Number(hoverRule) >= mhd36.px
+    && cellRule.indexOf('justify-content:center') >= 0,
+    'px=' + (mhd36 && mhd36.px) + ' cell>=' + hoverRule);
+
+  // 34.6b The budget 34.6 does NOT check. 34.6 is entirely about WIDTH: the
+  // host's cell is w-[60px] and 36 fits inside it with room to spare. HEIGHT
+  // is a separate budget, and 36 does not fit inside h-[30px] -- the button is
+  // 3px taller than the cell on each side, because the cell centres it
+  // (align-items:center) and lets the excess leave the box.
+  //
+  // That overflow is a real, shipped, currently-true fact, not a defect to fix
+  // here, and 34.6 cannot see it: every one of its numbers is horizontal. It
+  // is pinned because it is only HARMLESS. Three separate elements could clip
+  // it -- the cell, the strip, and the rule we emit for the cell -- and an
+  // overflow-hidden on any one of them would crop the top and bottom of the
+  // pin glyph and turn "a bigger, more clickable button" into a chopped one.
+  // Reading the three off the DOM and the emitted stylesheet is what makes the
+  // next size change a deliberate decision instead of an accident.
+  const cellCls = String(hrow.mount.getAttribute('class'));
+  const stripCls = String(hrow.strip.getAttribute('class'));
+  const cellH = Number((cellCls.match(/h-\[(\d+)px\]/) || [])[1] || 0);
+  const btnCls = String(hBtn.getAttribute('class'));
+  const btnH = Number((btnCls.match(/h-\[(\d+)px\]/) || [])[1] || 0);
+  const overPerSide = (btnH - cellH) / 2;
+  const clipFree = [cellCls, stripCls, cellRule]
+    .every((s) => String(s).indexOf('overflow-hidden') < 0);
+  check('34.6b 36px 在宿主 h-[30px] 格里纵向各溢出 3px，且格/条/我们写的规则都不裁它',
+    !!mhd36 && mhd36.px === 36 && btnCls.indexOf('h-[36px]') >= 0
+    && cellH === 30 && btnH === 36 && overPerSide === 3 && clipFree,
+    `cell=${cellH}px btn=${btnH}px over/side=${overPerSide}px clip-free=${clipFree}`);
+
+  // 34.7 At rest our rule is what MAKES the cell visible, and the host reserves
+  // nothing at rest (its mr-2). Pinning the status quo: no resting rule, so the
+  // enlargement never silently steals ~50px of every title.
+  check('34.7 静息态不写 reserve 规则（不白缩标题；这是既有行为，已钉住）',
+    css.indexOf('}' + '[data-mmx-toplock-reserve="' + hKey + '"]{margin-right') < 0,
+    hKey + ' :: ' + css.slice(-160));
+  check('34.7b 标题只多了一个自有属性，class 一字未改',
+    hrow.title.getAttribute('class') === IPINNED_TITLE
+    && hrow.title.getAttribute('data-mmx-toplock-reserve') === hKey
+    && hrow.title.getAttribute('data-mmx-toplock-mount') === null,
+    hrow.title.getAttribute('class'));
+  check('34.7c 宿主 mount 的 class 一字未改（我们只加自有属性）',
+    hrow.mount.getAttribute('class') === MHD_MOUNT, hrow.mount.getAttribute('class'));
 }
 
 console.log(`\npass=${pass} fail=${fail}`);

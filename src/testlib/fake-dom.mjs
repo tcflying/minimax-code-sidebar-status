@@ -21,8 +21,92 @@
 //     (the pinned-more memory, the new menu item) depend on that difference.
 //   - attribute selectors, .class, #id and comma lists: that is all the page
 //     script ever asks for.
+//   - MutationObserver with a microtask delivery, and document-level
+//     addEventListener: the menu watch attaches an observer to the document and
+//     expects to be told the moment the host mounts the row's dropdown portal,
+//     and to be told when the next click means that menu is going away. A
+//     harness that made the test poke the callback by hand would be testing the
+//     poke, so the records here are produced by the same appendChild /
+//     removeChild / setAttribute calls every other assertion in this file uses.
+//
+// It is PURELY additive: with no observer registered, no record is retained and
+// no microtask is scheduled, so the delivery path cannot affect a suite that
+// does not ask for it.
 
 let nextId = 0;
+
+// --------------------------------------------------------------------------
+// MutationObserver: records, a live-observer registry, and one microtask flush.
+// --------------------------------------------------------------------------
+let moSeq = 0;
+let moPending = [];
+let moScheduled = false;
+const moLive = new Set();
+const moAll = new Set();      // every observer ever constructed, live or not
+
+function moRecord(type, target, extra) {
+  if (!moLive.size) return;            // nobody is listening: record nothing
+  moPending.push({ seq: ++moSeq, type, target, ...extra });
+  if (moScheduled) return;
+  moScheduled = true;
+  // A real MutationObserver delivers as a microtask, i.e. after the current
+  // task and before the next paint. queueMicrotask is that same slot, so a
+  // test that awaits gets the callback without pumping anything by hand.
+  queueMicrotask(() => {
+    moScheduled = false;
+    moFlush();
+  });
+}
+
+function moMatches(obs, rec) {
+  for (const t of obs.targets) {
+    const inScope = t.node === rec.target || (t.opts.subtree && t.node.contains && t.node.contains(rec.target));
+    if (!inScope) continue;
+    if (rec.type === 'childList' && t.opts.childList) return true;
+    if (rec.type === 'attributes' && t.opts.attributes) return true;
+  }
+  return false;
+}
+
+function moFlush() {
+  // Snapshot-and-clear, so mutations the callbacks cause land in the NEXT
+  // microtask instead of extending this batch -- which is what a real
+  // MutationObserver does, and what keeps a callback that writes to the DOM
+  // from re-entering itself.
+  const batch = moPending;
+  moPending = [];
+  if (!batch.length) return;
+  for (const obs of Array.from(moLive)) {
+    const recs = batch.filter((r) => r.seq > obs.seenSeq && moMatches(obs, r));
+    if (!recs.length) continue;
+    obs.seenSeq = moSeq;
+    obs.deliveries++;
+    obs.cb(recs, obs);
+  }
+}
+
+class FakeMutationObserver {
+  constructor(cb) {
+    this.cb = cb;
+    this.targets = [];
+    this.seenSeq = moSeq;
+    this.deliveries = 0;
+    this.disconnects = 0;
+    moAll.add(this);
+  }
+  observe(node, opts) {
+    this.targets.push({ node, opts: opts || {} });
+    moLive.add(this);
+  }
+  disconnect() {
+    this.disconnects++;
+    this.targets = [];
+    moLive.delete(this);
+  }
+  takeRecords() {
+    return [];
+  }
+}
 
 function parseSimple(sel) {
   // One compound selector: tag#id.class[attr][attr="v"]...
@@ -157,6 +241,7 @@ class FakeNode {
     // repaint loop look perfectly quiet -- and a repaint loop is exactly what a
     // childList observer on our own subtree turns into.
     this.__w = (this.__w || 0) + 1;
+    moRecord('attributes', this, { attributeName: k });
   }
   getAttribute(k) {
     return k in this.attrs ? this.attrs[k] : null;
@@ -174,6 +259,7 @@ class FakeNode {
     c.__detached = false;
     this.childNodes.push(c);
     this.__w = (this.__w || 0) + 1;
+    moRecord('childList', this, { addedNodes: [c], removedNodes: [] });
     return c;
   }
   insertBefore(node, ref) {
@@ -200,6 +286,7 @@ class FakeNode {
     node.parentElement = null;
     node.__detached = true;
     this.__w = (this.__w || 0) + 1;
+    moRecord('childList', this, { addedNodes: [], removedNodes: [node] });
     return node;
   }
   remove() {
@@ -320,6 +407,7 @@ export function makeDom() {
   root.__isRoot = true;
   const head = new FakeNode('head');
   root.appendChild(head);
+  const docListeners = new Map();
   const document = {
     body: root,
     head,
@@ -336,6 +424,35 @@ export function makeDom() {
     },
     querySelector: (sel) => root.querySelector(sel),
     querySelectorAll: (sel) => root.querySelectorAll(sel),
+    // Document-level listeners. The page registers its capture handlers here,
+    // and a test needs to be able to hand one an event the way the browser
+    // would during the CAPTURE phase -- which is the only phase in which the
+    // page's own contextmenu/click handlers are registered. Delivery here is
+    // therefore capture-only: the target's own listeners are reached through
+    // FakeNode.dispatch, and calling this does NOT re-run them.
+    addEventListener(type, fn) {
+      if (!docListeners.has(type)) docListeners.set(type, []);
+      docListeners.get(type).push(fn);
+    },
+    removeEventListener(type, fn) {
+      const l = docListeners.get(type);
+      if (!l) return;
+      const i = l.indexOf(fn);
+      if (i >= 0) l.splice(i, 1);
+    },
+    docListenerCount: (type) => (docListeners.get(type) || []).length,
+    dispatch(type, ev = {}) {
+      const event = {
+        type,
+        isTrusted: !!ev.isTrusted,
+        target: ev.target || document.body,
+        defaultPrevented: false,
+        cancelBubble: false,
+        ...ev,
+      };
+      for (const fn of (docListeners.get(type) || []).slice()) fn(event);
+      return event;
+    },
   };
   return {
     document,
@@ -347,6 +464,19 @@ export function makeDom() {
     FakeNode,
     FakeText,
     el: (t, a, c) => build(t, a, c),
+    // The observer class, plus the two things a test has to be able to assert
+    // about an observer's LIFE: how many are still registered, and how many
+    // times the code under test called disconnect(). "We tear it down" is not
+    // an assertion unless the harness can see the teardown.
+    observers: {
+      MutationObserver: FakeMutationObserver,
+      live: () => moLive.size,
+      liveList: () => Array.from(moLive),
+      disconnects: () => Array.from(moAll).reduce((n, o) => n + o.disconnects, 0),
+      deliveries: () => Array.from(moAll).reduce((n, o) => n + o.deliveries, 0),
+      flush: () => moFlush(),
+      pending: () => moPending.length,
+    },
   };
 }
 

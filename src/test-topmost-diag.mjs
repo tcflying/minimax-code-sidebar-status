@@ -27,7 +27,7 @@
 //  W8  dispose clears the snapshot.
 //  W9  selection follows the same order api.topmost() uses (pinned first).
 //  W10 expando count / anchor shape / root hops, including the case that
-//      actually matters in the field: the root sits beyond the shipped 40.
+//      actually matters in the field: the root sits beyond the shipped cap.
 //  W11 Nothing identifying leaks: no id, no title, no token, no host callback
 //      source. And the payload carries no owner / dfs / popup / raw-current
 //      fields at all.
@@ -51,9 +51,13 @@
 //  W18 The collector rebuilds attempt / popup / candidate layer by layer, never
 //      reads the transport slot, never scans the popup tree again, and edits to
 //      the payload do not flow back into the diagnostic.
-//  W15 The shipped contract is untouched: TOPMOST_MAX_ANCESTORS is still 40,
-//      the retry delays are still 0/8/16, and the multiset of topmostReason
-//      write points is exactly the pre-diagnostic one -- no new reason.
+//  W15 The shipped contract is untouched: TOPMOST_MAX_ANCESTORS is the value
+//      asserted in W15 below, the retry schedule is still a FINITE table of
+//      literal delays (asserted in W15d -- widened on 2026-10-05 away from the
+//      three fixed 8ms steps that made the real host inject nothing, but still
+//      finite, still literals, and still capped by the watch deadline), and
+//      the multiset of topmostReason write points is exactly the pre-diagnostic
+//      one -- no new reason.
 //
 // Run    : node src/test-topmost-diag.mjs
 //
@@ -373,30 +377,71 @@ console.log('\n=== 4. connected / retarget 两个真实门禁 ===');
 }
 
 // ---------------------------------------------------------------------------
-console.log('\n=== 5. 次数上限与重试窗口不变 ===');
+// Section 5 originally read "次数上限与重试窗口不变" and pinned three fixed 8ms
+// steps. Those three steps ARE the defect: on the real host the row's dropdown
+// portal is mounted lazily on the first right click, later than the ~16ms they
+// span, so nothing was ever injected there. What this section protects is
+// unchanged and is what the diagnostic depends on -- the retry window is a
+// FINITE table, it is exhausted on purpose, `capped` fires on the last attempt
+// and not before, and the cap never overwrites the last attempt's real stage.
+// The numbers moved; the contract did not.
+console.log('\n=== 5. 次数上限与重试窗口：有限、逐级拉长、到点就停 ===');
 {
+  const SCHEDULE = (pageSrc.match(/var TOPMOST_RETRY_DELAYS = \[([^\]]*)\];/) || [])[1];
+  const STEPS = (SCHEDULE || '').split(',').map((s) => Number(String(s).trim())).filter((n) => !Number.isNaN(n));
+  // The diagnostic keeps its OWN cap on recorded attempts (3) so the snapshot
+  // stays small; it is deliberately not the number of attempts the chain makes.
+  // The real count is measured here from the timer queue: the chain re-arms
+  // exactly one callback per failed attempt, so the number of callbacks that
+  // fire before the queue drains IS the attempt count. Asserting the two
+  // against each other is what keeps "the window is N wide" from silently
+  // drifting away from the schedule the table claims.
+  const DIAG_CAP = Number((pageSrc.match(/var TOPMOST_DIAG_MAX_ATTEMPTS = (\d+);/) || [])[1]);
+  check('W5a0 出厂的重试表是一张有限的字面量表（不是循环、不是算出来的）',
+    !!SCHEDULE && STEPS.length >= 2 && STEPS.every((n) => Number.isFinite(n) && n >= 0), SCHEDULE);
+  check('W5a0b 它是【逐级拉长】的：每一拍都比上一拍久（固定 8ms 就是这个缺陷本身）',
+    STEPS.slice(1).every((n, i) => n > STEPS[i]), STEPS.join(','));
+  // W5a0b alone is satisfiable by a table that is increasing and still far too
+  // short. [0,4,8] passes it perfectly -- it is strictly increasing, it is a
+  // finite literal table, and it spans 12ms, which is the ORIGINAL defect: the
+  // host mounts the row's dropdown portal later than that on a first right
+  // click, so nothing was ever injected. "Increasing" is a property of the
+  // shape; only the total says the window is long enough to be worth having.
+  // This is the assertion that makes "somebody shortened the table" red instead
+  // of quietly restoring the bug the whole schedule exists to avoid.
+  check('W5a0c 累计窗口不得短于 500ms', STEPS.reduce((a, b) => a + b, 0) >= 500,
+    `sum=${STEPS.reduce((a, b) => a + b, 0)} table=${STEPS.join(',')}`);
   const page = makePage();
   const host = makeHost();
   const t = makeRow(page, 'mvs_x', host, { menu: false });
   rightClick(page, t.rowEl);
-  check('W5 首个 timer 的 delay 是 0', page.timers.delays().join() === '0', page.timers.delays().join());
+  check('W5 首个 timer 的 delay 是表里的第 0 项', page.timers.delays().join() === String(STEPS[0]),
+    page.timers.delays().join());
   page.timers.run();
-  check('W5b 第二次的 delay 是 8（窗口未变长）', page.timers.delays().join() === '8', page.timers.delays().join());
-  page.timers.run();
-  page.timers.run();
+  check('W5b 第二次的 delay 是表里的第 1 项（窗口已经变长了）',
+    page.timers.delays().join() === String(STEPS[1]), page.timers.delays().join());
+  let beats = 1;
+  while (page.timers.size() > 0 && beats < 40) { page.timers.run(); beats++; }
   const d = page.api.collect();
-  check('W5c 恰好 3 条 attempt，全部 nomenu',
-    d.attempts.length === 3 && d.attempts.map((a) => a.stage).join() === 'nomenu,nomenu,nomenu',
-    d.attempts.map((a) => a.stage).join());
-  check('W5d capped 为真，且没有第 4 条',
-    d.capped === true && d.attempts.length === 3, JSON.stringify(d.capped));
-  check('W5e try 序号是 1..3', d.attempts.map((a) => a.try).join() === '1,2,3',
+  check('W5c 链真的跑了表长那么多次（每次失败重排一次，排完就停）',
+    beats === STEPS.length, `beats=${beats} want=${STEPS.length}`);
+  check('W5c2 跑完之后定时器队列是空的（没有排了不跑的尾巴）',
+    page.timers.size() === 0, 'size=' + page.timers.size());
+  check('W5d capped 为真（上限在最后一次尝试上打，不是提前打）', d.capped === true, JSON.stringify(d.capped));
+  check('W5e 记下来的 attempt 序号是连续的 1..N，没有跳号也没有重号',
+    d.attempts.map((a) => a.try).join() === d.attempts.map((_, i) => i + 1).join(),
     d.attempts.map((a) => a.try).join());
+  check('W5e2 快照的条数被诊断自己的上限截住（不是链只跑了这么多）',
+    d.attempts.length === Math.min(STEPS.length, DIAG_CAP),
+    `recorded=${d.attempts.length} cap=${DIAG_CAP}`);
   check('W5f 出厂 lastReason 是 menu-not-found', page.api.state.lastReason === 'menu-not-found',
     page.api.state.lastReason);
-  check('W5g capped 没有把最后一次的真实原因覆盖掉',
-    d.attempts.length === 3 && d.attempts[2].stage === 'nomenu',
-    d.attempts.length === 3 ? d.attempts[2].stage : '(no third attempt recorded)');
+  const lastStage = d.attempts.length ? d.attempts[d.attempts.length - 1].stage : '(none)';
+  check('W5g capped 没有把最后一次的真实原因覆盖掉', lastStage === 'nomenu', lastStage);
+  check('W5h 窗口有总时限，而且它比整张表更长（否则表先到，时限就只是装饰）',
+    /var TOPMOST_WATCH_DEADLINE = (\d+);/.test(pageSrc)
+    && Number(pageSrc.match(/var TOPMOST_WATCH_DEADLINE = (\d+);/)[1]) > STEPS.reduce((a, b) => a + b, 0),
+    `${STEPS.reduce((a, b) => a + b, 0)} vs ${(pageSrc.match(/var TOPMOST_WATCH_DEADLINE = (\d+);/) || [])[1]}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -488,14 +533,17 @@ console.log('\n=== 8. selection / expando / anchor / root ===');
   check('W10b anchor 首条就是自身的行（count/firstSelf/nearestRow）',
     d.anchor.count === 1 && d.anchor.firstSelf === true && d.anchor.nearestRow === true,
     JSON.stringify(d.anchor));
-  check('W10c root 出厂 40 内命中，failureKind=ok',
+  check('W10c root 出厂 256 内命中，failureKind=ok',
     d.root.shipped.hit === true && d.root.failureKind === 'ok', JSON.stringify(d.root.shipped));
-  check('W10d 两套 cap 分开出（40 / 256）',
-    d.root.shipped.cap === 40 && d.root.extended.cap === 256);
+  check('W10d 两套 cap 分开出（256 / 512）',
+    d.root.shipped.cap === 256 && d.root.extended.cap === 512);
 }
 {
-  // A row whose HostRoot sits 45 hops up: the shipped 40 cannot resolve it, and
-  // that distinction is the whole point of reporting the two caps separately.
+  // A row whose HostRoot sits 300 hops up: the shipped 256 cannot resolve it,
+  // and that distinction is the whole point of reporting the two caps
+  // separately. 300 is the real fixture depth; the real field measurement is
+  // 176~186 hops, comfortably inside the shipped cap, so 300 is only ever a
+  // synthetic worst case and the over-shipped-cap branch stays covered.
   const page = makePage();
   const row = page.dom.el('div', { 'data-session-id': 'mvs_deep' });
   page.dom.root.appendChild(row);
@@ -503,13 +551,13 @@ console.log('\n=== 8. selection / expando / anchor / root ===');
   const root = fiber({ tag: 3, name: 'HostRoot', hooks: null, parent: null });
   root.stateNode = fiberRoot; fiberRoot.current = root;
   let cur = root;
-  for (let i = 0; i < 45; i++) { cur = fiber({ tag: 5, name: 'div', props: {}, hooks: null, parent: cur }); }
+  for (let i = 0; i < 300; i++) { cur = fiber({ tag: 5, name: 'div', props: {}, hooks: null, parent: cur }); }
   attachFiber(row, cur);
   page.api.setDiag('row', row);
   const d = page.api.collect();
-  check('W10e root 在 45 跳：出厂 40 失败、extended 256 成功',
-    d.root.shipped.hit === false && d.root.shipped.depth === 40 &&
-    d.root.extended.hit === true && d.root.extended.depth === 45,
+  check('W10e root 在 300 跳：出厂 256 失败、extended 512 成功',
+    d.root.shipped.hit === false && d.root.shipped.depth === 256 &&
+    d.root.extended.hit === true && d.root.extended.depth === 300,
     JSON.stringify(d.root));
   check('W10f failureKind 把 over-shipped-cap 与 root-not-found 分开',
     d.root.failureKind === 'over-shipped-cap', d.root.failureKind);
@@ -707,8 +755,25 @@ console.log('\n=== 11. W14 镜像路径根本没被编译进来 ===');
 // ---------------------------------------------------------------------------
 console.log('\n=== 12. W15 出厂契约未被动过 ===');
 {
-  check('W15 TOPMOST_MAX_ANCESTORS 仍是 40',
-    /var TOPMOST_MAX_ANCESTORS = 40;/.test(pageSrc));
+  check('W15 TOPMOST_MAX_ANCESTORS 仍是 256',
+    /var TOPMOST_MAX_ANCESTORS = 256;/.test(pageSrc));
+  // The regression lock for the shipped-cap defect: the cap must stay ABOVE the
+  // depth that was actually measured on this host, or currentHostRoot returns
+  // null again and every read falls back to no-fiber-root. Stated as a
+  // constant relation, so lowering the cap below the measured floor turns this
+  // red instead of silently disabling "到最顶" again.
+  const SHIPPED_CAP = 256;                 // what the product ships
+  const MEASURED_MAX_HOPS = 186;           // measured 2026-10-05: 176~186 to HostRoot
+  check('W15e 出厂 cap 必须覆盖真机实测的 186 跳下限（256 > 186）',
+    SHIPPED_CAP > MEASURED_MAX_HOPS &&
+    new RegExp('var TOPMOST_MAX_ANCESTORS = ' + SHIPPED_CAP + ';').test(pageSrc),
+    'cap=' + SHIPPED_CAP + ' measured=' + MEASURED_MAX_HOPS);
+  // And the diagnostic cap must stay strictly above the shipped one, otherwise
+  // over-shipped-cap becomes unreachable dead code (the W10e/W10f branch).
+  const diagCaps = pageSrc.match(/TOPMOST_DIAG_ROOT_EXTENDED = (\d+);/);
+  check('W15f 诊断上限必须严格大于出厂 cap（over-shipped-cap 分支才可达）',
+    !!diagCaps && Number(diagCaps[1]) > SHIPPED_CAP,
+    diagCaps ? diagCaps[1] : 'not found');
   const reasons = (pageSrc.match(/topmostReason\('[a-z-]*'\)/g) || []).sort();
   const expected = [
     "topmostReason('already-top')", "topmostReason('busy')", "topmostReason('call-threw')",
@@ -733,10 +798,27 @@ console.log('\n=== 12. W15 出厂契约未被动过 ===');
   check('W15c 诊断不新增任何 topmostReason 字符串',
     !/topmostDiag[A-Za-z]*\('([a-z-]+)'\)/.test(pageSrc.replace(/topmostDiagRecord|topmostDiagCapped|topmostDiagEarlyStop/g, '')),
     'no-new-reason');
-  const delays = BLOCK.match(/window\.setTimeout\([^,]+, (\d+)\)/g) || [];
-  check('W15d 重试窗口仍是 0 与 8（无第三个延迟）',
-    delays.join(' | ').includes(', 0)') && delays.join(' | ').includes(', 8)') && delays.length === 2,
-    delays.join(' | '));
+  // The schedule moved off three fixed 8ms steps on 2026-10-05 (see section 5),
+  // so "there is no third delay" is no longer the invariant worth pinning. What
+  // is worth pinning is that the window is a FINITE table of LITERAL delays that
+  // the attempt loop indexes into -- not a computed, unbounded, or timer-less
+  // one -- and that no second, competing retry loop has appeared next to it.
+  const table = BLOCK.match(/var TOPMOST_RETRY_DELAYS = \[([^\]]*)\];/);
+  const steps = ((table || [])[1] || '').split(',').map((s) => Number(String(s).trim()))
+    .filter((n) => Number.isFinite(n));
+  check('W15d 重试窗口是一张有限的字面量表，且循环按下标取它（不是又一个内联数字）',
+    !!table && steps.length >= 2 && steps.every((n) => n >= 0)
+    && /TOPMOST_RETRY_DELAYS\[w\.tries\]/.test(BLOCK)
+    && /TOPMOST_RETRY_DELAYS\[0\]/.test(BLOCK),
+    `steps=${steps.join(',')}`);
+  check('W15d2 watch 里没有第二个重试循环（setInterval / 无界的 while 都不得出现）',
+    !/setInterval/.test(BLOCK)
+    && !/TOPMOST_RETRY_DELAYS\.push/.test(BLOCK)
+    && !/TOPMOST_RETRY_DELAYS\.splice/.test(BLOCK),
+    'one-loop');
+  check('W15d3 观察器有自己的上限，不靠重试表那一套（否则它会变成常驻监听）',
+    /var TOPMOST_MAX_NUDGES = \d+;/.test(BLOCK) && /TOPMOST_MAX_NUDGES/.test(BLOCK)
+    && /var TOPMOST_WATCH_DEADLINE = \d+;/.test(BLOCK), 'bounds');
 }
 
 // ===========================================================================
