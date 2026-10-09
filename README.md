@@ -50,7 +50,7 @@
 >    总闸 `TOPMOST_MAX_ANCESTORS` 40→256 与红锁顶/右键菜单「0 注入」修复、
 >    右键「永久置顶到最顶」与新置顶自动到顶、红钮放大、
 >    已置顶会话活动上浮（R1）、**对抗测试抓出的 7 处事件丢失反例修复**、
->    完美批次 F1–F7（变异 82→97/97）。详见 15.16.10。
+>    完美批次 F1–F7（变异 88→97/97）。详见 15.16.10。
 >    **第 5 条里的两道门仍未解除**：悬停手感与右键菜单两项**待主上目视**，
 >    `29 vs 27` **以当前实时 `order` 为准、主上可否决**，在此之前不采新基线。
 
@@ -3466,7 +3466,7 @@ export function bucketFor({ status, terminalOutcome, hasErrorMessage, includeAbo
 > **`29 vs 27` 基线裁决仍未解除**（见本小节末尾「随附事实」）。
 > **本轮只写这两份文档，未改任何代码 / 测试 / 冻件字节**，也未启停任何进程。
 
-**六个批次一览**（全部已上墙、已推送；`origin/master` = `e798e0d`，与本地 `HEAD` 逐位一致）
+**六个批次一览**（全部已上墙、已推送；`origin/master` = `e798e0d`（记录本文时），与本地 `HEAD` 逐位一致）
 
 | 批次 | 主题 | 提交 |
 |---|---|---|
@@ -3490,7 +3490,7 @@ export function bucketFor({ status, terminalOutcome, hasErrorMessage, includeAbo
 - **右键菜单「0 注入」修复**。归因：**探测窗 16ms < 宿主懒挂弹层的耗时**。
   改法：`MutationObserver` + 退避表 `[0, 16, 50, 120, 250, 400]`（ms）、nudge 24、总时限 2s；
   **六个出口全部走 `stopTopmostWatch`**。
-  **`owner` 唯一门没有放松**：删掉门的变异用例 **103 变红**（证明这道门仍在生效）。
+  **`owner` 唯一门没有放松**：删除 owner 唯一门（变异注入验证）后 **103 条断言失败**（证明这道门仍在生效）。
 
 **批次 2 · 新功能**（`e5a10d0`）
 
@@ -3510,7 +3510,7 @@ export function bucketFor({ status, terminalOutcome, hasErrorMessage, includeAbo
 - **让位链 = 锁顶 > autoTop > promote**（优先级固定，不互相抢）。
 - **`running` 严格判据**：11 条断言 + 变异 `m27` 钉死 —— **`waiting` / `error` / `paused` 永不上浮**。
 - **结束后不回位**（只升不降，避免抖动）。
-- 真机验证：**锁顶在场时 167 次让位，零乱写**。
+- 真机验证：**锁顶在场时 153 次让位，零乱写**。
 
 **批次 5 · 七反例修复 + 对抗测试收编**（`0530966`）
 
@@ -3536,7 +3536,7 @@ export function bucketFor({ status, terminalOutcome, hasErrorMessage, includeAbo
 | F6 | `__sentAt` 通路 + >15s 汇总条「· 信号 Ns 未更新」+ aria 过期提示 | **保守不删点** |
 | F7 | `unknownIds` 实装 | 真机 **140** |
 
-- 变异总数 **82 → 97，全部 97/97 通过**。
+- 变异总数 **88 → 97，全部 97/97 通过**。
 
 **随附事实**
 
