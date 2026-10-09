@@ -37,8 +37,9 @@
 //       so a nested running session hoists its whole parent -> "8.8c" fails
 //   s10 unknownIds goes back to being a dead field (always 0)
 //       -> "8.9" fails
-//   s11 the dot takes its pointer events back, so the title it already carries
-//       can never reach a mouse -> "8.7" fails
+//   s11 F4b: the row-level title write goes away, so the hover hint lives only
+//       on a 4px dot that no cursor can ever land on
+//       -> every "8.11a" fails
 //   s12 apply() stops asking whether the signal is stale
 //       -> "8.10" and "8.10c" fail
 //   s13 A13 daemon side: the timestamp is published AFTER a.refresh() instead of
@@ -150,9 +151,12 @@ if (MUT === 's1') {
   // cannot resolve reads as a row with nothing wrong with it.
   pageSrc = mutate(pageSrc, 'else if (map[id] === undefined) stats.unknownIds++;', '', 's10');
 } else if (MUT === 's11') {
-  // The dot takes its pointer events back. title stays on the node, so the
-  // semantic text is still there -- and still unreachable by a mouse.
-  pageSrc = mutate(pageSrc, "'  pointer-events:auto;cursor:help;',", "'  pointer-events:none;',", 's11');
+  // F4b: the row-level title write goes away. The dot keeps its own title and
+  // aria-label, and the stylesheet is correct -- but the hover hint is now
+  // carried only by a 4px-wide bar, which is the exact defect F4b fixed.
+  pageSrc = mutate(pageSrc,
+    "applyRowTitle(row, DOT_SEMANTIC[bucket] || DOT_SEMANTIC_FALLBACK);",
+    "/* mutated: row-level title write removed */", 's11');
 } else if (MUT === 's12') {
   // A13: apply() stops asking whether the signal is stale, so a dead daemon
   // leaves a page that looks exactly as healthy as a live one.
@@ -888,30 +892,24 @@ console.log('\n=== 8. 状态点语义：aria / 图例 / 汇总去重 ===');
       `got=${JSON.stringify(bar.children[1].textContent)}`);
   }
 
-  // ---- 8.7 状态点的悬停语义（pointer-events）----
+  // ---- 8.7 dot 的 CSS：热区归属（F4 的旧口径，已被 8.11d 取代）----
   //
-  // ensureDot 早就在 dot 上写了 title（8.3 已钉住），但基础 dot 规则写着
-  // pointer-events:none —— 那个属性让元素【收不到指针事件】，浏览器于是既不弹
-  // title 也不给 cursor。语义其实一直在那儿，只是永远到不了鼠标。
+  // F4 当时把基础 dot 规则切成 pointer-events:auto + cursor:help，指望 dot 上
+  // 那句 title 弹得出来。CDP 复核也确实是 pe=auto / cur=help，可真机上就是弹不
+  // 出来：dot 只有 4~8px 宽，鼠标停不进那么小的一块。F4b 把提示挪到整行，dot
+  // 的 pointer-events 于是回退 none——F4 注释里登记的那条代价（截获行首 4px
+  // 条带）随之消失。
+  //
+  // 这一段现在只钉【别的规则没被顺带改掉】。dot 自身的 pointer-events 归 8.11d。
   {
     const { dom } = boot({ mvs_dup: 'running' }, [['list', 'mvs_dup']]);
     const style = dom.getElementById('mmx-status-style');
     check('8.7 前置：自有样式表挂上了', !!style, 'style=' + !!style);
     const css = String(style ? style.textContent : '');
-    // 只取【基础】dot 规则那一段：'[data-mmx-dot]{...}'。后面的
-    // [data-mmx-dot][data-mmx-bucket=...] 各自是分桶覆盖，不含 pointer-events，
-    // 混进来会让"规则段内不再含 pointer-events:none"这句话测不到点上。
     const base = (css.match(/\[data-mmx-dot\]\{([^}]*)\}/) || [])[1];
     check('8.7 前置：基础 dot 规则切到了', typeof base === 'string', JSON.stringify(base));
-    check('8.7 基础 dot 规则收指针事件（title 才可能弹出来）',
-      /pointer-events\s*:\s*auto/.test(String(base)), JSON.stringify(base));
-    check('8.7 基础 dot 规则不再把指针事件关掉',
-      !/pointer-events\s*:\s*none/.test(String(base)), JSON.stringify(base));
-    check('8.7 基础 dot 规则给了 cursor:help（鼠标停上去是个可问号）',
-      /cursor\s*:\s*help/.test(String(base)), JSON.stringify(base));
-    // 风险自查：这一段改动不得顺带改掉别的规则。红锁按钮与宿主的原生按钮各自是
-    // 独立元素、各有各的规则，dot 收事件不会经过它们；下面两条把"没被顺带改掉"
-    // 钉死，免得有人日后用"全局 pointer-events"去修它。
+    // 风险自查：F4b 改的是 dot 自己那一行。红锁按钮与宿主的原生按钮各有各的规则，
+    // 下面几条把"没被顺带改掉"钉死，免得有人日后用"全局 pointer-events"去修它。
     const lockCss = (pageSrc.match(/\.mmx-toplock-btn\{[^}]*\}/) || [])[0] || '';
     check('8.7 红锁按钮规则仍是 pointer-events:auto + cursor:pointer（没被顺带改）',
       /pointer-events\s*:\s*auto/.test(lockCss) && /cursor\s*:\s*pointer/.test(lockCss),
@@ -1222,6 +1220,143 @@ console.log('\n=== 8. 状态点语义：aria / 图例 / 汇总去重 ===');
       order.length > 0 && order[0][0] === 'refresh' && order[0][2] === 424242,
       JSON.stringify(order));
   }
+
+// ---- 8.11 F4b：状态提示挂在【整行】上，而不是 4px 的 dot 上 ----
+//
+// 起因是一次真机验收失败。F4 已经把 dot 的 CSS 改成 pointer-events:auto +
+// cursor:help、title 也在（CDP 实测 pe=auto / cur=help / title=正在运行），可主上
+// 在真机上悬停弹不出提示。根因不是 CSS 写错，是几何：dot 只有 6px×6px，running
+// 桶是 4px 宽的竖条（真机 getBoundingClientRect().width === 4），鼠标的物理光标
+// 停不进这么一条竖带。属性全对、热区小到没人能命中。
+//
+// 修法：提示挂到整行（宿主 button 铺满行宽），dot 的 pointer-events 回退 none。
+// 下面五条把这次改动的每一个承诺都执行一遍。
+{
+  // ① 有桶的行，title 就是 DOT_SEMANTIC 的原文。
+  {
+    const buckets = ['running', 'waiting', 'paused', 'error', 'done'];
+    const ids = buckets.map((_, i) => 'mvs_r' + i);
+    const statusMap = {};
+    buckets.forEach((b, i) => { statusMap[ids[i]] = b; });
+    const { rows } = boot(statusMap, ids.map((id) => ['list', id]), { showDone: true });
+    const got = buckets.map((b, i) => rows[ids[i] + '@list'].getAttribute('title'));
+    for (let i = 0; i < buckets.length; i++) {
+      check(`8.11a 有桶的行 title 就是 ${buckets[i]} 的中文语义`,
+        got[i] === [ '正在运行', '有子代理在运行', '本轮已中断或已取消',
+                     '上一轮失败或存在错误', '上一轮已完成' ][i],
+        `title=${JSON.stringify(got[i])}`);
+    }
+    // 热区必须是"整行"而不是某个子节点：提示挂在会话行本身，不挂在 dot 上。
+    const row0 = rows[ids[0] + '@list'];
+    const dot0 = row0.querySelector('[data-mmx-dot]');
+    check('8.11a 提示挂在会话行本身（不是挂在 dot 上）',
+      row0.hasAttribute('title') && !!dot0 && !!dot0.getAttribute('title'),
+      `row=${JSON.stringify(row0.getAttribute('title'))} dot=${JSON.stringify(dot0 && dot0.getAttribute('title'))}`);
+  }
+
+  // ② 没有桶的行不留下我们的残留。
+  {
+    // 先有桶、写下 title，再撤掉桶：摘干净才是真的"不残留"。
+    const { rows, api } = boot({ mvs_g: 'running' }, [['list', 'mvs_g']]);
+    const row = rows['mvs_g@list'];
+    const mid = row.getAttribute('title');
+    check('8.11b 前置：撤桶前行上有我们写的 title', mid === '正在运行', `title=${mid}`);
+    api.refresh({});
+    check('8.11b 撤掉桶后行上没有我们残留的 title',
+      row.hasAttribute('title') === false, `title=${JSON.stringify(row.getAttribute('title'))}`);
+    check('8.11b 撤掉桶后点也摘掉了',
+      row.querySelector('[data-mmx-dot]') === null);
+    // 从头就没有桶的行，本来也不该被写。
+    const { rows: rows2 } = boot({ mvs_h: 'running' }, [['list', 'mvs_h'], ['list', 'mvs_none']]);
+    check('8.11b 从来没有桶的行连 title 属性都没有',
+      rows2['mvs_none@list'].hasAttribute('title') === false,
+      `title=${JSON.stringify(rows2['mvs_none@list'].getAttribute('title'))}`);
+  }
+
+  // ③ 宿主自己写过 title 的行，一个字都不许覆盖。
+  //
+  // 真机取证（2026-10-09，app://./archon，614 行）：rowsWithTitle = 0，宿主今天
+  // 从不给会话行写 title。但"今天没有"不等于"永远没有"，所以这一条是前瞻性的
+  // 保证：宿主哪天给会话行加了自己的摘要提示，我们让位，而不是把它改写成状态。
+  {
+    const HOST = '会话标题摘要（宿主自己的）';
+    const { rows, api } = boot({ mvs_o: 'running' }, [['list', 'mvs_o']]);
+    const row = rows['mvs_o@list'];
+    // 模拟宿主在下一趟 apply 之前自己写了一个 title。
+    row.setAttribute('title', HOST);
+    api.refresh({ mvs_o: 'running' });
+    check('8.11c 宿主自带 title 的行不被我们的语义覆盖',
+      row.getAttribute('title') === HOST, `title=${JSON.stringify(row.getAttribute('title'))}`);
+    // 同一个保证的另一半：撤桶时也不能把宿主那句摘掉。
+    api.refresh({});
+    check('8.11c 撤桶时宿主自己的 title 仍然留着',
+      row.getAttribute('title') === HOST, `title=${JSON.stringify(row.getAttribute('title'))}`);
+    // 空串不算宿主的话，按"没有 title"处理（否则会永远写不进去）。
+    row.setAttribute('title', '');
+    api.refresh({ mvs_o: 'running' });
+    check('8.11c 空 title 被当成没有，被我们写上语义',
+      row.getAttribute('title') === '正在运行', `title=${JSON.stringify(row.getAttribute('title'))}`);
+  }
+
+  // ④ dot 的 CSS 回到 pointer-events:none，且不再带 cursor:help。
+  {
+    const { dom } = boot({ mvs_p: 'running' }, [['list', 'mvs_p']]);
+    const css = String(dom.getElementById('mmx-status-style').textContent);
+    const base = (css.match(/\[data-mmx-dot\]\{([^}]*)\}/) || [])[1];
+    check('8.11d 基础 dot 规则切到了', typeof base === 'string', JSON.stringify(base));
+    check('8.11d dot 收回了指针事件（悬停交给整行）',
+      /pointer-events\s*:\s*none/.test(String(base)), JSON.stringify(base));
+    check('8.11d dot 不再开 pointer-events（否则又截获行首 4px 条带）',
+      !/pointer-events\s*:\s*auto/.test(String(base)), JSON.stringify(base));
+    // cursor:help 必须一起撤：没有指针事件的元素上的光标样式永远不会生效，
+    // 留着它只会让人以为 dot 还是可问的。
+    check('8.11d dot 上没有残留 cursor:help',
+      !/cursor\s*:\s*help/.test(String(base)), JSON.stringify(base));
+    // 别人的规则不许被顺带改掉（同 8.7 的自查口径）。
+    const lockCss = (pageSrc.match(/\.mmx-toplock-btn\{[^}]*\}/) || [])[0] || '';
+    check('8.11d 红锁按钮仍是 pointer-events:auto + cursor:pointer（没被顺带改）',
+      /pointer-events\s*:\s*auto/.test(lockCss) && /cursor\s*:\s*pointer/.test(lockCss));
+    const barCss = (css.match(/#mmx-running-summary\{([^}]*)\}/) || [])[1] || '';
+    check('8.11d 汇总条仍然 pointer-events:none（刻意，不挡置顶区点击）',
+      /pointer-events\s*:\s*none/.test(String(barCss)), JSON.stringify(barCss.slice(-60)));
+    // dot 自己的 title / aria-label 一个字都不能少：改的是热区，不是语义。
+    // 读屏用户拿到的仍然是 dot 上那句，不是行上那句。
+    const dotEl = dom.root.querySelector('[data-mmx-dot]');
+    check('8.11d dot 的 aria-label 仍在（读屏语义没被这次改动削掉）',
+      !!dotEl && dotEl.getAttribute('aria-label') === '正在运行',
+      `aria=${JSON.stringify(dotEl && dotEl.getAttribute('aria-label'))}`);
+    check('8.11d dot 的 title 仍在',
+      !!dotEl && dotEl.getAttribute('title') === '正在运行',
+      `title=${JSON.stringify(dotEl && dotEl.getAttribute('title'))}`);
+  }
+
+  // ⑤ React 重建行之后，下一趟 apply 自愈。
+  //
+  // 侧栏是虚拟化的，行会被 React 整个换掉。重建出来的是【新节点】：既没有我们写
+  // 的 title，也没有我们的 dot。自愈不靠"记住我们写过什么"，而是靠每一趟重新
+  // 按 id 再写一遍——这正是虚拟化列表下唯一正确的做法。
+  {
+    const { dom, api } = boot({ mvs_v: 'running' }, [['list', 'mvs_v']]);
+    // 造一个全新的同 id 行顶掉旧的（React 重建就是这个形状：换节点，不改节点）。
+    const fresh = dom.el('div', { 'data-session-id': 'mvs_v' });
+    fresh.appendChild(dom.el('button', { type: 'button' }, ['会话']));
+    const old = dom.root.querySelector('[data-session-id="mvs_v"]');
+    // fake-dom 没有 replaceChild，等价形状是"旧的摘掉、新的挂进去"。
+    // 父节点要在摘之前先握住：removeChild 之后 old.parentElement 不再可用。
+    const host = old.parentElement;
+    host.removeChild(old);
+    host.appendChild(fresh);
+    check('8.11e 重建前新行确实什么提示都没有',
+      fresh.hasAttribute('title') === false && fresh.querySelector('[data-mmx-dot]') === null,
+      `title=${JSON.stringify(fresh.getAttribute('title'))}`);
+    api.refresh({ mvs_v: 'running' });
+    check('8.11e React 重建行之后 title 自愈',
+      fresh.getAttribute('title') === '正在运行',
+      `title=${JSON.stringify(fresh.getAttribute('title'))}`);
+    check('8.11e React 重建行之后点也自愈',
+      !!fresh.querySelector('[data-mmx-dot]'));
+  }
+}
 }
 
 console.log(`\npass=${pass} fail=${fail}`);

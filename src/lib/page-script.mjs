@@ -73,28 +73,33 @@ function __mmxStatusMain(cfg) {
       '  top:50%;',
       '  transform:translateY(-50%);',
       '  width:6px;height:6px;border-radius:9999px;',
-      // pointer-events:auto + cursor:help：让已经写在 dot 上的 title 真的弹得
-      // 出来，并给一个"这里可以问"的指针。ensureDot 一直写 title 与 aria-label
-      // （8.3 钉住），pointer-events:none 会让元素收不到指针事件，于是语义一直
-      // 在、却永远到不了鼠标——颜色之外那句"人能读的话"对视觉用户是死的。
+      // pointer-events:none —— dot 不再收指针事件（2026-10-09 F4b 改回）。
       //
-      // 遮挡面（几何事实，不是"零风险"）：
-      //   1. 点只有 6px×6px，error 桶 8px×8px，running 桶是 4px 宽的竖条，且
-      //      绝对定位在行内左缘 left:cfg.offsetX（默认 4px）处，全部落在行首那
-      //      一小块空白里，不是铺在行中央。
-      //   2. dot 开 pointer-events 后命中测试更深，会【截获】它压住的那条带子：
-      //      默认 offsetX=4、running 桶 4px 宽，行首 x∈[4,8) 落在宿主 button 铺满
-      //      行宽后的 padding 内——那 4px 条带原本点得到会话，现在由 dot 接走。
-      //      兄弟节点并非"不互相遮挡"：只有同为 pointer-events:none 才互不干扰。
-      //   3. 红色悬停锁顶按钮是【另一个独立元素】（.mmx-toplock-btn），它自己
-      //      的规则仍是 pointer-events:auto + cursor:pointer，我们没有、也不会
-      //      在这里改它；宿主自己的按钮同样各自独立。
-      //   4. 汇总条那一条 pointer-events:none 是刻意的（压在置顶区头上会挡住点
-      //      击），不在本规则内，也不受本次改动影响。
-      // 代价与收益：dot 开启 pointer-events 以显示 title；代价是行首约 4px 条带的
-      // 点击会被 dot 截获（影响：按钮标题自 x=8 起不受影响；选中该会话请点行中部）。
-      // 悬停语义的可见性收益大于这条带的损失，故接受。
-      '  pointer-events:auto;cursor:help;',
+      // 改回的原因是一条实测：F4 已经把 title 写在 dot 上、并且把 pointer-events
+      // 切成 auto + cursor:help，CDP 复核也确实是 pe=auto/cur=help/title=正在运行
+      // （真机，archon 页 89 个点抽样）。可主上在真机上悬停【弹不出提示】。量了
+      // 才发现根因不是 CSS，是几何：dot 只有 6px×6px（error 桶 8px×8px，running
+      // 桶是 4px 宽的竖条），还绝对定位在行内左缘 left:cfg.offsetX（默认 4px）
+      // 处，实测 getBoundingClientRect().width === 4。鼠标的物理光标停不进这么
+      // 一条 4px 宽的竖条——title 在、属性对、热区小到没人能命中，于是"语义永远
+      // 到不了鼠标"。让一个 4px 的元素承担悬停提示，本身就是错的分工。
+      //
+      // 修法是把提示挂到【整行】（见 apply() 里的 applyRowTitle）：整行是宿主
+      // button 铺满行宽，热区是整行而不是 4px，鼠标随便停上去都弹得出来。
+      //
+      // 这次改回顺带【消掉】了 F4 登记的那条代价。F4 注释第 2 条写过：dot 开
+      // pointer-events 后命中测试更深，会截获它压住的那条带子——行首 x∈[4,8)
+      // 原本点得到会话，现在被 dot 接走，"选中该会话请点行中部"。行级 title
+      // 已经覆盖了悬停需求，dot 就没有理由再收事件，于是那 4px 条带重新落回
+      // 宿主 button，F4 的取舍不再成立。
+      //
+      // dot 的 title / aria-label 一律保留（读屏仍然读得到那个语义名），视觉上的
+      // 颜色与形状也一个字没动。
+      //
+      // 下面两条不受本次改动影响，仍然各自独立：红色悬停锁顶按钮
+      // （.mmx-toplock-btn）自己的规则仍是 pointer-events:auto + cursor:pointer；
+      // 汇总条那一条 pointer-events:none 也是刻意的（压在置顶区头上会挡住点击）。
+      '  pointer-events:none;',
       '}',
       '[' + MARK + '][data-mmx-bucket="paused"]{ background:var(--orange_400,#f59e0b); }',
       '[' + MARK + '][data-mmx-bucket="error"]{ background:var(--red_400,#ef4444); width:8px;height:8px; }',
@@ -315,6 +320,48 @@ function __mmxStatusMain(cfg) {
       dot.setAttribute('title', label);
     }
     return dot;
+  }
+
+  // ---------- 行级悬停提示（F4b，2026-10-09）----------
+  //
+  // 状态语义挂在【整行】的 title 上，不再挂在 dot 上。理由见样式段：dot 只有
+  // 4~8px 宽，是个鼠标停不进去的热区，而整行是宿主 button 铺满行宽，悬停提示
+  // 只有挂在整行上才真的弹得出来。
+  //
+  // 取证（2026-10-09 真机 CDP，app://./archon，Runtime.evaluate 只读）：
+  // 614 个 [data-session-id] 里 rowsWithTitle = 0，抽查 10 行 hasAttribute('title')
+  // 全为 false。也就是【宿主自己从不给会话行写 title】。
+  //
+  // 但"当前没有"不等于"将来也不会有"，所以下面仍然按差值写，并且只碰两种值：
+  // 根本没有 title 的，和我们自己写进去的那种。文案常量恰好就是"我们自己写过
+  // 的值"的全集，所以判据是封闭的，不依赖任何外部名单：
+  //   * 行上没有 title            -> 直接写
+  //   * 行上的 title 等于我们要写的  -> 不写（值没变就别碰子树）
+  //   * 行上的 title 是空串         -> 当成没有，写
+  //   * 行上的 title 属于 DOT_SEMANTIC 值集 / 兜底文案 -> 是我们的旧值，覆盖
+  //   * 行上别的任何 title          -> 【宿主的】，一个字都不动
+  // 最后一条是"绝不覆盖宿主自己的提示"这条保证的落点：宿主哪天给会话行加了
+  // 自己的 title（会话名摘要之类），我们让位，而不是把它改写成状态文案。
+  function isOurTitle(v) {
+    if (v === null || v === undefined) return false;
+    if (v === '') return true;
+    for (var k in DOT_SEMANTIC) {
+      if (DOT_SEMANTIC[k] === v) return true;
+    }
+    return v === DOT_SEMANTIC_FALLBACK;
+  }
+
+  // label === null 表示"这一行现在没有状态桶了"，此时只在残留确实是我们的时
+  // 候摘掉；宿主自己的 title 同样一个字都不动。
+  function applyRowTitle(row, label) {
+    var cur = row.getAttribute('title');
+    if (label === null) {
+      if (isOurTitle(cur)) row.removeAttribute('title');
+      return;
+    }
+    if (cur === label) return;
+    if (cur !== null && !isOurTitle(cur)) return;
+    row.setAttribute('title', label);
   }
 
   // ---------------------------------------------------------------------
@@ -954,9 +1001,14 @@ function __mmxStatusMain(cfg) {
       var existing = row.querySelector(':scope > [' + MARK + ']');
       if (!bucket) {
         if (existing) { existing.remove(); stats.removed++; }
+        // 行级提示跟着状态桶走：桶没了就把我们自己写的那句摘掉（applyRowTitle
+        // 内部只摘"是我们写的"那种，宿主自带的 title 不在这里被顺手删掉）。
+        applyRowTitle(row, null);
         continue;
       }
       stats.matched++;
+      // 有桶：把状态语义写到【整行】。和 ensureDot 一样只在真的不同的时候写。
+      applyRowTitle(row, DOT_SEMANTIC[bucket] || DOT_SEMANTIC_FALLBACK);
       if (getComputedStyle(row).position === 'static') {
         row.style.position = 'relative';
         // Remember the rows whose INLINE position WE changed, so dispose()
