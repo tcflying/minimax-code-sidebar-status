@@ -35,8 +35,8 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 // script is the only place that asserts "every one of them is red".
 const SUITES = [
   { file: 'test-reorder-pinned.mjs', label: '置顶区排序', muts: ['d1', 'd2', 'd3', 'd4'] },
-  { file: 'test-topmost-menu.mjs', label: '到最顶菜单', muts: ['m1', 'm2', 'm3', 'm4', 'm5', 'm6', 'm7', 'm8', 'm9', 'm10', 'm11', 'm12', 'm13', 'm14', 'm15', 'm16', 'm17', 'm18', 'm19', 'm20', 'm21', 'm22', 'm23', 'm24', 'm25', 'm26', 'm27'] },
-  { file: 'test-pinned-lifecycle.mjs', label: '置顶记忆与 dispose', muts: ['s1', 's2', 's3', 's4', 's5', 's6', 's7'] },
+  { file: 'test-topmost-menu.mjs', label: '到最顶菜单', muts: ['m1', 'm2', 'm3', 'm4', 'm5', 'm6', 'm7', 'm8', 'm9', 'm10', 'm11', 'm12', 'm13', 'm14', 'm15', 'm16', 'm17', 'm18', 'm19', 'm20', 'm21', 'm22', 'm23', 'm24', 'm25', 'm26', 'm27', 'm28', 'm29'] },
+  { file: 'test-pinned-lifecycle.mjs', label: '置顶记忆与 dispose', muts: ['s1', 's2', 's3', 's4', 's5', 's6', 's7', 's8', 's9', 's10', 's11', 's12', 's13', 's14'] },
   { file: 'test-topmost-diag.mjs', label: '到最顶最小诊断', muts: ['g1', 'g2', 'g3', 'g4', 'g5', 'g6', 'g7', 'g8', 'g9', 'g10'] },
   { file: 'test-top-lock.mjs', label: '红色悬停锁顶', muts: ['t1', 't2', 't3', 't4', 't5', 't6', 't7', 't8', 't9', 't10', 't11', 't12', 't13', 't14', 't15', 't16', 'r1', 'r2', 'r3', 'r4', 'r5', 'r6', 'r7', 'r8', 'r9', 'r10', 'w1', 'w2', 'w3', 'w4', 'w5', 'w6', 'w7', 'w8', 'w9', 'x1', 'x2', 'x3', 'x4', 'x5'] },
 ];

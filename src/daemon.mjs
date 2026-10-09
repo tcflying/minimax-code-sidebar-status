@@ -227,7 +227,9 @@ export function createRefreshLoop({
           db.refresh();
           const session = getSession();
           const boot = await session.evaluateWithRetry(
-            buildBootstrapExpression({ status: db.snapshot(), ...bootstrapConfig })
+            // sentAt: A13 的起点。这一次【重新注入】本身就是最新的一次服务器刷新，
+            // 所以时间戳取现在，而不是复用最初那次注入的时间。
+            buildBootstrapExpression({ status: db.snapshot(), sentAt: Date.now(), ...bootstrapConfig })
           );
           if (!boot || boot.ok === true) {
             state.reboots++;
@@ -506,7 +508,9 @@ async function main() {
     ...(args.activeBar ? { activeBar: args.activeBar } : {}),
   };
   const boot = await session.evaluateWithRetry(
-    buildBootstrapExpression({ status: db.snapshot(), ...bootstrapConfig })
+    // sentAt: A13 的起点 —— 页面用它初始化 lastRefreshAt，之后每趟 refresh 由
+    // buildRefreshExpression 把新的时间戳写进 api.__sentAt。
+    buildBootstrapExpression({ status: db.snapshot(), sentAt: Date.now(), ...bootstrapConfig })
   );
   log('注入结果:', JSON.stringify(boot));
   if (boot && boot.ok === false) {

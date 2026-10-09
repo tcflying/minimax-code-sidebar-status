@@ -99,10 +99,17 @@
 //   m25  the refusal still counts the call -> "22.1 calls 不增" fails
 //   m26  the refusal no longer closes the host's menu -> "22.1 菜单照样关闭" fails
 //       -> "13.10" fails
-//   m27  the promote criterion is widened from === 'running' to !== undefined,
-//       so waiting / paused / error all promote -> every "26.14 V11 <bucket>"
-//       fails. This one exists because nothing pinned the strictness before:
-//       under exactly this edit the suite used to stay 797/797 green.
+  //   m27  the promote criterion is widened from === 'running' to !== undefined,
+  //       so waiting / paused / error all promote -> every "26.14 V11 <bucket>"
+  //       fails. This one exists because nothing pinned the strictness before:
+  //       under exactly this edit the suite used to stay 797/797 green.
+  //   m28  A13: the lock deferral in the auto-top segment is put back AFTER the
+  //       pending confirm (the only place it charges a budget), so a host order
+  //       that moves while a lock is held spends the budget every pass
+  //       -> "24.10f" and "24.10g" fail
+  //   m29  'already-top' leaves TOPMOST_REASON_TEXT, so a session that is already
+  //       on top is reported as "this host build cannot sort"
+  //       -> "9.4" and "9.4b" fail
 
 //
   //   node test-topmost-menu.mjs
@@ -412,6 +419,28 @@ if (MUT === 'm1') {
   const to = "      next.push({ id: ids[n], running: st[ids[n]] !== undefined });   // mutation m27";
   if (BLOCK.split(from).length - 1 !== 1) throw new Error('mutation m27 anchor not unique');
   BLOCK = BLOCK.replace(from, to);
+} else if (MUT === 'm28') {
+  // A13: put the lock deferral back where it was -- AFTER the pending confirm,
+  // i.e. after the only place this segment charges a budget. This is not a
+  // synthetic edit: it is literally the pre-2026-10-09 shape, and the symptom it
+  // produced is a budget that quietly reaches zero while a lock is held, so the
+  // one window where the correction could actually have landed is the window
+  // where the corrector has already spent itself.
+  const from = `    if (autoTopPending && topmostLockView.id) {
+      autoTopState.deferred++;
+      autoTopState.lastReason = 'toplock-other';
+      return;
+    }
+`;
+  if (BLOCK.split(from).length - 1 !== 1) throw new Error('mutation m28 anchor not unique');
+  BLOCK = BLOCK.replace(from, '');
+} else if (MUT === 'm29') {
+  // already-top leaves the reason table again, so topmostReasonText falls through
+  // to the generic "this host build cannot sort" sentence for a session that was
+  // just proven available and simply did not need a write.
+  const from = "    'already-top': '已在置顶区最顶',";
+  if (BLOCK.split(from).length - 1 !== 1) throw new Error('mutation m29 anchor not unique');
+  BLOCK = BLOCK.replace(from, '');
 } else if (MUT === 'm6') {
   const from = "if (!ev || !ev.isTrusted) { topmostState.blocked++; topmostReason('untrusted-click'); return; }";
   if (!BLOCK.includes(from)) throw new Error('mutation m6 anchor not found');
@@ -1492,6 +1521,42 @@ console.log('\n=== 9. 禁用项只说中文话 ===');
     p.api.topmostReasonText('some-internal-code-9000') === '当前宿主版本不支持置顶排序',
     p.api.topmostReasonText('some-internal-code-9000'));
   check('9.3 未知码不会原样返回', p.api.topmostReasonText('weird') !== 'weird');
+  // already-top 是【已经证明过的能力】上的一支，不是失败：capability 一路走到了
+  // "读出宿主自己的 order[0] 就是这一项" 才写下它。TOPMOST_REASON_TEXT 里没有
+  // 这一条，于是 topmostReasonText 落进兜底，api.topmost().reasonText 报的是
+  // "当前宿主版本不支持置顶排序" —— 对一个明明可用的会话说宿主不支持置顶排序，
+  // 是把"不用做"说成了"做不到"。daemon 每个 tick 的日志读的就是这个字段。
+  check('9.4 already-top 有自己的中文（不落进"宿主版本不支持"的兜底）',
+    p.api.topmostReasonText('already-top') === '已在置顶区最顶',
+    p.api.topmostReasonText('already-top'));
+  check('9.4 already-top 既不是兜底、也不是 ok 的文案',
+    p.api.topmostReasonText('already-top') !== '当前宿主版本不支持置顶排序'
+    && p.api.topmostReasonText('already-top') !== p.api.topmostReasonText('ok'),
+    p.api.topmostReasonText('already-top'));
+  // 传播路径：不是只查表，而是从【真的在首位的那一行】一路读到 reasonText。
+  {
+    const p9 = makePage();
+    const h9 = makeHost();
+    const { rowEl } = makeRow(p9, 'mvs_a', h9);
+    const cap9 = p9.api.topmostCapability(rowEl);
+    check('9.4b 传播路径：真在首位的一行 reason 就是 already-top（没有被改写成别的码）',
+      cap9.available === true && cap9.alreadyTop === true && cap9.reason === 'already-top',
+      `available=${cap9.available} alreadyTop=${cap9.alreadyTop} reason=${cap9.reason}`);
+    check('9.4b 传播路径：cap.reason 喂给 topmostReasonText 得到新文案（不是兜底）',
+      p9.api.topmostReasonText(cap9.reason) === '已在置顶区最顶',
+      p9.api.topmostReasonText(cap9.reason));
+  }
+  // 点击 already-top 的那一支必须写下同一个码，否则 topmostState.lastReason 与
+  // cap.reason 分叉，日志里两个字段会互相矛盾。
+  {
+    const p9 = makePage();
+    const h9 = makeHost();
+    const { rowEl } = makeRow(p9, 'mvs_a', h9);
+    p9.api.onTopmostActivate({ isTrusted: true }, rowEl, rowEl, 'mvs_a');
+    check('9.4c 点击已在首位的那一项，lastReason 也是 already-top 且零写',
+      p9.api.state.lastReason === 'already-top' && h9.calls.length === 0,
+      `lastReason=${p9.api.state.lastReason} calls=${h9.calls.length}`);
+  }
 }
 
   // ---------------------------------------------------------------------------
@@ -3332,6 +3397,51 @@ console.log('\n=== 24. 自动到最顶：新成员不在首位就补一次三参
   } else {
     check('24.10b 前置：自动到顶这一段在出厂里', false, D.why);
   }
+  // A13 让位的另一半：预算【不能】在锁在场期间被扣掉。
+  //
+  // 24.10 那一条钉的是"锁在场时我们不写"。这里钉的是"锁在场时我们也不【记账】"。
+  // 旧实现把让位判断放在待办确认【之后】：锁在场期间，只要有待办在飞，宿主那份
+  // order 一动（静默回滚、用户自己拖了一下、别的纠正器改写了），这一趟就落进
+  // "形态还在、目标没到下标 0 = 确认失败"，扣一次预算。三趟下来预算见底，于是
+  // 锁一释放、真正的补写机会来了的时候，预算已经没了，什么也不做。
+  //
+  // 而那三次扣费一次都不该发生：锁顶意图在场期间我们本来就【不打算】写，那段
+  // order 的变化根本不是我们造成的。deferred 该照记，pending 该留着。
+  const E = autoPage();
+  if (E.ok) {
+    await tick(E); await tick(E);                            // 基线 = [a,b,c]
+    commit(E.p, E.host, E.host.order.concat([ref('mvs_new')]));
+    await tick(E); await tick(E);                            // 补写一次，待办在飞
+    check('24.10e 前置：已经发出去一次，待办在飞',
+      E.host.calls.length === 1 && E.p.api.autoState.calls === 1
+      && E.p.api.autoState.budget === E.p.api.autoMax,
+      `calls=${JSON.stringify(E.host.calls)} budget=${E.p.api.autoState.budget}/${E.p.api.autoMax}`);
+    // 锁顶意图【在补写之后】才登场：这一次写是锁在不在场时自己做的，与锁无关。
+    E.p.api.lockView.id = 'mvs_a';
+    // 宿主静默回滚：闭包里的 order 换回补写【之前】那一份（模块完全不知情）。
+    // 这正是待办确认里"形态还在、目标没到下标 0"的那一种：待办记下的形态就是
+    // 补写之前那份，所以回滚到它 = 我们那一次写没落位。
+    commit(E.p, E.host, [ref('mvs_a'), ref('mvs_b'), ref('mvs_c'), ref('mvs_new')]);
+    await tick(E); await tick(E); await tick(E); await tick(E);
+    check('24.10f 锁在场期间宿主静默回滚 4 趟，预算一格都没扣（failed=0、budget 满）',
+      E.p.api.autoState.failed === 0 && E.p.api.autoState.budget === E.p.api.autoMax,
+      `failed=${E.p.api.autoState.failed} budget=${E.p.api.autoState.budget}/${E.p.api.autoMax} `
+      + `reason=${E.p.api.autoState.lastReason} deferred=${E.p.api.autoState.deferred}`);
+    check('24.10f 锁在场期间让位计数照常（语义没被改坏）',
+      E.p.api.autoState.deferred >= 1, `deferred=${E.p.api.autoState.deferred}`);
+    check('24.10f 锁在场期间一次宿主写都没有发生',
+      E.host.calls.length === 1, `calls=${JSON.stringify(E.host.calls)}`);
+    E.p.api.lockView.id = '';                                 // 锁释放
+    await tick(E);
+    check('24.10g 锁释放后仍然能补（预算没被锁在场期间的那些趟吃掉）',
+      E.host.calls.length === 2
+      && JSON.stringify(E.host.calls[1]) === JSON.stringify(['mvs_new', true, 0])
+      && E.p.api.autoState.calls === 2,
+      `calls=${JSON.stringify(E.host.calls)} apiCalls=${E.p.api.autoState.calls} `
+      + `budget=${E.p.api.autoState.budget} reason=${E.p.api.autoState.lastReason}`);
+  } else {
+    check('24.10e 前置：自动到顶这一段在出厂里', false, E.why);
+  }
   // 闸被别人占着：零写。
   const B = autoPage({ page: { foreignTicket: Object.freeze({ held: 'other' }) } });
   if (B.ok) {
@@ -4173,6 +4283,25 @@ console.log('\n=== 26. 活动会话上浮：置顶项开始对话就补一次三
     applyBody.indexOf('topLockTick();') < applyBody.indexOf('topmostAutoTopTick(sharedTopmostCap)')
     && applyBody.indexOf('topmostAutoTopTick(sharedTopmostCap)') < applyBody.indexOf('pinnedPromoteTick(sharedTopmostCap, map)'),
     'chain');
+  // 让位必须排在【扣费】之前，两段都是。这一条测的是语句顺序本身：24.10f 测的是
+  // 行为，两条各管一半——顺序一旦被谁"顺手整理"回去，24.10f 会红，而这条会先红，
+  // 指向的位置也直接得多。
+  {
+    const autoAt = pageSrc.indexOf('  function topmostAutoTopTick(capIn) {');
+    const autoEnd = pageSrc.indexOf('\n  }\n', autoAt);
+    const autoBody = pageSrc.slice(autoAt, autoEnd < 0 ? autoAt : autoEnd);
+    const proAt = pageSrc.indexOf('  function pinnedPromoteTick(capIn, status) {');
+    const proEnd = pageSrc.indexOf('\n  }\n', proAt);
+    const proBody = pageSrc.slice(proAt, proEnd < 0 ? proAt : proEnd);
+    check('26.13a autoTop：锁顶让位判断排在第一次扣预算（topmostCharge）之前',
+      autoBody.indexOf('topmostLockView.id') >= 0
+      && autoBody.indexOf('topmostLockView.id') < autoBody.indexOf('topmostCharge('),
+      `lock=${autoBody.indexOf('topmostLockView.id')} charge=${autoBody.indexOf('topmostCharge(')}`);
+    check('26.13b promote：锁顶让位判断同样排在第一次扣预算之前',
+      proBody.indexOf('topmostLockView.id') >= 0
+      && proBody.indexOf('topmostLockView.id') < proBody.indexOf('topmostCharge('),
+      `lock=${proBody.indexOf('topmostLockView.id')} charge=${proBody.indexOf('topmostCharge(')}`);
+  }
   check('26.13 可观测：api.topmost().pinnedPromote 暴露与 autoTop 同风格的计数',
     /pinnedPromote: \{[\s\S]*?passes: promoteState\.passes,[\s\S]*?lastReason: promoteState\.lastReason,[\s\S]*?\}/.test(pageSrc)
     && /budgetMax: TOPMOST_PROMOTE_MAX,/.test(pageSrc), 'counters');

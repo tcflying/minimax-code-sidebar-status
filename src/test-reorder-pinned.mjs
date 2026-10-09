@@ -377,23 +377,33 @@ console.log('\n=== 2. D2 变更检测按真实顺序判定（无缓存键）==='
     labels(list).join(','));
 }
 {
-  // A root nested inside another root. The nested list is itself a candidate
-  // (its subtree contains rows) and the two roots are planned in the same pass
-  // against the DOM as it was when planning started, so what one pass does to
-  // the outer changes what the NEXT pass reads there. This fixture measures
-  // the real convergence cost instead of assuming it:
-  //   pass 1  the inner list is hoisted inside itself, and the outer hoists o3.
-  //           The outer still reads the inner list as a plain wrapper, because
-  //           its FIRST row (i1) carries no dot
-  //   pass 2  pass 1 put i2 (running) at the inner list's head, so from now on
-  //           the outer reads the inner list itself as a running wrapper and
-  //           hoists it to the outer's head
-  //   pass 3  both roots match their ideal -> alreadyOk, nothing moves
-  // What matters is not the tick count but the intermediate states: every one
-  // of them is a correct partial hoist, never a scramble, because the move
-  // loop is back-to-front and each root's ideal is derived from its own live
-  // children. Change detection is recomputed from those children on every
-  // pass, so nothing can lock a wrong state in the way a cached key would.
+  // A root nested inside another root.
+  //
+  // A12 (2026-10-09) changed what the outer root is allowed to CLAIM. It used
+  // to ask w.querySelector('[data-session-id]') and
+  // w.querySelector('[data-mmx-dot][data-mmx-bucket="running"]'), both of which
+  // answer from the whole SUBTREE. On this fixture that let the outer root reach
+  // three levels down, into the inner LIST's own wrapper, and answer "this
+  // wrapper is running" because a row belonging to a different list was running.
+  // Worse, the answer CHANGED underneath it: only after the inner list had
+  // hoisted its own i2 to its head did the outer start seeing the inner list as
+  // a running wrapper. That cascade is what this test used to measure -- pass 1
+  // moved two nodes, pass 2 moved one more, pass 3 merely confirmed -- and it is
+  // exactly the 跨行认领 defect: the outer moved a child for a state that was
+  // never its own, and only got it right by luck of the inner list's final order.
+  //
+  // The shipped query is now the direct-child form (':scope > ...'). The inner
+  // list has no session row among its DIRECT children -- its children are
+  // wrappers -- so the outer root no longer claims it at all and treats it the
+  // way it already treated a 'more' button: a non-row child that keeps its
+  // relative position. Each root then converges inside a SINGLE pass, because
+  // nothing one root does can change what another root reads.
+  //
+  // What still matters, and what is asserted below: every intermediate state is
+  // a correct partial hoist rather than a scramble (each root's ideal is derived
+  // from its own live children and the move loop runs back-to-front), the
+  // convergence is real rather than assumed, and nothing can lock a wrong state
+  // in the way a cached key would.
   const p = makePage();
   const inner = p.list([p.row('i1'), p.row('i2', 'running'), p.row('i3'), p.row('i4')]);
   const outer = p.dom.el('div', { class: 'space-y-px' },
@@ -409,15 +419,39 @@ console.log('\n=== 2. D2 变更检测按真实顺序判定（无缓存键）==='
     check(`D2.5 第 ${i + 1} 轮后外层仍是同一组子节点`,
       outerLabels().sort().join(',') === 'INNER,o1,o2,o3', outerLabels().join(','));
   }
-  check('D2.5 嵌套根需要多轮（实测 2 轮搬移 + 第 3 轮确认）',
+  // One moving pass (inner hoists i2, outer hoists o3), then both roots report
+  // alreadyOk forever after: the outer never re-decides anything from the
+  // inner's contents.
+  check('D2.5 直接子认领后单趟收敛（第 2 轮起 moved=0、两个根都已就位）',
     JSON.stringify(passes) === JSON.stringify([
-      { moved: 2, alreadyOk: 0 }, { moved: 2, alreadyOk: 1 }, { moved: 0, alreadyOk: 2 }, { moved: 0, alreadyOk: 2 },
+      { moved: 2, alreadyOk: 0 }, { moved: 0, alreadyOk: 2 }, { moved: 0, alreadyOk: 2 }, { moved: 0, alreadyOk: 2 },
     ]), JSON.stringify(passes));
-  check('D2.5 收敛后内外层都正确',
-    labels(inner)[0] === 'i2' && outerLabels().join(',') === 'o3,INNER,o1,o2',
+  check('D2.5 收敛后内外层都正确，嵌套列表留在原位（不因内层在跑而被外层顶上去）',
+    labels(inner)[0] === 'i2' && outerLabels().join(',') === 'o3,o1,INNER,o2',
     `outer=${outerLabels().join(',')} inner=${labels(inner).join(',')}`);
-  check('D2.5 第 3 轮起 moved=0：已收敛，且不会再动',
-    passes[2].moved === 0 && passes[3].moved === 0, JSON.stringify(passes.slice(2)));
+  check('D2.5 第 2 轮起 moved=0：已收敛，且不会再动',
+    passes[1].moved === 0 && passes[2].moved === 0 && passes[3].moved === 0,
+    JSON.stringify(passes.slice(1)));
+  // The claim itself, not just its consequence: the nested list is NOT hoisted
+  // by the outer root even once its own head row is running. Without this the
+  // assertions above would still pass on a build that had quietly gone back to
+  // claiming the inner list, just at a different tick count.
+  {
+    const q = makePage();
+    const nested = q.list([q.row('n1'), q.row('n2', 'running'), q.row('n3'), q.row('n4')]);
+    const host = q.dom.el('div', { class: 'space-y-px' },
+      [q.wrap(q.row('h1')), nested, q.wrap(q.row('h2')), q.wrap(q.row('h3'))]);
+    q.dom.root.appendChild(host);
+    const r = q.api.applyReorder();
+    const heads = host.children.map((c) => (c === nested ? 'INNER' : labels(c)[0])).join(',');
+    check('D2.5b 外层根不认领嵌套列表的"跑"（它的直接子里没有会话行）：外层顺序原封不动',
+      heads === 'h1,INNER,h2,h3', heads);
+    // moved=1 是【内层列表自己】把 n2 提到自己的头上，不是外层搬了谁。只有
+    // runningLists=1 才说得出这一点：两个根都规划过就应该是 2。
+    check('D2.5b 那一次搬移来自内层列表自己，外层没有规划任何搬移',
+      r.moved === 1 && r.runningLists === 1 && labels(nested)[0] === 'n2',
+      `${JSON.stringify(r)} innerHead=${labels(nested)[0]}`);
+  }
 }
 
 // ---------------------------------------------------------------------------

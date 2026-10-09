@@ -31,6 +31,21 @@
 //   s7  the click memory goes back to raw text equality, so it stops matching
 //       the restore's classifier in both directions
 //       -> "3.9 「展开其余 23 项」" and "3.10 会话行自己的「更多」" fail
+//   s8  A12: the dot claim goes back to a descendant search, so a row adopts or
+//       deletes a nested row's dot -> every "8.8a" and "8.8b" fails
+//   s9  A12: applyReorder claims a session row from anywhere under the wrapper,
+//       so a nested running session hoists its whole parent -> "8.8c" fails
+//   s10 unknownIds goes back to being a dead field (always 0)
+//       -> "8.9" fails
+//   s11 the dot takes its pointer events back, so the title it already carries
+//       can never reach a mouse -> "8.7" fails
+//   s12 apply() stops asking whether the signal is stale
+//       -> "8.10" and "8.10c" fail
+//   s13 A13 daemon side: the timestamp is published AFTER a.refresh() instead of
+//       before it -> "8.10d" fails
+//   s14 A13: the bootstrap timestamp's "> 0" guard goes away, so the shipped
+//       default of 0 is read as a real refresh time
+//       -> "8.10e" fails
 //
 //   node test-pinned-lifecycle.mjs
 //   MMX_MUTATE=<id> node test-pinned-lifecycle.mjs   # expected: FAILED
@@ -51,7 +66,7 @@ function check(name, ok, extra = '') {
   }
 }
 
-const pageSrc = fs.readFileSync(new URL('./lib/page-script.mjs', import.meta.url), 'utf8');
+let pageSrc = fs.readFileSync(new URL('./lib/page-script.mjs', import.meta.url), 'utf8');
 function sliceBlock(startAnchor, endAnchor) {
   const a = pageSrc.indexOf(startAnchor);
   const b = pageSrc.indexOf(endAnchor);
@@ -114,6 +129,53 @@ if (MUT === 's1') {
     `    var t = (b.textContent || '').trim();
     if (t === '更多' || t === 'More') rememberPinnedMore(true);
     else if (t === '收起' || t === 'Show less') rememberPinnedMore(false);`, 's7');
+} else if (MUT === 's8') {
+  // A12: the dot claim goes back to a descendant search. ensureDot and apply()
+  // then adopt (or, when the outer row has no bucket, DELETE) a dot that belongs
+  // to a session row NESTED inside this one.
+  pageSrc = pageSrc.replace(/querySelector\(':scope > \[' \+ MARK \+ '\]'\)/g,
+    "querySelector('[' + MARK + ']')");
+  if (!/querySelector\(':scope > /.test(pageSrc)) throw new Error('mutation s8 anchor not found');
+} else if (MUT === 's9') {
+  // A12, the other half: applyReorder goes back to claiming a session row from
+  // anywhere under the wrapper, so a wrapper whose OWN session is idle gets
+  // hoisted because a nested session is running.
+  const rowAnchor = "w.querySelector(':scope > [data-session-id]')";
+  if (pageSrc.split(rowAnchor).length - 1 !== 1) throw new Error('mutation s9 anchor not unique');
+  pageSrc = pageSrc.replace(rowAnchor, "w.querySelector('[data-session-id]')")
+    .replace(/row\.querySelector\(':scope > \[' \+ MARK \+ '\]\[data-mmx-bucket="/g,
+      "row.querySelector('[' + MARK + '][data-mmx-bucket=\"");
+} else if (MUT === 's10') {
+  // unknownIds goes back to being a dead field: always 0, so a row the module
+  // cannot resolve reads as a row with nothing wrong with it.
+  pageSrc = mutate(pageSrc, 'else if (map[id] === undefined) stats.unknownIds++;', '', 's10');
+} else if (MUT === 's11') {
+  // The dot takes its pointer events back. title stays on the node, so the
+  // semantic text is still there -- and still unreachable by a mouse.
+  pageSrc = mutate(pageSrc, "'  pointer-events:auto;cursor:help;',", "'  pointer-events:none;',", 's11');
+} else if (MUT === 's12') {
+  // A13: apply() stops asking whether the signal is stale, so a dead daemon
+  // leaves a page that looks exactly as healthy as a live one.
+  pageSrc = mutate(pageSrc, '    updateStaleNote(Date.now() - lastRefreshAt);', '', 's12');
+} else if (MUT === 's13') {
+  // A13, daemon side: the server timestamp is published AFTER a.refresh()
+  // instead of before it. Subtle because it still compiles and still runs --
+  // the page simply never sees the timestamp that belongs to THIS tick, only the
+  // one from the previous tick, so the age reported to the user is off by one
+  // whole interval and a fresh signal can look like a stale one.
+  pageSrc = mutate(pageSrc, 'try{a.__sentAt=Date.now();}catch(e){}', '', 's13')
+    .replace('return {ok:true,stats:a.refresh(', 'var __r=a.refresh(')
+    .replace('),topmost:a.topmost()', ');a.__sentAt=Date.now();return {ok:true,stats:__r,topmost:a.topmost()');
+  if (/try\{a\.__sentAt=Date\.now\(\);\}catch\(e\)\{\}/.test(pageSrc)) throw new Error('mutation s13 did not move the write');
+} else if (MUT === 's14') {
+  // A13: the '> 0' guard on the bootstrap timestamp goes away, so the shipped
+  // default of 0 is accepted as a real refresh time. Every caller that does NOT
+  // come from the daemon (debug-guard, verify-*, the offline suites) then starts
+  // life believing the last refresh happened in 1970 and shows a permanent,
+  // fabricated "signal N seconds out of date".
+  pageSrc = mutate(pageSrc,
+    "typeof cfg.sentAt === 'number' && isFinite(cfg.sentAt) && cfg.sentAt > 0",
+    "typeof cfg.sentAt === 'number' && isFinite(cfg.sentAt)", 's14');
 } else if (MUT) {
   throw new Error('unknown MMX_MUTATE=' + MUT);
 }
@@ -674,7 +736,12 @@ console.log('\n=== 8. 状态点语义：aria / 图例 / 汇总去重 ===');
   // which is exactly what the pinned section produces. No row is a descendant
   // of the other, so per-row painting and per-session counting cannot be
   // confused for one another here.
-  function boot(statusMap, ids, cfgExtra = {}) {
+  //
+  // `clock` is a fake Date for the sections that need to move time (8.10). It is
+  // threaded in as a factory PARAMETER rather than patched onto globalThis, so
+  // two boots in one process cannot see each other's clock, and a section that
+  // passes none still gets the real Date and therefore real time.
+  function boot(statusMap, ids, cfgExtra = {}, clock = null) {
     const dom = makeDom();
     dom.document.addEventListener = () => {};
     dom.document.removeEventListener = () => {};
@@ -705,11 +772,11 @@ console.log('\n=== 8. 状态点语义：aria / 图例 / 汇总去重 ===');
       activeBg: 'rgba(10, 10, 10, 0.10)', activeBgHover: 'rgba(10, 10, 10, 0.14)',
       activeBar: 'rgba(0, 148, 252, 0.90)', status: statusMap, ...cfgExtra };
     const factory = new Function('window', 'document', 'MutationObserver',
-      'requestAnimationFrame', 'cancelAnimationFrame', 'getComputedStyle', 'localStorage', 'CSS',
+      'requestAnimationFrame', 'cancelAnimationFrame', 'getComputedStyle', 'localStorage', 'CSS', 'Date',
       'return (' + PAGE_FN_SRC + ')(' + JSON.stringify(cfg) + ');');
     const result = factory(win, dom.document, FakeMO, win.requestAnimationFrame,
       win.cancelAnimationFrame, () => ({ position: 'relative' }), win.localStorage,
-      { escape: (x) => String(x) });
+      { escape: (x) => String(x) }, clock || Date);
     return { dom, rows, api: win.__mmxStatus, result };
   }
 
@@ -819,6 +886,341 @@ console.log('\n=== 8. 状态点语义：aria / 图例 / 汇总去重 ===');
     // label together -- a legend must not be able to eat either one.
     check('8.6 计数文字没被改', bar.children[1].textContent === '1 个运行中',
       `got=${JSON.stringify(bar.children[1].textContent)}`);
+  }
+
+  // ---- 8.7 状态点的悬停语义（pointer-events）----
+  //
+  // ensureDot 早就在 dot 上写了 title（8.3 已钉住），但基础 dot 规则写着
+  // pointer-events:none —— 那个属性让元素【收不到指针事件】，浏览器于是既不弹
+  // title 也不给 cursor。语义其实一直在那儿，只是永远到不了鼠标。
+  {
+    const { dom } = boot({ mvs_dup: 'running' }, [['list', 'mvs_dup']]);
+    const style = dom.getElementById('mmx-status-style');
+    check('8.7 前置：自有样式表挂上了', !!style, 'style=' + !!style);
+    const css = String(style ? style.textContent : '');
+    // 只取【基础】dot 规则那一段：'[data-mmx-dot]{...}'。后面的
+    // [data-mmx-dot][data-mmx-bucket=...] 各自是分桶覆盖，不含 pointer-events，
+    // 混进来会让"规则段内不再含 pointer-events:none"这句话测不到点上。
+    const base = (css.match(/\[data-mmx-dot\]\{([^}]*)\}/) || [])[1];
+    check('8.7 前置：基础 dot 规则切到了', typeof base === 'string', JSON.stringify(base));
+    check('8.7 基础 dot 规则收指针事件（title 才可能弹出来）',
+      /pointer-events\s*:\s*auto/.test(String(base)), JSON.stringify(base));
+    check('8.7 基础 dot 规则不再把指针事件关掉',
+      !/pointer-events\s*:\s*none/.test(String(base)), JSON.stringify(base));
+    check('8.7 基础 dot 规则给了 cursor:help（鼠标停上去是个可问号）',
+      /cursor\s*:\s*help/.test(String(base)), JSON.stringify(base));
+    // 风险自查：这一段改动不得顺带改掉别的规则。红锁按钮与宿主的原生按钮各自是
+    // 独立元素、各有各的规则，dot 收事件不会经过它们；下面两条把"没被顺带改掉"
+    // 钉死，免得有人日后用"全局 pointer-events"去修它。
+    const lockCss = (pageSrc.match(/\.mmx-toplock-btn\{[^}]*\}/) || [])[0] || '';
+    check('8.7 红锁按钮规则仍是 pointer-events:auto + cursor:pointer（没被顺带改）',
+      /pointer-events\s*:\s*auto/.test(lockCss) && /cursor\s*:\s*pointer/.test(lockCss),
+      JSON.stringify(lockCss.slice(0, 60)));
+    const glyphCss = (pageSrc.match(/\.mmx-toplock-glyph\{[^}]*\}/) || [])[0] || '';
+    check('8.7 锁的 SVG 字形仍是 pointer-events:none（事件落在按钮上，不是字形上）',
+      /pointer-events\s*:\s*none/.test(glyphCss), JSON.stringify(glyphCss.slice(0, 60)));
+    // 汇总条那一条 pointer-events:none 是【刻意】的：它压在置顶区头上，收事件
+    // 就意味着挡住用户点置顶区里的任何一行。这里不动它。
+    const barCss = (css.match(/#mmx-running-summary\{([^}]*)\}/) || [])[1] || '';
+    check('8.7 汇总条仍然 pointer-events:none（不挡住置顶区的点击，这是刻意的）',
+      /pointer-events\s*:\s*none/.test(barCss), JSON.stringify(barCss.slice(-60)));
+  }
+
+  // ---- 8.8 A12：嵌套会话行不得被外层行认领 ----
+  //
+  // 症状：会话行里再套一层会话行时（宿主折叠/分组展开时会出现），外层行用
+  // row.querySelector('[data-mmx-dot]') 找点 —— 那个查询返回【子树里第一个】，
+  // 于是认领了内层行的点：内层的点被摘掉或被刷成外层的桶，外层自己反而没有点；
+  // applyReorder 同理，w.querySelector('[data-session-id]') 会把 wrapper 里
+  // 嵌套的那一行当成"本行的行"，把不该上浮的 wrapper 顶到列表头上。
+  // 修法是直接子查询 ':scope > ...'：w 的直接子才是本行 wrapper 的行，嵌套的
+  // session 行不得被外层认领。Chrome 27+ 起 querySelector 支持 :scope。
+  {
+    // ---- 前置：fake-dom 自己认得 :scope > ----
+    // 这一条测的是【测试台】，不是产品：如果 fake-dom 把 :scope > 退化成普通
+    // 后代查询，下面每一条断言都会"因为台子错了"而不是"因为产品错了"而变绿。
+    {
+      const d = makeDom();
+      const o = d.el('div', { 'data-session-id': 'mvs_out' });
+      const inner = d.el('div', { 'data-session-id': 'mvs_in' });
+      const dot = d.el('span', { 'data-mmx-dot': '1' });
+      inner.appendChild(dot);
+      o.appendChild(d.el('button', { type: 'button' }));
+      o.appendChild(inner);
+      const w = d.el('div', {});
+      w.appendChild(o);
+      d.root.appendChild(w);
+      check('8.8 前置：fake-dom 的 :scope > 只认直接子（不是子树第一个）',
+        o.querySelector(':scope > [data-mmx-dot]') === null
+        && inner.querySelector(':scope > [data-mmx-dot]') === dot
+        && o.querySelector('[data-mmx-dot]') === dot
+        && w.querySelector(':scope > [data-session-id]') === o
+        && w.querySelector('[data-session-id]') === o,
+        'outer:scope>dot=' + o.querySelector(':scope > [data-mmx-dot]'));
+    }
+
+    // ---- 8.8a 夹具：列表里三个普通 wrapper + 一个【内含嵌套行】的 wrapper ----
+    // list 的直接子全是 wrapper（这才是 findListRoots 认出来的列表形状）；只有
+    // 最后一个 wrapper 的行里还嵌着一行会话行，那一行自己带一颗 running 的点。
+    function bootNested(statusMap, cfgExtra = {}) {
+      const dom = makeDom();
+      dom.document.addEventListener = () => {};
+      dom.document.removeEventListener = () => {};
+      const sec = dom.el('div', { 'data-pinned-section': 'true' });
+      sec.appendChild(dom.el('div', { class: 'h-[30px] flex' }));
+      dom.root.appendChild(sec);
+      const list = dom.el('div', { class: 'space-y-px' });
+      dom.root.appendChild(list);
+      const mkRow = (id) => {
+        const r = dom.el('div', { 'data-session-id': id });
+        r.appendChild(dom.el('button', { type: 'button' }, ['会话']));
+        return r;
+      };
+      const wrappers = [];
+      for (const id of ['mvs_a', 'mvs_b', 'mvs_c']) {
+        const w2 = dom.el('div', { class: 'group relative' });
+        w2.appendChild(mkRow(id));
+        list.appendChild(w2);
+        wrappers.push(w2);
+      }
+      // 嵌套的那个：wrapper > 外层行 > 内层行 > dot
+      const wN = dom.el('div', { class: 'group relative' });
+      const outerRow = mkRow('mvs_out');
+      const innerRow = mkRow('mvs_in');
+      outerRow.appendChild(innerRow);
+      wN.appendChild(outerRow);
+      list.appendChild(wN);
+      wrappers.push(wN);
+
+      class FakeMO { observe() {} disconnect() {} }
+      const win = {
+        setTimeout: () => 1, clearTimeout: () => {}, setInterval: () => 2, clearInterval: () => {},
+        requestAnimationFrame: () => 0, cancelAnimationFrame: () => {},
+        addEventListener: () => {}, removeEventListener: () => {},
+        localStorage: makeStorage({}),
+      };
+      const cfg = { mark: 'data-mmx-dot', styleId: 'mmx-status-style', global: '__mmxStatus',
+        summaryId: 'mmx-running-summary', offsetX: 4, intervalMs: 3000, scope: '', showDone: false,
+        collapseOnStart: true, reorder: true,
+        activeBg: 'rgba(10, 10, 10, 0.10)', activeBgHover: 'rgba(10, 10, 10, 0.14)',
+        activeBar: 'rgba(0, 148, 252, 0.90)', status: statusMap, ...cfgExtra };
+      const factory = new Function('window', 'document', 'MutationObserver',
+        'requestAnimationFrame', 'cancelAnimationFrame', 'getComputedStyle', 'localStorage', 'CSS',
+        'return (' + PAGE_FN_SRC + ')(' + JSON.stringify(cfg) + ');');
+      const result = factory(win, dom.document, FakeMO, win.requestAnimationFrame,
+        win.cancelAnimationFrame, () => ({ position: 'relative' }), win.localStorage,
+        { escape: (x) => String(x) });
+      return { dom, list, wrappers, outerRow, innerRow, api: win.__mmxStatus, result };
+    }
+
+    // 8.8a 外层行【没有桶】：它绝不能顺手摘掉内层行的点。
+    {
+      const n = bootNested({ mvs_in: 'running' });
+      const innerDot = n.innerRow.querySelector(':scope > [data-mmx-dot]');
+      check('8.8a 前置：内层行确实拿到了自己的 running 点', !!innerDot,
+        'innerDot=' + !!innerDot);
+      const st = n.api.refresh({ mvs_in: 'running' });
+      check('8.8a 无桶的外层行不会摘掉内层行的点（removed=0）',
+        st.removed === 0, `removed=${st.removed} rows=${st.rows}`);
+      check('8.8a 内层行的点还在，且仍是自己那颗 running',
+        n.innerRow.querySelector(':scope > [data-mmx-dot]') === innerDot
+        && innerDot.getAttribute('data-mmx-bucket') === 'running',
+        `survives=${n.innerRow.querySelector(':scope > [data-mmx-dot]') === innerDot} `
+        + `bucket=${innerDot.getAttribute('data-mmx-bucket')}`);
+      check('8.8a 外层行仍然没有点（它没有桶）',
+        n.outerRow.querySelector(':scope > [data-mmx-dot]') === null);
+    }
+
+    // 8.8b 外层行【有桶】：它画自己的点，不认领内层那颗。
+    {
+      const n = bootNested({ mvs_in: 'running' });
+      const innerDot = n.innerRow.querySelector(':scope > [data-mmx-dot]');
+      const st = n.api.refresh({ mvs_out: 'paused', mvs_in: 'running' });
+      const outerDot = n.outerRow.querySelector(':scope > [data-mmx-dot]');
+      check('8.8b 外层行画出自己的点（不是空的）', !!outerDot, 'outerDot=' + !!outerDot);
+      check('8.8b 外层的点与内层的点是两个不同节点',
+        !!outerDot && outerDot !== innerDot, 'same=' + (outerDot === innerDot));
+      check('8.8b 外层的桶是它自己的 paused，内层的仍是 running',
+        !!outerDot && outerDot.getAttribute('data-mmx-bucket') === 'paused'
+        && innerDot.getAttribute('data-mmx-bucket') === 'running',
+        `outer=${outerDot && outerDot.getAttribute('data-mmx-bucket')} `
+        + `inner=${innerDot.getAttribute('data-mmx-bucket')}`);
+      check('8.8b 一趟只新画一颗点（外层那一次；内层换桶没有发生）',
+        st.painted === 1, `painted=${st.painted}`);
+    }
+
+    // 8.8c applyReorder：wrapper 里的嵌套行不得被当成"本 wrapper 的行"。
+    // 旧查询 w.querySelector('[data-session-id]') 会捡到嵌套的内层行，再往下
+    // 问那颗 running 的点，于是把整个 wrapper 顶到列表头——外层会话自己并没有在
+    // 跑，动的却是别人的父级。
+    //
+    // 两行【都有】桶是这里的关键：只要外层行没有桶，apply() 就会先把它误认的那颗
+    // 内层点摘掉，等 applyReorder 跑到时已经无点可问，这条断言就会因为"另一处
+    // 的缺陷顺手掩盖了它"而变绿——测的就不再是认领，而是认领之后有没有被擦掉。
+    {
+      const both = { mvs_out: 'paused', mvs_in: 'running' };
+      const n = bootNested(both);
+      check('8.8c 前置：内层的 running 点确实在树上（这一趟没人摘它）',
+        !!n.innerRow.querySelector(':scope > [data-mmx-dot][data-mmx-bucket="running"]'),
+        'innerRunning=' + !!n.innerRow.querySelector(':scope > [data-mmx-dot][data-mmx-bucket="running"]'));
+      // 判定读 initial：boot() 自己就跑了一趟 apply()，那【就是】这一趟 applyReorder
+      // 第一次动手的时刻。读后续 refresh 的话，它只会报 alreadyOk（上一趟已经
+      // 动过了，或者根本没动过），测不到"会不会动"。
+      check('8.8c 嵌套行不得让它的 wrapper 被上浮（initial moved=0）',
+        n.result.initial.reorder && n.result.initial.reorder.moved === 0,
+        JSON.stringify(n.result.initial.reorder));
+      check('8.8c 列表头一个 wrapper 仍是普通那一个，不是嵌套那一个',
+        n.list.children[0] !== n.wrappers[3],
+        'head=' + n.list.children.indexOf(n.wrappers[3]));
+      // 再刷新一趟：如果第一趟真的动过（缺陷），第二趟就会报 alreadyOk，
+      // 顺序也已经错了；两条一起才把"没动过"钉死。
+      const st = n.api.refresh(both);
+      check('8.8c 后续刷新同样不把它上浮',
+        st.reorder && st.reorder.moved === 0 && n.list.children[0] !== n.wrappers[3],
+        JSON.stringify(st.reorder) + ' head=' + n.list.children.indexOf(n.wrappers[3]));
+    }
+  }
+
+  // ---- 8.9 unknownIds：曾经恒为 0 的死字段 ----
+  //
+  // stats 里一直带着 unknownIds，却从来没有一行代码给它 +1。它本来要回答的
+  // 是"这一行挂着的会话 id，本地和云端两处都答不上来"——也就是"这一行我们
+  // 什么都不画，而用户看不出为什么"。恒为 0 时，daemon 日志里这个数字永远
+  // 干净，一个真的对不上的 id 就这样被统计成"没有异常的行"。
+  {
+    const { result } = boot({ mvs_a: 'running' }, [['list', 'mvs_a'], ['list', 'mvs_ghost']]);
+    check('8.9 认不出的 id 被计一次（现出厂恒为 0）',
+      result.initial.unknownIds === 1,
+      `unknownIds=${result.initial.unknownIds} rows=${result.initial.rows}`);
+  }
+  {
+    // 反向：认得出的行一个都不许多算——包括同 id 出现在两行上的那种（8.1 的
+    // 置顶副本 + 列表副本），重复出现不是"认不出"。
+    const { result } = boot({ mvs_a: 'running', mvs_b: 'waiting' },
+      [['pinned', 'mvs_a'], ['list', 'mvs_a'], ['list', 'mvs_b']]);
+    check('8.9b 全部认得出的行 unknownIds=0', result.initial.unknownIds === 0,
+      `unknownIds=${result.initial.unknownIds} rows=${result.initial.rows}`);
+  }
+  {
+    // done 是 opt-in：cfg.status 里【有】这个 id，只是这一趟被 showDone 挡掉
+    // 了没画点。这不是"认不出"，用它来冒充 unknown 会让这个计数变成"没画点的
+    // 行数"，而那件事 stats.matched / stats.painted 已经说得更准了。
+    const { result } = boot({ mvs_a: 'running', mvs_d: 'done' },
+      [['list', 'mvs_a'], ['list', 'mvs_d']], { showDone: false });
+    check('8.9c 被 showDone 挡掉的 done 不算 unknown（它认得出，只是没画）',
+      result.initial.unknownIds === 0 && result.initial.matched === 1,
+      `unknownIds=${result.initial.unknownIds} matched=${result.initial.matched}`);
+  }
+
+  // ---- 8.10 A13：daemon 掉线时汇总条的过期标注 ----
+  //
+  // daemon 每 2500ms 调一次 refresh。它死了、或者 evaluateWithRetry 一直失败
+  // 时，页面【什么都不会变】：点还是绿的、数字还是对的，只是它们已经过期了。
+  // 用户分不出"这一分钟没有会话在跑"和"我已经三分钟没收到信号了"。
+  // 这里只【标注】，绝不删点、绝不改色、绝不撤回任何宿主 DOM：过期的点仍然是
+  // 宿主最后一次告诉我们的样子，只是旁边多一句"这是 N 秒前的"。刷新一恢复，
+  // 后缀自动摘掉。
+  {
+    let T = 1000000;
+    const clock = { now: () => T };
+    const st = { mvs_a: 'running' };
+    const n = boot(st, [['list', 'mvs_a']], {}, clock);
+    const bar = n.dom.getElementById('mmx-running-summary');
+    const baseAria = String(bar.getAttribute('aria-label') || '');
+    check('8.10 前置：汇总条建出来了', !!bar);
+    check('8.10 前置：刚启动时没有过期后缀',
+      !/未更新/.test(bar.textContent) && !/数据可能过期/.test(baseAria),
+      JSON.stringify(bar.textContent));
+    // 出厂默认 sentAt=0 必须被读成"没有"，而不是"1970 年刷新过一次"。
+    // 少了这一条，所有不带 daemon 的调用方（debug-guard / verify-* / 离线套件）
+    // 一上来就永远挂着一条假的过期提示。
+    {
+      let T0 = 500000;
+      const z = boot({ mvs_a: 'running' }, [['list', 'mvs_a']], { sentAt: 0 },
+        { now: () => T0 });
+      const zbar = z.dom.getElementById('mmx-running-summary');
+      check('8.10e 出厂默认 sentAt=0 不会被读成"1970 年刷新过"（不假装过期）',
+        !/未更新/.test(zbar.textContent)
+        && !/数据可能过期/.test(String(zbar.getAttribute('aria-label'))),
+        JSON.stringify(zbar.textContent));
+      const y = boot({ mvs_a: 'running' }, [['list', 'mvs_a']], { sentAt: T0 },
+        { now: () => T0 + 20000 });
+      const ybar = y.dom.getElementById('mmx-running-summary');
+      check('8.10f cfg.sentAt 真的被采信（20s 后那条注入就过期了）',
+        /· 信号 20s 未更新/.test(ybar.textContent), JSON.stringify(ybar.textContent));
+    }
+    // 阈值内：14.9s 仍然不算过期。边界取的是"严格大于"，所以 15s 整也不算。
+    T += 14999;
+    n.api.apply();
+    check('8.10 阈值内（14.9s）不显示', !/未更新/.test(bar.textContent),
+      JSON.stringify(bar.textContent));
+    T += 1;
+    n.api.apply();
+    check('8.10 恰好 15s 仍不显示（阈值是严格大于）', !/未更新/.test(bar.textContent),
+      JSON.stringify(bar.textContent));
+    // 越过阈值。
+    T += 1000;
+    n.api.apply();
+    check('8.10 16s 后出现后缀「· 信号 16s 未更新」',
+      /· 信号 16s 未更新/.test(bar.textContent), JSON.stringify(bar.textContent));
+    check('8.10 后缀期间 aria-label 追加「数据可能过期」',
+      /数据可能过期/.test(String(bar.getAttribute('aria-label'))),
+      String(bar.getAttribute('aria-label')));
+    check('8.10 后缀是加在文本上的，不是加了一个子节点（分段数仍是 3）',
+      bar.children.length === 3, `children=${bar.children.length}`);
+    check('8.10 只标注，不动宿主那一份：点还在，桶没变',
+      !!n.rows['mvs_a@list'].querySelector(':scope > [data-mmx-dot][data-mmx-bucket="running"]'),
+      'dotGone');
+    check('8.10 计数文字本身没被后缀吃掉',
+      bar.children[1].textContent === '1 个运行中', JSON.stringify(bar.children[1].textContent));
+    // 服务器时间路径：daemon 在调 refresh 之前把时间写在 api.__sentAt 上，
+    // 页面读一次就清掉。这一条断言的是【写进去就能生效】，不是页面自己
+    // 猜的 now()——两者在真机上同钟同刻，但在别的宿主里不保证。
+    T += 20000;
+    n.api.__sentAt = T;
+    n.api.apply();
+    check('8.10b 读到 api.__sentAt 后后缀消失（刷新恢复即自动摘除）',
+      !/未更新/.test(bar.textContent), JSON.stringify(bar.textContent));
+    check('8.10b aria-label 恢复成原始那句（没有残留的过期说明）',
+      String(bar.getAttribute('aria-label')) === baseAria,
+      String(bar.getAttribute('aria-label')));
+    check('8.10b __sentAt 被消费掉了（否则下一趟会拿同一个旧时间戳当新鲜）',
+      !n.api.__sentAt, 'sentAt=' + n.api.__sentAt);
+    // 消费之后再不刷新，16s 后又该出现——这一趟证明的是"真的在跟着时间走"。
+    T += 16000;
+    n.api.apply();
+    check('8.10c 消费之后不再刷新，16s 后后缀重新出现',
+      /· 信号 16s 未更新/.test(bar.textContent), JSON.stringify(bar.textContent));
+  }
+
+  // ---- 8.10d daemon 侧的表达式：必须在 refresh 之前写入时间戳 ----
+  //
+  // 页面上写的那一半只有在 daemon 真的在调 refresh 之前写了时间戳时才有用。
+  // 这一段把出厂的 buildRefreshExpression 【切出来编译并执行】一遍，在一个假
+  // window 上记录调用顺序，而不是去 grep 那串字符、也不是直接 import 那个函数
+  // ——import 进来的是模块作用域里的那份，测试里的任何变异都改不到它，于是这条
+  // 断言会永远绿。切出来的那份与 pageScript 同源，s13 变异的就是它。
+  {
+    const refreshFnSrc = sliceBlock('export function buildRefreshExpression(statusMap) {',
+      'export function buildDisposeExpression() {').replace('export function', 'function');
+    const refreshFn = new Function('GLOBAL', refreshFnSrc + '\nreturn buildRefreshExpression;')('__mmxStatus');
+    const expr = refreshFn({ mvs_a: 'running' });
+    const order = [];
+    const fakeWindow = { __mmxStatus: null };
+    fakeWindow.__mmxStatus = {
+      refresh: function (m) {
+        order.push(['refresh', JSON.stringify(m), fakeWindow.__mmxStatus.__sentAt]);
+        return { rows: 1 };
+      },
+      topmost: function () { order.push(['topmost']); return {}; },
+      topmostDiag: function () { order.push(['diag']); return {}; },
+    };
+    const ran = new Function('window', 'Date', 'return ' + expr + ';')(fakeWindow, { now: () => 424242 });
+    check('8.10d refresh 表达式跑得通并返回 stats',
+      ran && ran.ok === true && ran.stats && ran.stats.rows === 1, JSON.stringify(ran));
+    check('8.10d daemon 的时间戳在 refresh 【之前】写进了 api 对象',
+      order.length > 0 && order[0][0] === 'refresh' && order[0][2] === 424242,
+      JSON.stringify(order));
   }
 }
 

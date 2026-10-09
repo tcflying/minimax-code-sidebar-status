@@ -165,6 +165,86 @@ export function matches(node, sel) {
   return parseSelector(sel).some((s) => matchesSimple(node, s));
 }
 
+// --------------------------------------------------------------------------
+// :scope > / combinators. ADDITIVE ONLY.
+//
+// The shipped page asks for `:scope > [data-mmx-dot]` so a row never adopts (or
+// removes) a dot that belongs to a session row NESTED inside it. Without this,
+// querySelector would answer "the first match anywhere below me", which is the
+// pre-fix behaviour and would make a nested-row assertion test the fake.
+//
+// Design note: a selector that is a SINGLE compound with no :scope still takes
+// exactly the path it always took (parseSimple + matchesSimple over the flat
+// descendant list). Only a selector that actually carries a combinator or a
+// :scope is tokenised into a chain and walked, so no existing suite can change
+// behaviour because of this.
+// --------------------------------------------------------------------------
+
+function parseCompound(tok) {
+  if (tok === ':scope') return { tag: null, id: null, classes: [], attrs: [], scope: true };
+  return parseSimple(tok);
+}
+
+function tokenizeChain(part) {
+  const norm = String(part).trim().replace(/\s*>\s*/g, ' > ');
+  const toks = norm.split(/\s+/).filter(Boolean);
+  const sels = [];
+  const combs = [];
+  let pending = null;
+  for (const t of toks) {
+    if (t === '>') { pending = '>'; continue; }
+    sels.push(parseCompound(t));
+    if (pending) { combs.push(pending); pending = null; }
+  }
+  // A dangling combinator ('a >') means the selector is malformed; fall back to
+  // the legacy shape rather than pretending it matched nothing meaningful.
+  if (!sels.length || pending) return null;
+  return { sels, combs };
+}
+
+// Same comma split as parseSelector, but each part may be a chain.
+function parseSelectorAny(sel) {
+  return String(sel)
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((s) => {
+      const chain = tokenizeChain(s);
+      return chain ? chain : parseSimple(s);
+    });
+}
+
+function partMatches(scope, node, simple) {
+  if (!node || node.nodeType !== 1) return false;
+  if (simple.scope) return node === scope;
+  return matchesSimple(node, simple);
+}
+
+function matchChain(scope, node, sels, combs) {
+  const last = sels.length - 1;
+  let cur = node;
+  if (!partMatches(scope, cur, sels[last])) return false;
+  for (let k = last - 1; k >= 0; k--) {
+    if (combs[k] === '>') {
+      cur = cur.parentElement;
+      if (!partMatches(scope, cur, sels[k])) return false;
+    } else {
+      // Descendant: some ancestor, and the walk stops at the scope root the way
+      // a real engine's does -- `:scope` may never match an ancestor of itself.
+      let a = cur.parentElement;
+      let hit = null;
+      while (a) {
+        if (partMatches(scope, a, sels[k])) { hit = a; break; }
+        if (a === scope) break;
+        a = a.parentElement;
+      }
+      if (!hit) return false;
+      cur = hit;
+    }
+  }
+  return true;
+}
+
 class FakeNode {
   constructor(tag) {
     this.nodeType = 1;
@@ -323,8 +403,20 @@ class FakeNode {
     return out;
   }
   querySelectorAll(sel) {
-    const parts = parseSelector(sel);
-    return this.descendants().filter((n) => parts.some((s) => matchesSimple(n, s)));
+    const parts = parseSelectorAny(sel);
+    const chains = parts.filter((p) => p.combs);
+    if (!chains.length) {
+      // The legacy path, byte for byte: every suite that never asked for a
+      // combinator lands here and cannot be affected by the chain walker.
+      return this.descendants().filter((n) => parts.some((s) => matchesSimple(n, s)));
+    }
+    const flats = parts.filter((p) => !p.combs);
+    // Document order, because the candidate list is walked once and every chain
+    // is tested against each candidate in turn -- the same order a real engine
+    // reports, which is what querySelector()[0] depends on.
+    return this.descendants().filter((n) =>
+      chains.some((c) => matchChain(this, n, c.sels, c.combs))
+      || flats.some((s) => matchesSimple(n, s)));
   }
   querySelector(sel) {
     return this.querySelectorAll(sel)[0] || null;
@@ -399,6 +491,12 @@ class FakeText {
   }
   get textContent() {
     return this.data;
+  }
+  // A real Text node is a ChildNode, so it has remove() just like an element
+  // does. Added for the A13 stale-note text node, which the page retires with
+  // node.remove() rather than the banned parent.removeChild(node).
+  remove() {
+    if (this.parentElement) this.parentElement.removeChild(this);
   }
 }
 

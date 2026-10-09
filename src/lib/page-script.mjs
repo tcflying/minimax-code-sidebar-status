@@ -43,6 +43,20 @@ function __mmxStatusMain(cfg) {
   var mount = mountPoint(15000);
   if (!mount) return { ok: false, reason: 'no-document-body' };
 
+  // A13: 最后一次【服务器】刷新进入本页面的时刻。
+  //
+  // daemon 每 intervalMs 调一次 a.refresh()。它掉线时页面什么都不会变，而"没变"
+  // 恰恰是最有欺骗性的那种状态：点还是绿的、数字还是对的，只是它们已经过期了。
+  // 所以这一趟要有一个能被问出来的时间戳。
+  //
+  // 初始化取 daemon 随 cfg 送来的 sentAt，没有【可用的】就退回注入那一刻的页面
+  // 时间。> 0 这个条件是承重的：出厂默认是 sentAt: 0，而 0 是一个合法的数字，
+  // 只判 typeof/isFinite 会让所有没有 daemon 的调用方（debug-guard、verify-*、
+  // 离线套件）把 lastRefreshAt 钉在 1970，于是汇总条一上来就永远写着"信号 N 秒
+  // 未更新"——一个假的过期提示比没有提示更糟。
+  var lastRefreshAt = (typeof cfg.sentAt === 'number' && isFinite(cfg.sentAt) && cfg.sentAt > 0)
+    ? cfg.sentAt : Date.now();
+
   // ---------- styles ----------
   var style = document.getElementById(cfg.styleId);
   if (!style) {
@@ -59,7 +73,28 @@ function __mmxStatusMain(cfg) {
       '  top:50%;',
       '  transform:translateY(-50%);',
       '  width:6px;height:6px;border-radius:9999px;',
-      '  pointer-events:none;',
+      // pointer-events:auto + cursor:help：让已经写在 dot 上的 title 真的弹得
+      // 出来，并给一个"这里可以问"的指针。ensureDot 一直写 title 与 aria-label
+      // （8.3 钉住），pointer-events:none 会让元素收不到指针事件，于是语义一直
+      // 在、却永远到不了鼠标——颜色之外那句"人能读的话"对视觉用户是死的。
+      //
+      // 遮挡面（几何事实，不是"零风险"）：
+      //   1. 点只有 6px×6px，error 桶 8px×8px，running 桶是 4px 宽的竖条，且
+      //      绝对定位在行内左缘 left:cfg.offsetX（默认 4px）处，全部落在行首那
+      //      一小块空白里，不是铺在行中央。
+      //   2. dot 开 pointer-events 后命中测试更深，会【截获】它压住的那条带子：
+      //      默认 offsetX=4、running 桶 4px 宽，行首 x∈[4,8) 落在宿主 button 铺满
+      //      行宽后的 padding 内——那 4px 条带原本点得到会话，现在由 dot 接走。
+      //      兄弟节点并非"不互相遮挡"：只有同为 pointer-events:none 才互不干扰。
+      //   3. 红色悬停锁顶按钮是【另一个独立元素】（.mmx-toplock-btn），它自己
+      //      的规则仍是 pointer-events:auto + cursor:pointer，我们没有、也不会
+      //      在这里改它；宿主自己的按钮同样各自独立。
+      //   4. 汇总条那一条 pointer-events:none 是刻意的（压在置顶区头上会挡住点
+      //      击），不在本规则内，也不受本次改动影响。
+      // 代价与收益：dot 开启 pointer-events 以显示 title；代价是行首约 4px 条带的
+      // 点击会被 dot 截获（影响：按钮标题自 x=8 起不受影响；选中该会话请点行中部）。
+      // 悬停语义的可见性收益大于这条带的损失，故接受。
+      '  pointer-events:auto;cursor:help;',
       '}',
       '[' + MARK + '][data-mmx-bucket="paused"]{ background:var(--orange_400,#f59e0b); }',
       '[' + MARK + '][data-mmx-bucket="error"]{ background:var(--red_400,#ef4444); width:8px;height:8px; }',
@@ -248,8 +283,21 @@ function __mmxStatusMain(cfg) {
   // bucket 在 apply() 里是拿到之后才 setAttribute('data-mmx-bucket') 的，
   // 所以语义标签必须由调用方一并带进来，不能在 ensureDot 内部去读属性 ——
   // 那一刻属性还没写，标签会永远停在兜底文案上。
+  // 认领点只认【直接子】（A12）。
+  //
+  // row.querySelector('[data-mmx-dot]') 返回的是【子树里第一个】匹配项。会话行
+  // 里再嵌一层会话行时，那个"第一个"是【内层行自己的点】：于是内层的点被摘掉、
+  // 被刷成外层的桶，而真正缺点的外层行还是裸的。直接子查询把这条认领路径关死在
+  // "自己画的那个点"上。
+  // 证据边界：该【嵌套形态】是离线保守建模——离线夹具能复现，但现场是否真的出现
+  // 未证明（1003.md §14.30.2 与风险表第 2 行：现场结构未证明）；【直接子形态】已由
+  // 真机证据钉死（单层 div 实测 509/509 全中）。故本规则对直接子是真机结论，
+  // 对嵌套子只是"不更差"的防御。
+  //
+  // :scope 是标准伪类（querySelector 从 Chrome 27 / Firefox 32 / Safari 7 起支持），
+  // 页内代码可以直接用；它表达的是"以调用 querySelector 的那个元素为根"。
   function ensureDot(row, bucket) {
-    var dot = row.querySelector('[' + MARK + ']');
+    var dot = row.querySelector(':scope > [' + MARK + ']');
     if (!dot) {
       dot = document.createElement('span');
       dot.setAttribute(MARK, '1');
@@ -367,6 +415,56 @@ function __mmxStatusMain(cfg) {
       if (seg.style.display !== want) seg.style.display = want;
     }
     bar.setAttribute('data-mmx-empty', n === 0 && w === 0 ? '1' : '0');
+  }
+
+  // A13: daemon 掉线的过期标注。
+  //
+  // daemon 每 intervalMs 调一次 refresh。它死了、或者 evaluateWithRetry 一直
+  // 失败时，页面【什么都不会变】：点还是绿的、数字还是对的，只是它们已经过期
+  // 了，用户分不出"这一分钟没有会话在跑"和"我已经三分钟没收到信号了"。
+  //
+  // 只【标注】，绝不删点、绝不改色、绝不撤回任何宿主 DOM：过期的点仍然是宿主
+  // 最后一次告诉我们的样子，只是旁边多一句"这是 N 秒前的"。刷新一恢复，后缀
+  // 自动摘掉。
+  //
+  // 后缀挂成一个【文本节点】，不是第四个子元素：element.children 只数元素节点，
+  // 所以分段数仍然是 3（pip + running + waiting），布局与 8.6 钉住的那条不变。
+  // aria-label 用一句可识别的标记恢复：把标记句之后的部分切掉就回到原始那句，
+  // 于是条被宿主重建（ensureSummary 重新建一个）之后也不需要额外的记忆。
+  //
+  // 三个常量都留在这一段里，是为了让离线套件把 ensureSummary/updateSummary
+  // 这一段单独切出去编译时，本函数仍然是自洽的（它只依赖 ensureSummary 和
+  // document）。真正的时间状态由 apply() 算好 age 传进来，本函数不读时钟。
+  var STALE_AFTER_MS = 15000;
+  var STALE_NOTE_MARK = '。数据可能过期';
+  var staleNote = null;
+  function updateStaleNote(ageMs) {
+    var bar = ensureSummary();
+    if (!bar) return '';
+    // 宿主随时可能重建这条 bar（section 的 children 是各自重挂的）。文本节点
+    // 跨不过重建，所以先确认它还挂在【这一条】上，不是就当它没了。
+    if (staleNote && staleNote.parentElement !== bar) staleNote = null;
+    var age = Number(ageMs);
+    if (!isFinite(age) || age < 0) age = 0;
+    var aria = String(bar.getAttribute('aria-label') || '');
+    var cut = aria.indexOf(STALE_NOTE_MARK);
+    if (cut >= 0) aria = aria.slice(0, cut);
+    if (age <= STALE_AFTER_MS) {
+      if (staleNote) { staleNote.remove(); staleNote = null; }
+      if (cut >= 0) bar.setAttribute('aria-label', aria);
+      return '';
+    }
+    var secs = Math.floor(age / 1000);
+    var text = ' · 信号 ' + secs + 's 未更新';
+    if (!staleNote) {
+      staleNote = document.createTextNode(text);
+      bar.appendChild(staleNote);
+    } else if (staleNote.data !== text) {
+      staleNote.data = text;
+    }
+    var want = aria + STALE_NOTE_MARK + '：以上数字来自 ' + secs + ' 秒前的一次刷新。';
+    if (String(bar.getAttribute('aria-label') || '') !== want) bar.setAttribute('aria-label', want);
+    return text;
   }
 
   // ---------------------------------------------------------------------
@@ -579,11 +677,18 @@ function __mmxStatusMain(cfg) {
       var rest = [];
       for (var k = 0; k < kids.length; k++) {
         var w = kids[k];
-        var row = w.querySelector && w.querySelector('[data-session-id]');
+        // :scope > : the row that belongs to THIS wrapper is its DIRECT child.
+        // Descendant search would reach a session row NESTED inside that row and
+        // answer with it, so a wrapper whose own session is idle but which holds
+        // a nested RUNNING session would be hoisted as a whole -- the parent
+        // moves for a state that is not its own. Same rule, same reason as
+        // ensureDot above; the two buckets below ask about the dot of that direct
+        // child only, for the same reason.
+        var row = w.querySelector && w.querySelector(':scope > [data-session-id]');
         if (!row) { rest.push(w); continue; }
-        if (row.querySelector('[' + MARK + '][data-mmx-bucket="running"]')) {
+        if (row.querySelector(':scope > [' + MARK + '][data-mmx-bucket="running"]')) {
           runW.push(w);
-        } else if (row.querySelector('[' + MARK + '][data-mmx-bucket="waiting"]')) {
+        } else if (row.querySelector(':scope > [' + MARK + '][data-mmx-bucket="waiting"]')) {
           waitW.push(w);
         } else {
           rest.push(w);
@@ -827,11 +932,26 @@ function __mmxStatusMain(cfg) {
       if (!bucket) {
         var cb = cloudState.get(id);
         if (cb) { bucket = cb; fromCloud = true; }
+        // unknownIds：这一行挂着的会话 id 在【本地 cfg.status】与【cloudState】
+        // 两处都答不上来，于是这一行我们什么都不画，而用户看到的是一行没有状态
+        // 点的会话，分不出"没有状态"和"状态源掉线了"。这个计数以前是死字段
+        // （写进 stats 却从来没有 +1 过），所以 daemon 日志里它恒为 0，一个真的
+        // 对不上的 id 会被统计成"一切正常的行"。
+        //
+        // 判据是"两处都【查不到】"，不是"这一趟没画点"：被 showDone 挡掉的 done
+        // 在 cfg.status 里【有】这个 id，它认得出、只是这一趟不画，那属于
+        // stats.matched / stats.painted 已经说得更准的事，不该混进这个计数。
+        else if (map[id] === undefined) stats.unknownIds++;
       }
       // The "done" bucket is opt-in: hundreds of grey dots drown the three
       // states that actually matter (green running / yellow paused / red error).
       if (bucket === 'done' && !cfg.showDone) bucket = undefined;
-      var existing = row.querySelector('[' + MARK + ']');
+      // Same :scope > direct-child rule as ensureDot, and for the same reason:
+      // this is the "does this row already own a dot" test that decides whether
+      // a dot gets REMOVED. Descendant search let a row with no bucket delete a
+      // nested row's dot, which is how one conversation's status dot silently
+      // disappeared when its parent row stopped having a bucket of its own.
+      var existing = row.querySelector(':scope > [' + MARK + ']');
       if (!bucket) {
         if (existing) { existing.remove(); stats.removed++; }
         continue;
@@ -870,6 +990,18 @@ function __mmxStatusMain(cfg) {
     }
 
     updateSummary(stats.runningOnScreen, stats.waitingOnScreen);
+    // A13 的掉线标注：daemon 在调 refresh 之前把服务器时间写在 api.__sentAt 上，
+    // 这里读一次就【清掉】——不清的话，下一趟 apply（MutationObserver 或那 3s
+    // 定时器都会触发它）会把同一个旧时间戳当成"刚刚刷新过"，标注就永远不出现。
+    // 读不到就是没收到：lastRefreshAt 停在原地，年龄自己长上去。
+    try {
+      if (api.__sentAt) {
+        var sent = Number(api.__sentAt);
+        if (isFinite(sent) && sent > 0) lastRefreshAt = sent;
+        api.__sentAt = 0;
+      }
+    } catch (e) { /* never break the host app */ }
+    updateStaleNote(Date.now() - lastRefreshAt);
     // Must run AFTER the dots are painted: the hoister keys off the bucket
     // attribute the loop above just set.
     stats.reorder = applyReorder();
@@ -1637,6 +1769,24 @@ function __mmxStatusMain(cfg) {
       return;
     }
     var prev = autoTopIds;
+    // 锁顶意图在场时让位（扣费之前的那一道，A13）。
+    //
+    // 这一段原来放在待办确认【之后】，于是锁在场期间宿主那份 order 一动（静默回滚、
+    // 用户自己拖了一下、别的纠正器改写了），待办就落进"形态还在、目标没到下标 0 =
+    // 确认失败"，扣一次预算。可那几次扣费一次都不该发生：锁顶意图在场时我们
+    // 【本来就不打算】写，那段 order 的变化不是我们造成的。三趟下来预算见底，等
+    // 锁一释放、真正的补写机会真的来了，预算已经没了，什么也不做——用户看到的
+    // 就是"锁着的时候那次纠正彻底没发生"。
+    //
+    // 所以让位必须【提到扣费之前】：待办留着（不确认、不扣费），deferred 照常 +1，
+    // 这一趟一次宿主写都不发生。与下面那条"变化中的让位"是同一条纪律，只是它
+    // 提前到了记账之前；两者写的都不是同一个变量（那边推迟的是【这一次变化】，
+    // 这边推迟的是【这一次变化的结果】），所以两条都要留。
+    if (autoTopPending && topmostLockView.id) {
+      autoTopState.deferred++;
+      autoTopState.lastReason = 'toplock-other';
+      return;
+    }
     // 先确认上一次待纠正的那一次变化。只有确认了（目标真落到下标 0，或那一份形态
     // 已经消失）基线才推进；确认失败则扣一次预算并把待办留到下一趟。被闸挡、抛异
     // 常、reject、resolve 了但 order 没动，四种都落在下面这三条里。
@@ -1903,6 +2053,10 @@ function __mmxStatusMain(cfg) {
     // 基线之外，锁一释放仍会被认成"刚刚开始对话"并被浮上去。这正是 D1
     // （24.10b/24.10c）修过的形状，抄同一条，不各自发明。
     // 本分支里不得出现任何宿主写，deferred 仍然每趟 +1。
+    //
+    // 语句顺序在这里是【承重】的，不是排版：这一段让位必须排在下面的待办确认
+    // （那是本段唯一扣预算的地方）之前，否则锁在场期间的 order 变化同样会被当成
+    // "这次上浮没落位"而扣费——24 段踩过这个坑，见那里的同名注释。
     if (topmostLockView.id) {
       promoteState.deferred++;
       promoteState.lastReason = 'toplock-other';
@@ -2857,6 +3011,14 @@ function __mmxStatusMain(cfg) {
     'no-menu-fiber': '该行没有可用的右键菜单',
     'busy': '上一次操作还没结束',
     'toplock-other': '已有会话被锁顶，请先解除',
+    // already-top 不是失败，是【已经证明过能力】之后的一个 no-op：capability
+    // 一路走到了读出宿主自己的 order[0] 就是这一项才写下它（见 topmostCapability
+    // 末尾的 alreadyTop 分支），点击那一支也写下同一个码（见
+    // onTopmostActivate）。它以前不在表里，于是 topmostReasonText 落进最下面
+    // 那句兜底，daemon 每个 tick 打的 api.topmost().reasonText 就成了"当前宿主
+    // 版本不支持置顶排序"——对一个明明可用的会话说宿主不支持置顶排序，等于把
+    // "不用做"报成了"做不到"。
+    'already-top': '已在置顶区最顶',
     'untrusted-click': '只响应真实点击',
     'row-gone': '会话行已变化',
     'menu-gone': '菜单已关闭',
@@ -5154,6 +5316,10 @@ export function buildBootstrapExpression(cfg) {
     activeBgHover: 'rgba(10, 10, 10, 0.14)',
     activeBar: 'rgba(0, 148, 252, 0.90)',
     status: {},
+    // A13: 服务器侧时间。daemon 在每一次注入时把当时的时间带进来，页面用它初始化
+    // lastRefreshAt。缺省就是 undefined，页面退回"注入那一刻的页面时间"——那正是
+    // 没有 daemon 时（手动注入、离线套件）该有的行为。
+    sentAt: 0,
     ...cfg,
   };
   return `(${PAGE_FN})(${JSON.stringify(full)})`;
@@ -5164,7 +5330,15 @@ export function buildRefreshExpression(statusMap) {
   // reports what it found, it never pins anything. It rides along with the
   // periodic refresh so the daemon log carries the capability and its reason
   // without anybody having to click a menu.
-  return `(function(){var a=window.${GLOBAL};if(!a)return {ok:false,reason:'not-installed'};return {ok:true,stats:a.refresh(${JSON.stringify(statusMap)}),topmost:a.topmost(),topmostDiag:(function(){try{return a.topmostDiag();}catch(e){return {available:false,error:'collector-threw'};}})()};})()`;
+  //
+  // A13: the server timestamp is written onto the api object BEFORE a.refresh()
+  // runs, and the page reads it exactly once and clears it. If this daemon dies
+  // the field simply stops being written, the page's lastRefreshAt ages past
+  // STALE_AFTER_MS and the summary bar says so -- which is the only honest
+  // thing the page can say, since the dots it is showing are exactly the ones
+  // the host last told it about. The write is guarded: an older host whose api
+  // object is frozen must degrade to "no timestamp", never to a thrown refresh.
+  return `(function(){var a=window.${GLOBAL};if(!a)return {ok:false,reason:'not-installed'};try{a.__sentAt=Date.now();}catch(e){}return {ok:true,stats:a.refresh(${JSON.stringify(statusMap)}),topmost:a.topmost(),topmostDiag:(function(){try{return a.topmostDiag();}catch(e){return {available:false,error:'collector-threw'};}})()};})()`;
 }
 
 export function buildDisposeExpression() {

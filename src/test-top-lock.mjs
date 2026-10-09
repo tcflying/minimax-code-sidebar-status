@@ -471,7 +471,7 @@ function buildExpr(cfg) {
     summaryId: 'mmx-running-summary', offsetX: 4, intervalMs: 3000, scope: '', showDone: false,
     collapseOnStart: true, reorder: true,
     activeBg: 'rgba(10, 10, 10, 0.10)', activeBgHover: 'rgba(10, 10, 10, 0.14)',
-    activeBar: 'rgba(0, 148, 252, 0.90)', status: {}, ...cfg };
+    activeBar: 'rgba(0, 148, 252, 0.90)', status: {}, sentAt: 0, ...cfg };
   return '(' + PAGE_FN_SRC + ')(' + JSON.stringify(full) + ')';
 }
 

@@ -450,9 +450,15 @@ console.log('\n=== F. 空视图 → 首个真实视图 → 第二次变化 ===')
 // G. Two native pins inside ONE poll. Reported as a LIMIT because the requirement
 //    does not say which of the two should end up first, and this suite will not
 //    invent that policy. The FACT recorded is narrower and does not need it: only
-//    the lowest-index new member is ever a candidate, and the other one is
+//    the lowest-index WRITABLE new member is ever a candidate, and the other one is
 //    absorbed into the baseline with no further turn -- so at most one of a batch
 //    of N new members is corrected per poll, and the rest are never reconsidered.
+//    "可写者" is the post-J.2 rule: a candidate the probe refuses (read-only,
+//    non-local id) is SKIPPED and the next writable candidate in the SAME batch
+//    continues, still within one host write for that pass. The wording was
+//    "下标最小的新成员" before J.2 existed, which described a rule the product no
+//    longer ships -- the shipped rule skips a refused candidate, it does not let
+//    one eat the batch.
 // ---------------------------------------------------------------------------
 console.log('\n=== G. 同一次轮询里新增两项 ===');
 {
@@ -463,7 +469,7 @@ console.log('\n=== G. 同一次轮询里新增两项 ===');
   await passes(a, 2);
   await passes(a, 4);
   const calls = a.host.calls.length;
-  limitRow('G.1 一批新增只发生一次写, 规则是"下标最小的新成员"',
+  limitRow('G.1 一批新增只发生一次写, 规则是"下标最小的新成员中可写者"',
     `${seqOf(a)} calls=${JSON.stringify(a.host.calls)} lastId=${a.p.api.autoState.lastId} noCandidate=${a.p.api.autoState.noCandidate}`);
   limitRow('G.2 后到的那一项此后再无任何机会（已被基线吸收）',
     `raw index of mvs_d = ${a.host.order.findIndex((r) => r.id === 'mvs_d')}，${calls} 次调用，d 从未成为候选`);
