@@ -1535,12 +1535,36 @@ function __mmxStatusMain(cfg) {
   var autoTopState = {
     passes: 0, settleMiss: 0, changes: 0, calls: 0, blocked: 0, refused: 0,
     unproven: 0, deferred: 0, exhausted: 0, noCandidate: 0, alreadyTop: 0,
-    noBaseline: 0, budget: TOPMOST_AUTOTOP_MAX, owner: '', lastId: '', lastReason: '',
+    noBaseline: 0, confirmed: 0, failed: 0, awaiting: 0, absorbed: 0,
+    budget: TOPMOST_AUTOTOP_MAX, owner: '', lastId: '', lastReason: '',
   };
   // 上一次【已证明】顺序里的会话 id，和【上一趟观察到的】顺序。两者都只是
   // "上一次看到什么"的记忆，任何持久化槽都不写它。
   var autoTopIds = [];
   var autoTopSeen = [];
+  // 待纠正的那一次变化：{ ids, id, tried }。
+  // 基线【不再】在尝试时推进，而是在下一趟【确认】之后才推进。被共享闸挡住、宿主
+  // 抛异常、宿主 reject、宿主 resolve 了但 order 没动——这四种一律把这份待办留
+  // 到下一趟，于是"新出现的那一项停在最底部"这一次变化不会被吃掉。tried 记的是
+  // 有没有真的叫过 cap.fn：没叫过（闸被别人占着）不算一次失败，也不扣预算。
+  var autoTopPending = null;
+  // 预算按【确认失败】扣，不是按【尝试】扣：一次成功落位不花钱，被闸挡住 / 抛
+  // 异常 / reject / resolve 了但 order 没动才花一次。返回是否真的扣掉了。
+  function topmostCharge(rt, id, st) {
+    if (!rt) return false;
+    if (rt.owner !== id) return false;
+    if (!(rt.budget > 0)) return false;
+    rt.budget = rt.budget - 1;
+    st.budget = rt.budget;
+    return true;
+  }
+  // 「这一份比基线【更小】」：每个成员都还在，且真的少了人。用户取消置顶就是这样
+  // 发生的，而我们不纠正移除，所以要把它认成一份稳定的新成员集。
+  function topmostShrankTo(ids, prev) {
+    if (ids.length >= prev.length) return false;
+    for (var i = 0; i < ids.length; i++) if (prev.indexOf(ids[i]) < 0) return false;
+    return true;
+  }
   // 与 topLockRuntime 同一套纪律：存不下的窗口 = 拒绝，绝不是给一份用完即弃的
   // 预算（那正是 r3 的 w3 缺陷）。
   function autoTopRuntime() {
@@ -1597,53 +1621,115 @@ function __mmxStatusMain(cfg) {
     // 空数组证明不了任何东西：它既可能是"还没加载"，也可能是"用户刚取消全部
     // 置顶"。不写，并且不动基线。
     if (!ids.length) { autoTopState.unproven++; autoTopState.lastReason = 'view-unstable'; return; }
-    // 稳定两趟才认。变化中的那一趟只更新"上一趟看到什么"。
+    // 稳定两趟才认。变化中的那一趟只更新"上一趟观察到的"。
     if (!topmostSameIds(ids, autoTopSeen)) {
       autoTopSeen = ids.slice();
       autoTopState.settleMiss++;
+      // 这一趟不是"什么都没看见"，而是"看见了一份【比成员基线更小】的稳定视图"：
+      // 用户取消置顶就是这样发生的，而我们不纠正移除，所以要把它认成新的成员基线。
+      // 不认的话，"取消一次、再点一次置顶"会回到与基线【逐字节相同】的顺序，那一
+      // 项就再也不会被认成新成员，对抗测试 R 段正是这一条。纯拖拽（成员集合不变）
+      // 走不到这里，所以这条绝不撤销用户的拖拽。
+      if (!autoTopPending && autoTopIds.length && topmostShrankTo(ids, autoTopIds)) {
+        autoTopIds = ids.slice();
+        autoTopState.absorbed++;
+      }
       return;
     }
     var prev = autoTopIds;
-    // 已知边界（本轮不修，记在这里免得以后当成"没想过"）：基线这一次推进发生在下面
-    // 那个唯一写点【之前】。所以宿主拒绝这次补写并把顺序回滚之后，下一趟 prev 与
-    // ids 相同，会在下面那句同序早退处直接返回——首次调用被宿主拒绝后不自动重试，
-    // 同一目标的补写预算在回滚路径上等效 1。要真重试得另开一个批次把基线一并退回
-    // 去，改动面比让位那一处大得多，且失效方向是少补而不是乱写，所以不在这轮顺手改。
-    autoTopIds = ids.slice();
-    if (!prev.length) { autoTopState.noBaseline++; autoTopState.lastReason = 'baseline-armed'; return; }
+    // 先确认上一次待纠正的那一次变化。只有确认了（目标真落到下标 0，或那一份形态
+    // 已经消失）基线才推进；确认失败则扣一次预算并把待办留到下一趟。被闸挡、抛异
+    // 常、reject、resolve 了但 order 没动，四种都落在下面这三条里。
+    if (autoTopPending) {
+      if (ids.indexOf(autoTopPending.id) === 0) {
+        autoTopIds = ids.slice();
+        autoTopPending = null;
+        autoTopState.confirmed++;
+        autoTopState.lastReason = 'landed';
+        prev = autoTopIds;
+      } else if (hostCallBusy()) {
+        // 宿主那次调用还在飞：这一趟【不下结论】，不扣预算，也不再写一次。
+        autoTopState.awaiting++;
+        autoTopState.lastReason = 'awaiting-host';
+        return;
+      } else if (topmostSameIds(ids, autoTopPending.ids)) {
+        // 形态还在、目标没到下标 0 = 确认失败。待办留着，下面按"这次变化还在"走。
+        if (autoTopPending.tried && topmostCharge(autoTopRuntime(), autoTopPending.id, autoTopState)) {
+          autoTopState.failed++;
+        }
+        autoTopState.lastReason = 'confirm-failed';
+      } else {
+        // 形态没了（被别人的纠正改写，或用户自己动了）：这一次没落位，扣一次预算，
+        // 待办作废，基线认下这份新观察。
+        if (autoTopPending.tried && topmostCharge(autoTopRuntime(), autoTopPending.id, autoTopState)) {
+          autoTopState.failed++;
+        }
+        autoTopPending = null;
+        autoTopIds = ids.slice();
+        prev = autoTopIds;
+        autoTopState.lastReason = 'confirm-failed-shape';
+      }
+    }
+    // 首趟与基线趟只记录，不写：没有"上一份可信顺序"就没有"新成员"。
+    if (!prev.length) {
+      autoTopIds = ids.slice();
+      autoTopState.noBaseline++;
+      autoTopState.lastReason = 'baseline-armed';
+      return;
+    }
     if (topmostSameIds(prev, ids)) return;              // 顺序没变：一次调用都不考虑
     autoTopState.changes++;
     // 锁顶意图在场时让位：那是用户按过按钮授权的一次意图，它的代次与维持预算都
     // 归它，我们在这里插一脚只会和它对拉。
-    // 让位只【推迟】这一次补写，绝不把它取消：这里把成员基线退回上一趟的值，于是
-    // 让位期间到达的新成员留在基线之外，锁一释放仍会被认成新成员并补到 0。若保留
-    // 上面那次推进，它们会被误当成"上一趟就知道了"，锁释放后 prev 与 ids 相同，一
-    // 次调用都不会再发生——用户新建会话点置顶后没到最顶，正是这样留下来的（D1）。
-    // 这一分支里【不得】出现任何宿主写，deferred 也仍然每趟 +1。
+    // 让位只【推迟】这一次补写，绝不把它取消：这里既不推进基线、也不建待办，于是
+    // 让位期间到达的新成员留在基线之外，锁一释放仍会被认成新成员并补到 0（这条是
+    // D1 修过的形状，抄同一条，不各自发明）。这一分支里【不得】出现任何宿主写，
+    // deferred 也仍然每趟 +1。
     if (topmostLockView.id) {
-      autoTopIds = prev;
       autoTopState.deferred++;
       autoTopState.lastReason = 'toplock-other';
       return;
     }
-    // 候选 = 这次【新出现】的成员里下标最小的那个。成员没变就一个候选也没有，
-    // 那是用户自己的拖拽，绝不撤销。
-    var cand = -1;
-    for (var j = 0; j < ids.length; j++) { if (prev.indexOf(ids[j]) < 0) { cand = j; break; } }
-    if (cand < 0) { autoTopState.noCandidate++; autoTopState.lastReason = 'no-new-member'; return; }
-    if (cand === 0) { autoTopState.alreadyTop++; autoTopState.lastReason = 'already-top'; return; }
-    var id = ids[cand];
+    // 候选 = 这次【新出现】的成员，按下标从小到大逐个试。被探针拒绝的那一个（只读
+    // / 非本地 id）不吃掉整批：跳过它，同批里下一个可写的继续。一次变化仍然【一趟最
+    // 多一次】宿主写——找到第一个可写的就 break，绝不在同一趟里写第二次。
+    var pick = -1;
+    var refusalReason = '';
+    for (var j = 0; j < ids.length; j++) {
+      if (prev.indexOf(ids[j]) >= 0) continue;
+      var one = ids[j];
+      if (!topmostAutoTopId(one)) { refusalReason = 'not-local-id'; continue; }
+      var ro;
+      try { ro = !!cap.probe(one, cap.source); } catch (e) { ro = true; }
+      if (ro) { refusalReason = 'readonly-session'; continue; }
+      pick = j;
+      break;
+    }
+    // 这一批里一个可写的都没有：没有任何东西需要纠正，认下这份观察（否则每趟都要
+    // 重探一次同一个只读目标）。成员没变就一个候选也没有，那是用户自己的拖拽，
+    // 绝不撤销。
+    if (pick < 0) {
+      autoTopState.noCandidate++;
+      if (refusalReason) { autoTopState.refused++; autoTopState.lastReason = refusalReason; }
+      else autoTopState.lastReason = 'no-new-member';
+      autoTopIds = ids.slice();
+      return;
+    }
+    if (pick === 0) {
+      autoTopState.alreadyTop++;
+      autoTopState.lastReason = 'already-top';
+      autoTopIds = ids.slice();
+      return;
+    }
+    var id = ids[pick];
     autoTopState.lastId = id;
-    if (!topmostAutoTopId(id)) { autoTopState.refused++; autoTopState.lastReason = 'not-local-id'; return; }
-    var readOnly;
-    try { readOnly = !!cap.probe(id, cap.source); } catch (e) { readOnly = true; }
-    if (readOnly) { autoTopState.refused++; autoTopState.lastReason = 'readonly-session'; return; }
     var rt = autoTopRuntime();
     if (!rt) { autoTopState.blocked++; autoTopState.lastReason = 'runtime-unavailable'; return; }
     // 换一个目标 = 新的预算；同一个目标用完就停（w4 那条"只有可信手势才补满"
     // 的纪律在这里的形状是：只有【新出现的另一项】才补满）。
     if (rt.owner !== id) { rt.owner = id; rt.budget = TOPMOST_AUTOTOP_MAX; rt.reason = ''; }
     autoTopState.owner = rt.owner;
+    autoTopState.budget = rt.budget;
     if (rt.budget < 1) {
       autoTopState.budget = 0;
       autoTopState.exhausted++;
@@ -1651,9 +1737,16 @@ function __mmxStatusMain(cfg) {
       return;
     }
     var ticket = hostCallTake();
-    if (!ticket) { autoTopState.blocked++; autoTopState.lastReason = 'gate-unavailable'; return; }
-    rt.budget--;
-    autoTopState.budget = rt.budget;
+    // 闸被别人占着：一次宿主写都不发生，但这一次变化【留在待办里】，闸一释放就补。
+    if (!ticket) {
+      autoTopState.blocked++;
+      autoTopState.lastReason = 'gate-unavailable';
+      autoTopPending = { ids: ids.slice(), id: id, tried: false };
+      return;
+    }
+    // 待办【在调用之前】就记上：同步抛异常、reject、resolve 之后 order 没动，这三
+    // 种都要被下一趟认出来，而不是在这一趟就把这次变化吃掉。
+    autoTopPending = { ids: ids.slice(), id: id, tried: true };
     autoTopState.calls++;
     autoTopState.lastReason = 'calling';
     var ret;
@@ -1668,8 +1761,8 @@ function __mmxStatusMain(cfg) {
       return;
     }
     // A resolved promise means "the host finished handling it", never "it
-    // worked", so nothing here is reported as a success. The gate is released
-    // by its own settle and by nobody else.
+    // worked": 这里【不】推进基线、也【不】扣预算，落位与否留给下一趟确认。闸由它
+    // 自己的结算释放，而且只释放它自己那一张票。
     Promise.resolve(ret).then(function () {
       hostCallRelease(ticket);
       autoTopState.lastReason = 'host-returned';
@@ -1718,8 +1811,11 @@ function __mmxStatusMain(cfg) {
   //
   // 有界，四道：
   //   1. 预算按【会话】分，每会话 3 次，住 window 上（存不下就 fail closed，绝不
-  //      给一份用完即弃的预算）。
-  //   2. 一次状态变化最多一次写：基线在判据【之前】推进，这一次变化就被消费掉了。
+  //      给一份用完即弃的预算）。扣的是【确认失败】——被闸挡住 / 抛异常 / reject /
+  //      resolve 了但 order 没动——不是每次尝试；真落位的那一次不花钱。
+  //   2. 一次状态变化最多一次写：这一趟找到第一个可写的目标就 break，绝不写第二
+  //      次；而这一趟没写成（闸被占、抛异常、reject）时升沿【不消费】，待办留到
+  //      闸空闲的下一趟补，与 24 段的让位形状同一条。
   //   3. order 不可证明时暂停，而且【不动基线】。
   //   4. 目标自己过 cap.probe，绝不借见证行的只读结论；云端数字 id 直接拒绝。
   var TOPMOST_PROMOTE_KEY = '__mmxStatusPinnedPromoteV1';
@@ -1727,7 +1823,8 @@ function __mmxStatusMain(cfg) {
   var promoteState = {
     passes: 0, settleMiss: 0, changes: 0, noChange: 0, calls: 0, blocked: 0,
     refused: 0, unproven: 0, deferred: 0, exhausted: 0, alreadyTop: 0,
-    noBaseline: 0, budget: TOPMOST_PROMOTE_MAX, lastId: '', lastReason: '',
+    noBaseline: 0, confirmed: 0, failed: 0, awaiting: 0,
+    budget: TOPMOST_PROMOTE_MAX, lastId: '', lastReason: '',
   };
   // 上一趟的状态基线，按 id 存 { id, running }。
   // 刻意【按 id】而不是按下标：让位期间用户可能拖过顺序，按下标记的基线会在那
@@ -1737,6 +1834,11 @@ function __mmxStatusMain(cfg) {
   // 上一趟【观察到的】顺序，只用来做"连续两趟相同"的防抖。变化中的那一趟只更新
   // 它，不碰 promotePrev。
   var promoteSeen = [];
+  // 待上浮的那一条升沿：{ ids, id, tried }。基线【不】在判据之前推进，只有下一趟
+  // 确认了（真的浮到了下标 0，或那一份顺序形态已经被别的纠正改写）才推进。被共享
+  // 闸占着的那一趟不算消费掉这次升沿——闸一空闲就补，对抗测试 P.2 / Q.3 就是这
+  // 一条。tried 记有没有真的叫过 cap.fn：没叫过不扣预算。
+  var promotePending = null;
   // 与 autoTopRuntime / topLockRuntime 同一套纪律：槽存不下 = 拒绝，绝不是给一份
   // 用完即弃的预算（那正是 r3 的 w3 缺陷）。
   function promoteRuntime() {
@@ -1806,9 +1908,36 @@ function __mmxStatusMain(cfg) {
       promoteState.lastReason = 'toplock-other';
       return;
     }
-    // 基线在判据【之前】推进，于是这一次的 idle -> running 被"消费"掉：同一趟
-    // 最多一次写，持续 running 永不再写，会话结束（running -> idle）也不回位。
-    promotePrev = next;
+    // 基线【不】在判据之前推进。升沿留在 promotePending 里，直到下一趟确认它：真的
+    // 浮到了下标 0（成功，不扣预算），或者那一份顺序形态已经被别的纠正改写（这一
+    // 次没落位，扣一次预算，基线认下新观察）。确认失败时基线原地不动，于是这一条
+    // 升沿在闸空闲的下一趟仍会被认出来并再浮一次。
+    if (promotePending) {
+      if (ids.indexOf(promotePending.id) === 0) {
+        promotePrev = next;
+        promotePending = null;
+        promoteState.confirmed++;
+        promoteState.lastReason = 'landed';
+        return;
+      }
+      if (hostCallBusy()) {
+        promoteState.awaiting++;
+        promoteState.lastReason = 'awaiting-host';
+        return;
+      }
+      if (promotePending.tried && topmostCharge(promoteRuntime(), promotePending.id, promoteState)) {
+        promoteState.failed++;
+      }
+      if (topmostSameIds(ids, promotePending.ids)) {
+        // 形态还在：这次升沿没落位，扣一次预算，待办留到下一趟。
+        promoteState.lastReason = 'confirm-failed';
+      } else {
+        promoteState.lastReason = 'confirm-failed-shape';
+        promotePending = null;
+        promotePrev = next;
+        return;
+      }
+    }
     // Object.create(null)：这份查找表只认"自家键"。用 {} 的话，一个恰好叫
     // constructor 的 id 会读到原型上的函数而不是 undefined，那会把一个从没进过
     // 置顶区的会话误认成"上一趟就在跑"。
@@ -1826,11 +1955,14 @@ function __mmxStatusMain(cfg) {
       cand = c;
       break;                                    // 一次最多一项：下标最小的那一个
     }
-    if (cand < 0) { promoteState.noChange++; return; }
+    // 这一次没有状态变化（持续 running、会话结束、纯拖拽）：基线认下，这一条升沿
+    // 到此为止。会话结束【不回位】，也是靠这里只更新 running 布尔、不记任何位置。
+    if (cand < 0) { promoteState.noChange++; promotePrev = next; return; }
     promoteState.changes++;
     // 判据要求下标 > 0。已经在最顶的那一项什么也不做，也不消耗预算。
     if (cand === 0) {
       promoteState.alreadyTop++;
+      promotePrev = next;
       promoteState.lastReason = 'already-top';
       return;
     }
@@ -1838,6 +1970,7 @@ function __mmxStatusMain(cfg) {
     promoteState.lastId = id;
     if (!topmostAutoTopId(id)) {
       promoteState.refused++;
+      promotePrev = next;
       promoteState.lastReason = 'not-local-id';
       return;
     }
@@ -1846,6 +1979,7 @@ function __mmxStatusMain(cfg) {
     try { readOnly = !!cap.probe(id, cap.source); } catch (e) { readOnly = true; }
     if (readOnly) {
       promoteState.refused++;
+      promotePrev = next;
       promoteState.lastReason = 'readonly-session';
       return;
     }
@@ -1864,17 +1998,19 @@ function __mmxStatusMain(cfg) {
       return;
     }
     // 与「到最顶」菜单项、红色锁顶按钮、自动到顶同一把闸。谁先拿到谁写，
-    // 这一趟另一个放弃（null 意味着零宿主写，不排队、不重试到本趟之外）。
+    // 这一趟另一个放弃（null 意味着零宿主写，不排队）。但【放弃不等于消费】：升沿
+    // 留在待办里，闸一空闲的下一趟补上，形状与 24 段让位时留待办同一条。
     var ticket = hostCallTake();
     if (!ticket) {
       promoteState.blocked++;
       promoteState.lastReason = 'gate-unavailable';
+      promotePending = { ids: ids.slice(), id: id, tried: false };
       return;
     }
-    rt.budget--;
     promoteState.budget = rt.budget;
     promoteState.calls++;
     promoteState.lastReason = 'calling';
+    promotePending = { ids: ids.slice(), id: id, tried: true };
     var ret;
     try {
       // EXACTLY three arguments, and it is the SAME single write the other three
@@ -1887,8 +2023,8 @@ function __mmxStatusMain(cfg) {
       return;
     }
     // A resolved promise means "the host finished handling it", never "it
-    // worked", so nothing here is reported as a success. The gate is released
-    // by its own settle and by nobody else.
+    // worked": 这里【不】推进基线、也【不】扣预算，落位与否留给下一趟确认。闸由
+    // 它自己的结算释放，而且只释放它自己那一张票。
     Promise.resolve(ret).then(function () {
       hostCallRelease(ticket);
       promoteState.lastReason = 'host-returned';

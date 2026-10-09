@@ -3310,6 +3310,14 @@ console.log('\n=== 24. 自动到最顶：新成员不在首位就补一次三参
       && D.p.api.autoState.deferred === 1 && D.p.api.autoState.lastReason === 'toplock-other',
       `calls=${D.host.calls.length} apiCalls=${D.p.api.autoState.calls} deferred=${D.p.api.autoState.deferred} reason=${D.p.api.autoState.lastReason}`);
     D.p.api.lockView.id = '';                              // 锁释放
+    await tick(D);                                         // 决定趟：补写一次
+    // 宿主按这一次写重渲染，也就是闭包里那份 order 换新（与 24.5 的 commit 同一
+    // 件事）。落位是在 cap.order 上被读到的：不先把这一份落进闭包，下一趟看到的
+    // 仍然是补写之前那份顺序，纠正器就有理由把这次变化当成"没落位"再补一次。
+    // 旧实现不需要这一步，是因为它在【尝试时】就把基线推进了——那正是这次要改掉
+    // 的形状（resolve 即消费）。所以这条断言仍然钉住的是"落位之后不再重复写"，
+    // 而不是"发出去一次就不管"。
+    commit(D.p, D.host, D.host.order);
     await tick(D); await tick(D);
     check('24.10c 锁释放后，让位期间到达的新成员仍被补到下标 0（让位只推迟，不取消）',
       D.host.calls.length === 1
@@ -3938,11 +3946,18 @@ console.log('\n=== 26. 活动会话上浮：置顶项开始对话就补一次三
       && JSON.stringify(A.host.calls[0]) === JSON.stringify(['mvs_c', true, 0])
       && A.p.api.promoteState.calls === 1,
       `calls=${JSON.stringify(A.host.calls)} apiCalls=${A.p.api.promoteState.calls}`);
-    // 预算住在 window 上：重新注入不能顺手把它补满。
+    // 预算住在 window 上，而且扣的是【确认失败】而不是【尝试】：这一次上浮真
+    // 落位了（下面 26.3 会钉住它落位），所以一分钱没花。期望值从 budget===2 改成
+    // ===max 是这次语义变化的直接后果，理由不是"数字好看"，而是"落位不该扣预算"
+    // 这条新纪律本身需要被钉住——扣预算的另一半（确认失败会扣、耗尽后停写）由
+    // 26.10 与对抗测试 E.1 钉住。
     const rt = A.p.window[A.p.api.promoteKey];
-    check('26.5 预算住在 window 上（不是每趟重新给满的三次）',
-      rt && typeof rt === 'object' && rt.budget === 2 && rt.owner === 'mvs_c',
+    check('26.5 预算槽是 window 上那个对象，owner 是这一趟的会话',
+      rt && typeof rt === 'object' && rt.owner === 'mvs_c',
       JSON.stringify(rt));
+    check('26.5 真落位的那一次不扣预算（扣的是确认失败，不是尝试）',
+      rt.budget === A.p.api.promoteMax,
+      `budget=${rt.budget} max=${A.p.api.promoteMax}`);
   } else {
     check('26.5 前置：上浮这一段在出厂里', false, A.why);
   }
@@ -4030,23 +4045,34 @@ console.log('\n=== 26. 活动会话上浮：置顶项开始对话就补一次三
   }
 }
 {
-  // 预算：每会话 3 次，耗尽后只读返回。宿主回滚 + 会话再次开始，重复四轮。
-  const A = promotePage();
+  // 预算：每会话 3 次，扣的是【确认失败】，耗尽后彻底停写。
+  //
+  // 这里换成 fail:true 的宿主：它接下那一次三参调用，但闭包里那份 order（也就是
+  // cap.order 的唯一来源）始终不换成新的，所以纠正器永远看不到落位——这就是"宿
+  // 主 resolve 了但顺序没动"那条分支。旧循环用的是"宿主回滚 + 会话再次开始"，在
+  // 新语义下每一次都只是一趟确认失败，扣得比写得多，计数不再是"写了三次"。现在
+  // 这里断言的仍然是同一个性质（有界、用完即停），而且更直接：写的次数就是上限。
+  const A = promotePage({ host: { fail: true } });
   if (A.ok) {
     const max = A.p.api.promoteMax;
     const rtKey = A.p.api.promoteKey;
+    await armPromote(A);                                 // 基线：三项全部 idle
     let writes = 0;
-    for (let round = 0; round < max + 1; round++) {
-      settleOrder(A.p, A.host);                       // 宿主按上一次的写重渲染
-      commit(A.p, A.host, [ref('mvs_a'), ref('mvs_b'), ref('mvs_c')]);
-      await ptick(A, {});                              // 会话结束
-      await ptick(A, {});
-      await ptick(A, { mvs_c: 'running' });            // 同一会话再次开始对话
+    for (let round = 0; round < max + 3; round++) {
+      await ptick(A, { mvs_c: 'running' });            // 同一会话一直开着话，宿主一直不落位
       writes = A.host.calls.length;
     }
-    check('26.10 V8 同一个会话的上浮次数有界（用完即停，不是无限对拉）',
-      writes === max && A.p.api.promoteState.exhausted >= 1,
-      `calls=${writes} max=${max} exhausted=${A.p.api.promoteState.exhausted} reason=${A.p.api.promoteState.lastReason}`);
+    check('26.10 V8 同一个会话的上浮次数有界（确认失败才扣预算，用完即停）',
+      writes === max && A.p.api.promoteState.exhausted >= 1
+      && A.p.api.promoteState.failed === max,
+      `calls=${writes} max=${max} exhausted=${A.p.api.promoteState.exhausted} failed=${A.p.api.promoteState.failed} reason=${A.p.api.promoteState.lastReason}`);
+    // 耗尽之后再跑三趟：一次新写都不许发生（不是每趟重试一次）。
+    await ptick(A, { mvs_c: 'running' });
+    await ptick(A, { mvs_c: 'running' });
+    await ptick(A, { mvs_c: 'running' });
+    check('26.10 预算耗尽后彻底停写（确认失败已经用完三次）',
+      A.host.calls.length === max,
+      `calls=${A.host.calls.length} max=${max} reason=${A.p.api.promoteState.lastReason}`);
     check('26.10 预算槽在 window 上且已归零',
       A.p.window[rtKey] && typeof A.p.window[rtKey] === 'object'
       && A.p.window[rtKey].budget === 0 && A.p.window[rtKey].owner === 'mvs_c',
