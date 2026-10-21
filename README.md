@@ -3900,9 +3900,10 @@ powershell -NoProfile -File .\src\set-mmx-taskbar-icon.ps1 -TargetProcessId 4858
 
 - 不写 `System.AppUserModel.ID` / `Relaunch*` 属性，不碰窗口类图标，不动注册表、快捷方式、官方 exe/asar/资源；不新建任务栏按钮、不造分组。
 - keeper 只在 MiniMax 运行期间存在；应用退出即结束；不新增开机自启、不加新服务。
-- **尚未对真实应用做过 Apply 验收**（本轮只做了只读探测 + 隔离自检）。
+- **已完成真实应用热应用验收**：2026-10-22 对运行中的 MiniMax Code 应用任务栏图标，隐藏 keeper 返回 `status=applied / ok=true / applied=true`；主会话在真实桌面确认任务栏按钮为红色实心圆，应用未重启。
+- **未做真实应用验收的边界**：`mmx-fix` 冷启动后由 launcher 自动启动 keeper 的整链路，以及应用退出后 keeper 自然结束；这两项尚未在真实应用上操作，仅有隔离自检与代码审查证据。
 - ⚠️ 2026-10-22 事故记录：自检里曾拿**真实主窗句柄**当假句柄，导致一次真 `WM_SETICON` 打到了用户正在用的窗口，随后 HICON 被销毁、窗口留下野句柄。已改：假句柄固定为不可能是窗口的值并加断言；`Remove-MmxTaskbarHeldIcons` 要求「能证明窗口不再引用」才允许销毁；原生适配器改成 **fail-closed**（桩缺失直接抛错，绝不回退真实 API）。
-- 事故留下的悬空句柄**不需要靠重启清**：用一次性候选脚本 `logs\taskbar-repair\repair-dangling-taskbar-icon.ps1` 归零（默认只读，`-Apply` 才写；门禁要求「同一 PID + 同一创建时间、同一窗口句柄/类/归属、当前图标一字不差等于事故记录」，任何一条不符立即拒绝；只发 `WM_SETICON(NULL)`，绝不 `DestroyIcon` 旧句柄）。归零后再按正常流程起 keeper，它保存的 Old 就是 0，`-Stop` 恢复的也是 0。
+- 事故留下的悬空句柄**已于 2026-10-22 归零，未重启应用**：用一次性候选脚本 `logs\taskbar-repair\repair-dangling-taskbar-icon.ps1` 归零（默认只读，`-Apply` 才写；门禁要求「同一 PID + 同一创建时间、同一窗口句柄/类/归属、当前图标一字不差等于事故记录」，任何一条不符立即拒绝；只发 `WM_SETICON(NULL)`，绝不 `DestroyIcon` 旧句柄）。归零后再按正常流程起 keeper，它保存的 Old 就是 0，`-Stop` 恢复的也是 0。该脚本是**一次性本地恢复工具，只针对这次事故的那一个窗口**：它**未入库**（`logs/` 被 `.gitignore` 忽略）、**不随本补丁分发**，新克隆者拿不到它，也不是可以直接照抄运行的通用步骤 —— 需要同样处理时请按本节机制另写工具，而不是找这个脚本。
 - ⚠️ **强杀 keeper = 图标重新变悬空**：HICON 由 keeper 进程持有，进程一死系统就销毁它，窗口会再次挂上野句柄（和上面那次事故同形状）。要停就用 `-Stop`（先恢复原图再退出），别直接杀进程。
 
 ---
