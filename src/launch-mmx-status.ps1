@@ -27,7 +27,10 @@ param(
   [switch]$NoDaemon,
   # 逃生舱：关掉「running 行自动置顶」。默认是开的，所以平时不需要传；
   # 只有置顶导致侧边栏重排异常时才用这个把它关掉。
-  [switch]$NoReorder
+  [switch]$NoReorder,
+  # 逃生舱：完全不换托盘图标。默认会把托盘图标换成红圆
+  # （assets\mmx-red-circle.ico），出问题或不想换时用这个关掉。
+  [switch]$NoTrayIcon
 )
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -146,6 +149,19 @@ function Resolve-TargetPort {
   return 0
 }
 
+function Get-CdpListenerProcessId {
+  # 当前 CDP 端口的唯一 listener PID。拿不到或不唯一就返回 0 —— 不猜。
+  # 端口通 ≠ 端口是 CDP 的；但 CDP 端口是应用自己监听的，listener 就是主进程。
+  param([int]$Port)
+  if ($Port -le 0) { return 0 }
+  try {
+    $conns = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+  } catch { return 0 }
+  $owners = @($conns | ForEach-Object { $_.OwningProcess } | Where-Object { $_ } | Select-Object -Unique)
+  if ($owners.Count -ne 1) { return 0 }
+  return [int]$owners[0]
+}
+
 function Get-MiniMaxProcesses {
   param([string]$ExePath)
   $name = [System.IO.Path]::GetFileNameWithoutExtension($ExePath)
@@ -252,8 +268,51 @@ if (-not $cdpUp) {
   exit 3
 }
 
+# ---------------------------------------------------------------------------
+# 托盘图标：一次性把托盘图标换成 assets\mmx-red-circle.ico（红圆）。
+#
+# 只动托盘图标：不改桌面 mmx-fix 快捷方式图标（那个还是原来的 M），
+# 不改官方 app.asar / exe / 资源 / 注册表。
+#
+# 有意识的简化：Explorer 重建、或应用自己重建托盘时，官方会把缓存里的原图
+# 装回去 —— 那时再走一次 mmx-fix 启动就重新换红圆。不做常驻监控，
+# 不加后台服务/自启。官方直启动（不走这个脚本）也不经过这里。
+#
+# 位置要求：函数定义和调用都在 DryRun 退出、CDP 失败退出之后；
+# 调用点放在 daemon 启动之后（不拖慢 daemon 起来），-NoDaemon 分支照常调用。
+# 失败只记 WARN：绝不影响 daemon 启动，也不改应用生命周期。
+# ---------------------------------------------------------------------------
+function Invoke-MmxTrayIconSwap {
+  param([int]$CdpPort, [string]$ExePath)
+  if (-not $NoTrayIcon) {
+    try {
+      $trayHelper = Join-Path $Root 'set-mmx-tray-icon.ps1'
+      $listenerPid = Get-CdpListenerProcessId -Port $CdpPort
+      if ($listenerPid -le 0) {
+        Write-Log "CDP 端口 $CdpPort 没有唯一监听进程，跳过托盘换图。" 'WARN'
+        return
+      }
+      # helper 自己会再证明一次：EXE 规范路径一致、是主进程、host 窗口唯一、
+      # 图标 ID 唯一。任何一条不成立就只返回失败原因，不会写。
+      # -WaitSeconds 8：冷启动时托盘 host 窗口可能晚于 CDP 就绪，给它有界等待
+      # （helper 上限 30；等不到就只是不换图，绝不影响启动流程）。
+      $trayOut = @(& $trayHelper -TargetProcessId $listenerPid -ExpectedExecutable $ExePath -Apply -WaitSeconds 8)
+      $tray = if ($trayOut.Count -gt 0) { $trayOut[-1] } else { $null }
+      if ($tray -and $tray.ok) {
+        Write-Log "托盘图标已换成红圆：pid=$listenerPid host=$($tray.hostWindow) id=$($tray.iconId)" 'INFO'
+      } else {
+        $why = if ($tray) { $tray.reason } else { 'no-result' }
+        Write-Log "托盘图标未更换（不影响启动流程）：reason=$why" 'WARN'
+      }
+    } catch {
+      Write-Log "托盘换图异常（不影响启动流程）：$($_.Exception.Message)" 'WARN'
+    }
+  }
+}
+
 if ($NoDaemon) {
   Write-Log "CDP 就绪（$port），-NoDaemon：不拉起 daemon。结束。"
+  Invoke-MmxTrayIconSwap -CdpPort $port -ExePath $exe
   exit 0
 }
 
@@ -298,4 +357,7 @@ try {
   # resumes normal healing on its next probe.
   Remove-Item -LiteralPath $HandshakeFile -Force -ErrorAction SilentlyContinue
 }
+
+# daemon 已经起来了，这时才换托盘图标：不拖慢 daemon 启动。
+Invoke-MmxTrayIconSwap -CdpPort $port -ExePath $exe
 exit 0
