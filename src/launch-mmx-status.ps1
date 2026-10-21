@@ -30,7 +30,10 @@ param(
   [switch]$NoReorder,
   # 逃生舱：完全不换托盘图标。默认会把托盘图标换成红圆
   # （assets\mmx-red-circle.ico），出问题或不想换时用这个关掉。
-  [switch]$NoTrayIcon
+  [switch]$NoTrayIcon,
+  # 逃生舱：完全不换任务栏按钮图标（默认把主窗口任务栏按钮换成红圆）。
+  # 与 -NoTrayIcon 互相独立：托盘换图、任务栏换图各管各的。
+  [switch]$NoTaskbarIcon
 )
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -310,9 +313,75 @@ function Invoke-MmxTrayIconSwap {
   }
 }
 
+function Invoke-MmxTaskbarIconSwap {
+  # 任务栏按钮图标：拉起一个隐藏的 keeper 进程，把主窗口任务栏按钮换成红圆。
+  #
+  # 为什么必须常驻进程：图标是 LoadImageW 出来的非共享 HICON，MS 原文说
+  # 「非共享资源随创建它的进程退出被系统销毁」——换完就退，图标就废了。
+  # 所以 keeper 自己一直活着持有这个 HICON，直到目标应用退出。
+  #
+  # 位置要求：函数定义和调用都在 DryRun 退出、CDP 失败退出之后；
+  # 调用点放在 daemon 启动之后（不拖慢 daemon 起来），-NoDaemon 分支照常调用。
+  # 失败只记 WARN：绝不影响 daemon 启动，也不改应用生命周期。
+  #
+  # 这里不判断「有没有换成红」：那要读 keeper 自己写的 JSON 结果文件。
+  # 只凭进程启动成功就宣称换好了是假报，本函数不这么干。
+  param([int]$CdpPort, [string]$ExePath)
+  if ($NoTaskbarIcon) { return }
+  try {
+    $taskbarHelper = Join-Path $Root 'set-mmx-taskbar-icon.ps1'
+    if (-not (Test-Path -LiteralPath $taskbarHelper)) {
+      Write-Log "找不到任务栏换图脚本：$taskbarHelper" 'WARN'
+      return
+    }
+    # 用现成的 CDP 监听 PID 找已经在跑的应用；绝不因为换图去启动官方程序。
+    $listenerPid = Get-CdpListenerProcessId -Port $CdpPort
+    if ($listenerPid -le 0) {
+      Write-Log "CDP 端口 $CdpPort 没有唯一监听进程，跳过任务栏换图。" 'WARN'
+      return
+    }
+    $stateDir = Join-Path $LogDir 'taskbar-icon'
+    if (-not (Test-Path -LiteralPath $stateDir)) {
+      New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
+    }
+    $token = [guid]::NewGuid().ToString('N')
+    $stateFile = Join-Path $stateDir ("keeper-{0}-{1}.json" -f $listenerPid, $token)
+    $psExe = $null
+    try { $psExe = (Get-Process -Id $PID).Path } catch { $psExe = $null }
+    if (-not $psExe) { $psExe = (Get-Command powershell.exe -ErrorAction SilentlyContinue).Source }
+    if (-not $psExe) {
+      Write-Log '找不到 powershell.exe，任务栏换图未启动。' 'WARN'
+      return
+    }
+    # 路径含空格/中文，全部手工套双引号。
+    $argLine = '-NoProfile -WindowStyle Hidden -File "{0}" -TargetProcessId {1} -ExpectedExecutable "{2}" -Apply -WaitSeconds 8 -StateDir "{3}" -RunToken {4}' -f $taskbarHelper, $listenerPid, $ExePath, $stateDir, $token
+    # UseShellExecute=false + CreateNoWindow=true：不给它造控制台窗口
+    # （项目 VBS 注释记过：光靠 -WindowStyle Hidden 仍可能闪黑窗）。
+    # stdout/stderr 重定向到自己的管道：不让 keeper 继承父进程的输出句柄，
+    # 否则父进程退出后管道写端还开着，调用方一直等不到 EOF。
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $psExe
+    $psi.Arguments = $argLine
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.WorkingDirectory = $Root
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    if (-not $proc) {
+      Write-Log '任务栏图标辅助进程启动失败。' 'WARN'
+      return
+    }
+    Write-Log "已启动任务栏图标辅助进程（pid=$($proc.Id)，目标 pid=$listenerPid）；效果见 keeper 结果文件：$stateFile" 'INFO'
+  } catch {
+    Write-Log "任务栏换图异常（不影响启动流程）：$($_.Exception.Message)" 'WARN'
+  }
+}
+
 if ($NoDaemon) {
   Write-Log "CDP 就绪（$port），-NoDaemon：不拉起 daemon。结束。"
   Invoke-MmxTrayIconSwap -CdpPort $port -ExePath $exe
+  Invoke-MmxTaskbarIconSwap -CdpPort $port -ExePath $exe
   exit 0
 }
 
@@ -360,4 +429,5 @@ try {
 
 # daemon 已经起来了，这时才换托盘图标：不拖慢 daemon 启动。
 Invoke-MmxTrayIconSwap -CdpPort $port -ExePath $exe
+Invoke-MmxTaskbarIconSwap -CdpPort $port -ExePath $exe
 exit 0

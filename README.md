@@ -3846,7 +3846,68 @@ fatal: TLS connect error: error:0A000126:SSL routines::unexpected eof
 
 ---
 
-## 19. 致谢
+## 19. 任务栏按钮图标换红圆（WM_SETICON）
+
+把**任务栏上的 MiniMax Code 按钮**（不是右托盘）也换成 `assets\mmx-red-circle.ico` 那个红圆。
+
+### 19.1 机制（微软原文，不猜）
+
+| 事实 | 出处 |
+|---|---|
+| `WM_SETICON`（`0x0080`）给窗口挂 `ICON_BIG(1)` / `ICON_SMALL(0)`；返回值是**上一个图标句柄**，窗口本来没图标时就是 `NULL` —— 返回 0 **不是失败标志** | <https://learn.microsoft.com/en-us/windows/win32/winmsg/wm-seticon> |
+| `WM_GETICON`（`0x007F`）读回窗口当前图标 —— 这才是「已生效」的证据；没显式设过图标的窗口 `DefWindowProc` 返回 0（此时走窗口类图标） | <https://learn.microsoft.com/en-us/windows/win32/winmsg/wm-geticon> |
+| `LoadImageW` 从**文件**加载时**不能加 `LR_SHARED`**；非共享资源「随创建它的进程退出被系统销毁」 | <https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-loadimagew> |
+
+第三条决定了架构：HICON 必须由一个**常驻进程**一直持有到目标进程结束，否则进程一退图标就变野句柄。所以换图是一个 **keeper 进程**，不是一个一次性调用。
+
+### 19.2 三个文件
+
+- `src/set-mmx-taskbar-icon.ps1` —— 默认**只读探测**；`-Apply` 才下发 `WM_SETICON` 并常驻持有 HICON；`-Stop` 让在跑的 keeper 恢复原图并退出。
+- `src/test-taskbar-icon.ps1` —— 116 项自检（门禁 / 假适配器失败分支 / 真实窗口原生回路 / 生命周期回归 / 接线静态检查）；PS 5.1 与 PS 7 各用真实 `-File` 入口跑一遍默认 probe。
+- `src/launch-mmx-status.ps1` —— 新增 `-NoTaskbarIcon` 逃生开关（与 `-NoTrayIcon` **互相独立**）；daemon 起来之后、以及 `-NoDaemon` 分支都会拉 keeper。
+
+### 19.3 身份门禁（fail closed）
+
+必须**全系统唯一**满足下列条件的顶级窗口才是「主窗口」：`class == Chrome_WidgetWin_1`、
+`title == 'MiniMax Code'`、`owner == 0`、可见、非 `WS_EX_TOOLWINDOW`。
+同进程那个 offscreen 的 `Mavis Browser Background Render Host 1` 因此被排除；
+**不用** `Get-Process.MainWindowHandle`（它会误选无标题的临时 tool 窗口），**不用**矩形排除（最小化/多屏都不成立）。
+EXE 规范路径、命令行可得性、辅助子进程（`--type=` / `--eval` / `--run-as-node` / `host-runner.js`）任一条不成立就只读不写。
+
+### 19.4 keeper 的生命周期
+
+- 目标进程退出 / 主窗口销毁 → 释放 HICON 退出；**读回证明不了窗口不再引用时，改为继续持有**（不销毁、不退出，报 `retaining`）。
+- 收到停止指令 → 先在「窗口仍引用我们的 handle」时恢复原值（恢复值取 `WM_SETICON` 返回的 `Old`，不是更早的快照），再释放。
+- 单实例互斥按「目标 PID + 创建时间」命名（防 PID 复用、防重复启动多份）。
+- 只设一次，不轮询重设：官方自己换回原图时不跟它抢。
+
+### 19.5 手工对**当前已在跑**的应用热应用（不重启、不经 launcher）
+
+```powershell
+# 只读探测（先确认门禁能唯一锁定主窗口）
+powershell -NoProfile -File .\src\set-mmx-taskbar-icon.ps1 `
+  -TargetProcessId 48588 -ExpectedExecutable "D:\MiniMax\MiniMax Code\MiniMax Code.exe"
+
+# 真正换图（隐藏常驻，自己持有图标；结果写 logs\taskbar-icon\keeper-<pid>-<token>.json）
+powershell -NoProfile -WindowStyle Hidden -File .\src\set-mmx-taskbar-icon.ps1 `
+  -TargetProcessId 48588 -ExpectedExecutable "D:\MiniMax\MiniMax Code\MiniMax Code.exe" -Apply
+
+# 安全停止（先恢复原图再退出）
+powershell -NoProfile -File .\src\set-mmx-taskbar-icon.ps1 -TargetProcessId 48588 -Stop
+```
+
+### 19.6 已知边界
+
+- 不写 `System.AppUserModel.ID` / `Relaunch*` 属性，不碰窗口类图标，不动注册表、快捷方式、官方 exe/asar/资源；不新建任务栏按钮、不造分组。
+- keeper 只在 MiniMax 运行期间存在；应用退出即结束；不新增开机自启、不加新服务。
+- **尚未对真实应用做过 Apply 验收**（本轮只做了只读探测 + 隔离自检）。
+- ⚠️ 2026-10-22 事故记录：自检里曾拿**真实主窗句柄**当假句柄，导致一次真 `WM_SETICON` 打到了用户正在用的窗口，随后 HICON 被销毁、窗口留下野句柄。已改：假句柄固定为不可能是窗口的值并加断言；`Remove-MmxTaskbarHeldIcons` 要求「能证明窗口不再引用」才允许销毁；原生适配器改成 **fail-closed**（桩缺失直接抛错，绝不回退真实 API）。
+- 事故留下的悬空句柄**不需要靠重启清**：用一次性候选脚本 `logs\taskbar-repair\repair-dangling-taskbar-icon.ps1` 归零（默认只读，`-Apply` 才写；门禁要求「同一 PID + 同一创建时间、同一窗口句柄/类/归属、当前图标一字不差等于事故记录」，任何一条不符立即拒绝；只发 `WM_SETICON(NULL)`，绝不 `DestroyIcon` 旧句柄）。归零后再按正常流程起 keeper，它保存的 Old 就是 0，`-Stop` 恢复的也是 0。
+- ⚠️ **强杀 keeper = 图标重新变悬空**：HICON 由 keeper 进程持有，进程一死系统就销毁它，窗口会再次挂上野句柄（和上面那次事故同形状）。要停就用 `-Stop`（先恢复原图再退出），别直接杀进程。
+
+---
+
+## 20. 致谢
 
 - 第三方项目 [`sqing33/minimax-code-skin`](https://github.com/sqing33/minimax-code-skin)
   首次证明了 CDP 路线在 MiniMax Code 上可行。**但要注意**：它的 subagent 识别在真机上
