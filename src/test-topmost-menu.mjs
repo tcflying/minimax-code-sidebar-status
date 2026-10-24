@@ -426,7 +426,9 @@ if (MUT === 'm1') {
   // produced is a budget that quietly reaches zero while a lock is held, so the
   // one window where the correction could actually have landed is the window
   // where the corrector has already spent itself.
-  const from = `    if (autoTopPending && topmostLockView.id) {
+  // 2026-10-24 之后同一纪律换了形状：让位只在【证不出锁顶落点】时发生，预算照旧
+  // 只为【我们造成的失败】扣。
+  const from = `    if (autoTopPending && lockSlot.blocked) {
       autoTopState.deferred++;
       autoTopState.lastReason = 'toplock-other';
       return;
@@ -3201,9 +3203,10 @@ console.log('\n=== 23B. 入口语义：落意图、解除、能力不足，与�
 // 时 A 的下标也确实从 0 变成了 1，那不是需要纠正的移动，是我们必须让开的
 // 一次真实操作。判据是【成员】不是【下标】。
 //
-// 24.x 逐条钉住：只认新成员、只在不在 0 时补一次三参、绝不搬动其余项、共享
+// 24.x 逐条钉住：只认新成员、只在不在该落的位时补一次三参、绝不搬动其余项、共享
 // 闸、窗口预算、有界（一次变化最多一次调用）、不可证明时暂停且保留基线、
-// 锁顶意图在场时让位、绝不写 localStorage、绝不动宿主 DOM 行序。
+// 锁顶在场时落在锁后面（证不出锁顶落点则让位）、绝不写 localStorage、绝不动宿主
+// DOM 行序。
 // ===========================================================================
 function autoPage(opts = {}) {
   const why = [];
@@ -3345,68 +3348,64 @@ console.log('\n=== 24. 自动到最顶：新成员不在首位就补一次三参
   }
 }
 {
-  // 锁顶意图在场：让位。锁的维持才是用户按过按钮授权的那一次。
+  // 锁顶在场（用户 2026-10-24 新规则）：锁保持第一，新对话紧跟其后。
+  // 这一趟的 order 能证明锁顶就在 raw[0]，所以落点是 raw[1] —— 不是 raw[0]，
+  // 也不是"锁在场就零写"。
   const A = autoPage();
   if (A.ok) {
     await tick(A); await tick(A);
     commit(A.p, A.host, A.host.order.concat([ref('mvs_new')]));
     A.p.api.lockView.id = 'mvs_a';
     await tick(A); await tick(A);
-    check('24.10 锁顶意图在场时让位（不与锁对拉，零宿主写）',
-      A.host.calls.length === 0 && A.p.api.autoState.deferred >= 1,
-      `calls=${A.host.calls.length} deferred=${A.p.api.autoState.deferred}`);
+    check('24.10 锁顶在场：新成员补到 raw[1]，锁留在 raw[0]',
+      A.host.calls.length === 1
+      && JSON.stringify(A.host.calls[0]) === JSON.stringify(['mvs_new', true, 1])
+      && JSON.stringify(ids(A.host)) === JSON.stringify(['mvs_a', 'mvs_new', 'mvs_b', 'mvs_c']),
+      `calls=${JSON.stringify(A.host.calls)} order=${JSON.stringify(ids(A.host))}`);
   } else {
     check('24.10 前置：自动到顶这一段在出厂里', false, A.why);
   }
-  // D1 回归：让位只【推迟】一次补写，绝不把它取消掉。
+  // D1 回归：锁顶在场不取消这一次纠正，只是把落点挪到锁后面。
   // 锁顶意图在场期间用户又建了一个会话并点了自己的置顶，宿主把它追加到末尾。
-  // 那一趟我们让位（零宿主写）；锁一释放，同一个新成员必须【仍然】被补到下标 0。
-  // 旧实现把成员基线在让位判断【之前】就推进了，于是这个新成员被当成了"上一趟
-  // 就已经知道"，锁释放后 prev 与 ids 相同，一次调用都不会再发生——用户新建会话
-  // 置顶后没到最顶，这个症状就是这么留下来的。
+  // 那一趟我们把它补到 raw[1]（锁留在 raw[0]）；锁一释放，已经落位的那一项不再
+  // 被搬动 —— 纠正器按【事件】动作，落位即结算，不追记"它当初是为了让锁才落的位"。
   const D = autoPage();
   if (D.ok) {
     await tick(D); await tick(D);                          // 基线 = [a,b,c]
     commit(D.p, D.host, D.host.order.concat([ref('mvs_new')]));
     D.p.api.lockView.id = 'mvs_a';                         // 锁顶意图在场
-    await tick(D); await tick(D);                          // 让位那一趟
-    check('24.10b 让位那一趟零宿主写（deferred 计数照记，让位语义没被改坏）',
-      D.host.calls.length === 0 && D.p.api.autoState.calls === 0
-      && D.p.api.autoState.deferred === 1 && D.p.api.autoState.lastReason === 'toplock-other',
-      `calls=${D.host.calls.length} apiCalls=${D.p.api.autoState.calls} deferred=${D.p.api.autoState.deferred} reason=${D.p.api.autoState.lastReason}`);
-    D.p.api.lockView.id = '';                              // 锁释放
-    await tick(D);                                         // 决定趟：补写一次
+    await tick(D); await tick(D);                          // 决定那一趟
+    check('24.10b 锁顶在场：新成员补到 raw[1]（锁保持第一，新对话紧跟其后）',
+      D.host.calls.length === 1
+      && JSON.stringify(D.host.calls[0]) === JSON.stringify(['mvs_new', true, 1])
+      && JSON.stringify(ids(D.host)) === JSON.stringify(['mvs_a', 'mvs_new', 'mvs_b', 'mvs_c']),
+      `calls=${JSON.stringify(D.host.calls)} order=${JSON.stringify(ids(D.host))}`);
     // 宿主按这一次写重渲染，也就是闭包里那份 order 换新（与 24.5 的 commit 同一
     // 件事）。落位是在 cap.order 上被读到的：不先把这一份落进闭包，下一趟看到的
     // 仍然是补写之前那份顺序，纠正器就有理由把这次变化当成"没落位"再补一次。
-    // 旧实现不需要这一步，是因为它在【尝试时】就把基线推进了——那正是这次要改掉
-    // 的形状（resolve 即消费）。所以这条断言仍然钉住的是"落位之后不再重复写"，
-    // 而不是"发出去一次就不管"。
     commit(D.p, D.host, D.host.order);
     await tick(D); await tick(D);
-    check('24.10c 锁释放后，让位期间到达的新成员仍被补到下标 0（让位只推迟，不取消）',
-      D.host.calls.length === 1
-      && JSON.stringify(D.host.calls[0]) === JSON.stringify(['mvs_new', true, 0])
-      && D.p.api.autoState.calls === 1,
-      `calls=${JSON.stringify(D.host.calls)} apiCalls=${D.p.api.autoState.calls} reason=${D.p.api.autoState.lastReason}`);
+    check('24.10c 落位被认下（不再重复写：同一趟变化仍然最多一次调用）',
+      D.host.calls.length === 1 && D.p.api.autoState.calls === 1
+      && D.p.api.autoState.confirmed === 1,
+      `calls=${JSON.stringify(D.host.calls)} apiCalls=${D.p.api.autoState.calls} `
+      + `confirmed=${D.p.api.autoState.confirmed} reason=${D.p.api.autoState.lastReason}`);
+    D.p.api.lockView.id = '';                              // 锁释放
     await tick(D); await tick(D);
     await tick(D); await tick(D);
-    check('24.10d 补完之后不重复写（同一趟变化仍然最多一次调用）',
+    check('24.10d 锁释放后不再搬动已落位的那一项（纠正器按事件动作）',
       D.host.calls.length === 1 && D.p.api.autoState.calls === 1,
-      `calls=${JSON.stringify(D.host.calls)} apiCalls=${D.p.api.autoState.calls}`);
+      `calls=${JSON.stringify(D.host.calls)} apiCalls=${D.p.api.autoState.calls} `
+      + `order=${JSON.stringify(ids(D.host))}`);
   } else {
     check('24.10b 前置：自动到顶这一段在出厂里', false, D.why);
   }
-  // A13 让位的另一半：预算【不能】在锁在场期间被扣掉。
+  // A13 的一半：预算【不能】因为不是我们造成的 order 变化而被扣掉。
   //
-  // 24.10 那一条钉的是"锁在场时我们不写"。这里钉的是"锁在场时我们也不【记账】"。
-  // 旧实现把让位判断放在待办确认【之后】：锁在场期间，只要有待办在飞，宿主那份
-  // order 一动（静默回滚、用户自己拖了一下、别的纠正器改写了），这一趟就落进
-  // "形态还在、目标没到下标 0 = 确认失败"，扣一次预算。三趟下来预算见底，于是
-  // 锁一释放、真正的补写机会来了的时候，预算已经没了，什么也不做。
-  //
-  // 而那三次扣费一次都不该发生：锁顶意图在场期间我们本来就【不打算】写，那段
-  // order 的变化根本不是我们造成的。deferred 该照记，pending 该留着。
+  // 24.10 那一条钉的是"锁在场时落在锁后面（raw[1]），不与锁对拉"。这里钉的是
+  // "落点前提变了本身不是失败"：锁顶是在那一次写【之后】才登场的，我们那一次写
+  // 的落点前提（无锁 = raw[0]）已经变了 —— 前提变了不扣账。但那一次写如果真的
+  // 没落位（这一段里宿主静默回滚了它），照旧扣一次：账不能因为前提变了就免掉。
   const E = autoPage();
   if (E.ok) {
     await tick(E); await tick(E);                            // 基线 = [a,b,c]
@@ -3419,28 +3418,58 @@ console.log('\n=== 24. 自动到最顶：新成员不在首位就补一次三参
     // 锁顶意图【在补写之后】才登场：这一次写是锁在不在场时自己做的，与锁无关。
     E.p.api.lockView.id = 'mvs_a';
     // 宿主静默回滚：闭包里的 order 换回补写【之前】那一份（模块完全不知情）。
-    // 这正是待办确认里"形态还在、目标没到下标 0"的那一种：待办记下的形态就是
-    // 补写之前那份，所以回滚到它 = 我们那一次写没落位。
     commit(E.p, E.host, [ref('mvs_a'), ref('mvs_b'), ref('mvs_c'), ref('mvs_new')]);
-    await tick(E); await tick(E); await tick(E); await tick(E);
-    check('24.10f 锁在场期间宿主静默回滚 4 趟，预算一格都没扣（failed=0、budget 满）',
-      E.p.api.autoState.failed === 0 && E.p.api.autoState.budget === E.p.api.autoMax,
-      `failed=${E.p.api.autoState.failed} budget=${E.p.api.autoState.budget}/${E.p.api.autoMax} `
-      + `reason=${E.p.api.autoState.lastReason} deferred=${E.p.api.autoState.deferred}`);
-    check('24.10f 锁在场期间让位计数照常（语义没被改坏）',
-      E.p.api.autoState.deferred >= 1, `deferred=${E.p.api.autoState.deferred}`);
-    check('24.10f 锁在场期间一次宿主写都没有发生',
-      E.host.calls.length === 1, `calls=${JSON.stringify(E.host.calls)}`);
-    E.p.api.lockView.id = '';                                 // 锁释放
-    await tick(E);
-    check('24.10g 锁释放后仍然能补（预算没被锁在场期间的那些趟吃掉）',
+    await tick(E);                                           // 前提变了：重新指向 raw[1]
+    commit(E.p, E.host, E.host.order);                      // 宿主按这一次写重渲染
+    await tick(E); await tick(E); await tick(E);
+    check('24.10f 锁在场期间：新成员补到 raw[1]，锁留在 raw[0]',
       E.host.calls.length === 2
-      && JSON.stringify(E.host.calls[1]) === JSON.stringify(['mvs_new', true, 0])
-      && E.p.api.autoState.calls === 2,
+      && JSON.stringify(E.host.calls[1]) === JSON.stringify(['mvs_new', true, 1])
+      && JSON.stringify(ids(E.host)) === JSON.stringify(['mvs_a', 'mvs_new', 'mvs_b', 'mvs_c']),
+      `calls=${JSON.stringify(E.host.calls)} order=${JSON.stringify(ids(E.host))}`);
+    check('24.10f 前提变了不多扣账，但真的没落位的那一次照扣（账不因前提变化被免掉）',
+      E.p.api.autoState.failed === 1 && E.p.api.autoState.budget === E.p.api.autoMax - 1,
+      `failed=${E.p.api.autoState.failed} budget=${E.p.api.autoState.budget}/${E.p.api.autoMax} `
+      + `reason=${E.p.api.autoState.lastReason}`);
+    E.p.api.lockView.id = '';                                 // 锁释放
+    await tick(E); await tick(E);
+    check('24.10g 锁释放后不再搬动已落位的那一项（纠正器按事件动作）',
+      E.host.calls.length === 2 && E.p.api.autoState.calls === 2,
       `calls=${JSON.stringify(E.host.calls)} apiCalls=${E.p.api.autoState.calls} `
-      + `budget=${E.p.api.autoState.budget} reason=${E.p.api.autoState.lastReason}`);
+      + `order=${JSON.stringify(ids(E.host))}`);
   } else {
     check('24.10e 前置：自动到顶这一段在出厂里', false, E.why);
+  }
+  // A13 的另一半，现在有了更精确的形状：让位只在【这一趟的 order 证不出锁顶就在
+  // raw[0]】时发生。锁顶在场但位置证不出来（不在 raw[0]）时，这一趟一次宿主写
+  // 都不发生，待办留着，预算一格都不扣 —— 那段 order 的变化不是我们造成的。
+  const F = autoPage();
+  if (F.ok) {
+    await tick(F); await tick(F);                            // 基线 = [a,b,c]
+    commit(F.p, F.host, F.host.order.concat([ref('mvs_new')]));
+    await tick(F); await tick(F);                            // 补写一次，待办在飞
+    F.p.api.lockView.id = 'mvs_b';                           // 锁顶在场，但不在 raw[0]
+    commit(F.p, F.host, [ref('mvs_a'), ref('mvs_b'), ref('mvs_c'), ref('mvs_new')]);
+    await tick(F); await tick(F); await tick(F); await tick(F);
+    check('24.10h 锁顶证不出在 raw[0]：零宿主写、预算一格都没扣（deferred 照记）',
+      F.host.calls.length === 1 && F.p.api.autoState.calls === 1
+      && F.p.api.autoState.failed === 0 && F.p.api.autoState.budget === F.p.api.autoMax
+      && F.p.api.autoState.deferred >= 1 && F.p.api.autoState.lastReason === 'toplock-other',
+      `calls=${JSON.stringify(F.host.calls)} failed=${F.p.api.autoState.failed} `
+      + `budget=${F.p.api.autoState.budget}/${F.p.api.autoMax} `
+      + `deferred=${F.p.api.autoState.deferred} reason=${F.p.api.autoState.lastReason}`);
+    F.p.api.lockView.id = '';                                 // 锁顶撤掉
+    await tick(F);                                           // 决定趟：补写一次
+    commit(F.p, F.host, F.host.order);                      // 宿主按这一次写重渲染
+    await tick(F); await tick(F);
+    check('24.10i 锁顶撤掉之后那一项仍然被补到 order[0]（让位只推迟，不取消）',
+      F.host.calls.length === 2
+      && JSON.stringify(F.host.calls[1]) === JSON.stringify(['mvs_new', true, 0])
+      && F.p.api.autoState.calls === 2,
+      `calls=${JSON.stringify(F.host.calls)} apiCalls=${F.p.api.autoState.calls} `
+      + `failed=${F.p.api.autoState.failed} reason=${F.p.api.autoState.lastReason}`);
+  } else {
+    check('24.10h 前置：自动到顶这一段在出厂里', false, F.why);
   }
   // 闸被别人占着：零写。
   const B = autoPage({ page: { foreignTicket: Object.freeze({ held: 'other' }) } });
@@ -3546,7 +3575,7 @@ console.log('\n=== 24. 自动到最顶：新成员不在首位就补一次三参
   check('24.16 自动到顶这一段在出厂里', cut >= 0 && endCut > cut, 'cut=' + cut);
   check('24.16 它自己只有那一个三参写点，且经由能力解析出来的 cap.fn',
     (body.match(/\.fn\(/g) || []).length === 1
-    && body.indexOf('cap.fn(id, true, 0)') >= 0,
+    && body.indexOf('cap.fn(id, true, lockSlot.slot)') >= 0,
     'writes=' + (body.match(/\.fn\(/g) || []).length);
   check('24.16 它不碰 DOM 行序（无 insertBefore / appendChild / removeChild）',
     !/insertBefore|appendChild|removeChild/.test(body), 'dom-writes');
@@ -3932,9 +3961,9 @@ console.log('\n=== 25. 晚挂载的弹层：探测预算不够导致真机零注
 // 把本段的状态判据抄进 24 段会让新成员永远不被补到最顶。
 //
 // 26.x 逐条钉住：置顶第 3 位开始对话补写一次三参、其余项相对次序一个字节不变、
-// 宿主 DOM 行序一个字节不变、会话结束不回位、锁顶在场零写且释放后仍能补上、
-// 纯拖拽零写、云端 id 零写、order 不可证明零写且基线不动、预算有界、已在下标 0
-// 零写、与自动到顶共用同一把闸。
+// 宿主 DOM 行序一个字节不变、会话结束不回位、锁顶在场时落在锁后面、
+// 纯拖拽零写、云端 id 零写、order 不可证明零写且基线不动、预算有界、已在该落的
+// 位上零写、与自动到顶共用同一把闸。
 // ===========================================================================
 function promotePage(opts = {}) {
   const why = [];
@@ -4033,29 +4062,32 @@ console.log('\n=== 26. 活动会话上浮：置顶项开始对话就补一次三
   }
 }
 {
-  // 锁顶意图在场：让位，而且不推进状态基线。让位期间开始对话的那一项在锁释放
-  // 后必须仍然被认出来——这正是 D1（24.10b/24.10c）修过的形状。
+  // 锁顶在场（用户 2026-10-24 新规则）：锁保持第一，正在跑的那一项紧跟其后。
   const A = promotePage();
   if (A.ok) {
     await armPromote(A);
-    A.p.api.lockView.id = 'mvs_a';                        // 锁顶意图在场
-    await ptick(A, { mvs_c: 'running' });                // 让位期间 c 开始对话
-    check('26.5 V4a 锁顶在场时零写（deferred 照记，让位语义没被改坏）',
-      A.host.calls.length === 0 && A.p.api.promoteState.calls === 0
-      && A.p.api.promoteState.deferred >= 1
-      && A.p.api.promoteState.lastReason === 'toplock-other',
-      `calls=${A.host.calls.length} deferred=${A.p.api.promoteState.deferred} reason=${A.p.api.promoteState.lastReason}`);
-    await ptick(A, { mvs_c: 'running' });                // 仍在让位
-    check('26.5 V4a 让位期间基线不推进（第二次让位仍记 deferred，而不是已经写过）',
-      A.host.calls.length === 0 && A.p.api.promoteState.deferred >= 2,
-      `calls=${A.host.calls.length} deferred=${A.p.api.promoteState.deferred}`);
-    A.p.api.lockView.id = '';                             // 锁释放
-    await ptick(A, { mvs_c: 'running' });
-    check('26.5 V4b 锁释放后，让位期间开始对话的那一项仍然被浮到最顶（让位只推迟，不取消）',
+    A.p.api.lockView.id = 'mvs_a';                        // 锁顶意图在场（raw[0]）
+    await ptick(A, { mvs_c: 'running' });                // c 开始对话
+    check('26.5 V4a 锁顶在场：正在跑的那一项浮到 raw[1]，锁留在 raw[0]',
       A.host.calls.length === 1
-      && JSON.stringify(A.host.calls[0]) === JSON.stringify(['mvs_c', true, 0])
-      && A.p.api.promoteState.calls === 1,
-      `calls=${JSON.stringify(A.host.calls)} apiCalls=${A.p.api.promoteState.calls}`);
+      && JSON.stringify(A.host.calls[0]) === JSON.stringify(['mvs_c', true, 1])
+      && JSON.stringify(ids(A.host)) === JSON.stringify(['mvs_a', 'mvs_c', 'mvs_b']),
+      `calls=${JSON.stringify(A.host.calls)} order=${JSON.stringify(ids(A.host))}`);
+    settleOrder(A.p, A.host);
+    await ptick(A, { mvs_c: 'running' });                // 持续 running
+    check('26.5 V4a 持续 running 不重复写（锁顶在场也一样）',
+      A.host.calls.length === 1 && A.p.api.promoteState.calls === 1,
+      `calls=${JSON.stringify(A.host.calls)} apiCalls=${A.p.api.promoteState.calls} `
+      + `confirmed=${A.p.api.promoteState.confirmed}`);
+    A.p.api.lockView.id = '';                             // 锁释放
+    await ptick(A, { mvs_c: 'running' });                // 仍在飞的待办被重新指向 raw[0]
+    check('26.5 V4b 锁释放时仍在飞的待办被重新指向 order[0]（落点前提变了就重算）',
+      A.host.calls.length === 2
+      && JSON.stringify(A.host.calls[1]) === JSON.stringify(['mvs_c', true, 0])
+      && JSON.stringify(ids(A.host)) === JSON.stringify(['mvs_c', 'mvs_a', 'mvs_b']),
+      `calls=${JSON.stringify(A.host.calls)} order=${JSON.stringify(ids(A.host))}`);
+    settleOrder(A.p, A.host);
+    await ptick(A, { mvs_c: 'running' });
     // 预算住在 window 上，而且扣的是【确认失败】而不是【尝试】：这一次上浮真
     // 落位了（下面 26.3 会钉住它落位），所以一分钱没花。期望值从 budget===2 改成
     // ===max 是这次语义变化的直接后果，理由不是"数字好看"，而是"落位不该扣预算"
@@ -4257,7 +4289,7 @@ console.log('\n=== 26. 活动会话上浮：置顶项开始对话就补一次三
   const body = cut < 0 ? '' : BLOCK.slice(cut, endCut < 0 ? cut : endCut + 4);
   check('26.13 上浮这一段在出厂里', cut >= 0 && endCut > cut, 'cut=' + cut);
   check('26.13 它自己只有那一个三参写点，且经由能力解析出来的 cap.fn',
-    (body.match(/\.fn\(/g) || []).length === 1 && body.indexOf('cap.fn(id, true, 0)') >= 0,
+    (body.match(/\.fn\(/g) || []).length === 1 && body.indexOf('cap.fn(id, true, lockSlot.slot)') >= 0,
     'writes=' + (body.match(/\.fn\(/g) || []).length);
   check('26.13 它不碰 DOM 行序（无 insertBefore / appendChild / removeChild）',
     !/insertBefore|appendChild|removeChild/.test(body), 'dom-writes');
@@ -4294,13 +4326,13 @@ console.log('\n=== 26. 活动会话上浮：置顶项开始对话就补一次三
     const proEnd = pageSrc.indexOf('\n  }\n', proAt);
     const proBody = pageSrc.slice(proAt, proEnd < 0 ? proAt : proEnd);
     check('26.13a autoTop：锁顶让位判断排在第一次扣预算（topmostCharge）之前',
-      autoBody.indexOf('topmostLockView.id') >= 0
-      && autoBody.indexOf('topmostLockView.id') < autoBody.indexOf('topmostCharge('),
-      `lock=${autoBody.indexOf('topmostLockView.id')} charge=${autoBody.indexOf('topmostCharge(')}`);
+      autoBody.indexOf('lockSlot.blocked') >= 0
+      && autoBody.indexOf('lockSlot.blocked') < autoBody.indexOf('topmostCharge('),
+      `lock=${autoBody.indexOf('lockSlot.blocked')} charge=${autoBody.indexOf('topmostCharge(')}`);
     check('26.13b promote：锁顶让位判断同样排在第一次扣预算之前',
-      proBody.indexOf('topmostLockView.id') >= 0
-      && proBody.indexOf('topmostLockView.id') < proBody.indexOf('topmostCharge('),
-      `lock=${proBody.indexOf('topmostLockView.id')} charge=${proBody.indexOf('topmostCharge(')}`);
+      proBody.indexOf('lockSlot.blocked') >= 0
+      && proBody.indexOf('lockSlot.blocked') < proBody.indexOf('topmostCharge('),
+      `lock=${proBody.indexOf('lockSlot.blocked')} charge=${proBody.indexOf('topmostCharge(')}`);
   }
   check('26.13 可观测：api.topmost().pinnedPromote 暴露与 autoTop 同风格的计数',
     /pinnedPromote: \{[\s\S]*?passes: promoteState\.passes,[\s\S]*?lastReason: promoteState\.lastReason,[\s\S]*?\}/.test(pageSrc)

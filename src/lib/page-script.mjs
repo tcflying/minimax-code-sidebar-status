@@ -1681,6 +1681,53 @@ function __mmxStatusMain(cfg) {
   }
 
   // ---------------------------------------------------------------------
+  // 锁顶在场时，正确器的落点（用户 2026-10-24 新规则：锁顶保持第一，新对话紧跟其后）
+  //
+  // 一条判据，两个纠正器共用：
+  //   没有锁顶意图              -> { slot: 0, lock: '' }    置顶区最顶（原语义不变）
+  //   锁顶【已证实】在 raw[0]  -> { slot: 1, lock: id }    锁保持第一，目标紧跟其后
+  //   锁顶在场但证不出 raw[0]  -> { blocked: reason }       一次宿主写都不发生
+  //
+  // "证实"的意思只有一条：这一趟【自己的】cap.order（fiber 树、唯一七依赖 hook、
+  // source === 'local'、只读探针都已经在 topmostCapability 里证过）把锁顶 id 放在
+  // RAW 下标 0。RAW 是因为宿主那个插入下标本来就是 RAW 下标：order 里可能混着非
+  // 会话行，而本模块比较的那份 ids 只含会话行，两者的下标不是一回事。
+  //
+  // 其余一切（锁顶失踪、不在 0、source 未知/不匹配、视图证不出来）都不是"猜 0 或 1"
+  // 的许可，是拒绝：证不出来就让位，绝不写到猜出来的位置上。
+  function topmostLockSlot(cap) {
+    var locked = topmostLockView.id;
+    if (!locked) return { slot: 0, lock: '' };
+    // 证不出来时也把 slot / lock 填成"无锁"的样子：blocked 才是那一位真正读的
+    // 标志，数字槽位只是不让待办的前提比较拿到 undefined。
+    if (!cap || !cap.order || !isArray(cap.order)) return { slot: 0, lock: '', blocked: 'view-unstable' };
+    if (cap.source !== 'local') return { slot: 0, lock: '', blocked: 'source-not-local' };
+    if (!topmostAutoTopId(locked)) return { slot: 0, lock: '', blocked: 'not-local-id' };
+    var at = -1;
+    for (var i = 0; i < cap.order.length; i++) {
+      var it = cap.order[i];
+      if (it && it.type === 'session' && String(it.id) === locked) { at = i; break; }
+    }
+    if (at < 0) return { slot: 0, lock: '', blocked: 'order-missing-id' };
+    if (at !== 0) return { slot: 0, lock: '', blocked: 'lock-not-at-top' };
+    return { slot: 1, lock: locked };
+  }
+
+  // 目标是不是已经在【它该落的那一位】上。也是一条判据，两个纠正器共用。
+  //   有锁：落点是 RAW 下标（宿主那个插入下标就是 RAW 下标）
+  //   无锁：落点仍是本模块一直用的会话下标 0（不变）
+  function topmostAtSlot(cap, ids, id, slot) {
+    if (slot === 1) {
+      for (var i = 0; i < cap.order.length; i++) {
+        var it = cap.order[i];
+        if (it && it.type === 'session' && String(it.id) === id) return i === 1;
+      }
+      return false;
+    }
+    return ids.indexOf(id) === 0;
+  }
+
+  // ---------------------------------------------------------------------
   // 新出现的置顶项自动补到最顶
   //
   // 用户 2026-10-05 反馈：新建会话点宿主自己的「置顶」后，它落在置顶区【最底
@@ -1821,41 +1868,66 @@ function __mmxStatusMain(cfg) {
       return;
     }
     var prev = autoTopIds;
-    // 锁顶意图在场时让位（扣费之前的那一道，A13）。
-    //
-    // 这一段原来放在待办确认【之后】，于是锁在场期间宿主那份 order 一动（静默回滚、
-    // 用户自己拖了一下、别的纠正器改写了），待办就落进"形态还在、目标没到下标 0 =
-    // 确认失败"，扣一次预算。可那几次扣费一次都不该发生：锁顶意图在场时我们
-    // 【本来就不打算】写，那段 order 的变化不是我们造成的。三趟下来预算见底，等
-    // 锁一释放、真正的补写机会真的来了，预算已经没了，什么也不做——用户看到的
-    // 就是"锁着的时候那次纠正彻底没发生"。
-    //
-    // 所以让位必须【提到扣费之前】：待办留着（不确认、不扣费），deferred 照常 +1，
-    // 这一趟一次宿主写都不发生。与下面那条"变化中的让位"是同一条纪律，只是它
-    // 提前到了记账之前；两者写的都不是同一个变量（那边推迟的是【这一次变化】，
-    // 这边推迟的是【这一次变化的结果】），所以两条都要留。
-    if (autoTopPending && topmostLockView.id) {
+    // 这一趟锁顶的落点。锁顶在场且【这一趟自己的 order】能证明它就在 raw[0] 时，
+    // 我们不是让位，是把落点从 0 挪到 1（锁保持第一，新对话紧跟其后）；证不出来
+    // （失踪 / 不在 0 / source 不对 / 视图不可证）时才让位。
+    var lockSlot = topmostLockSlot(cap);
+    // 让位仍然【提到扣费之前】（A13）：锁顶在场却证不出它的落点时，那一段 order
+    // 的变化不是我们造成的，待办留着（不确认、不扣费），deferred 照常 +1，这一趟
+    // 一次宿主写都不发生。放回待办确认之后，那几次扣费会把预算白白吃掉，等锁顶
+    // 真正能被证实、真正的补写机会来了的时候，预算已经没了。
+    if (autoTopPending && lockSlot.blocked) {
       autoTopState.deferred++;
       autoTopState.lastReason = 'toplock-other';
       return;
     }
-    // 先确认上一次待纠正的那一次变化。只有确认了（目标真落到下标 0，或那一份形态
-    // 已经消失）基线才推进；确认失败则扣一次预算并把待办留到下一趟。被闸挡、抛异
-    // 常、reject、resolve 了但 order 没动，四种都落在下面这三条里。
+    // 先确认上一次待纠正的那一次变化。只有确认了（目标真落到【它该落的那一位】，或
+    // 那一份形态已经消失）基线才推进；确认失败则扣一次预算并把待办留到下一趟。被闸
+    // 挡、抛异常、reject、resolve 了但 order 没动，四种都落在下面这三条里。
     if (autoTopPending) {
-      if (ids.indexOf(autoTopPending.id) === 0) {
+      // 待办的落点前提是否还成立？锁顶出现 / 释放 / 切换都会改落点，而那不是我们
+      // 造成的失败：前提变了就【不判定、不扣费】，只把待办重新指向新落点。
+      var pendSame = autoTopPending.slot === lockSlot.slot
+        && autoTopPending.lock === (lockSlot.lock || '');
+      if (lockSlot.lock && autoTopPending.id === lockSlot.lock) {
+        // 待办的目标就是锁顶自己。锁顶已经把它按在 raw[0]，那一次写【成了】——
+        // 它不是失败，不扣预算。【也不推进基线】：这一趟里还没被消费的新成员不能
+        // 被这一次作废顺带吞掉（吞掉了它们就再也不会被补）。待办就此作废，下面
+        // 照常挑选别的新成员。
+        autoTopPending = null;
+        autoTopState.lastReason = 'lock-absorbed';
+      } else if (topmostAtSlot(cap, ids, autoTopPending.id, lockSlot.slot)) {
         autoTopIds = ids.slice();
         autoTopPending = null;
         autoTopState.confirmed++;
         autoTopState.lastReason = 'landed';
         prev = autoTopIds;
+      } else if (!pendSame) {
+        if (hostCallBusy()) {
+          // 我们那一次调用还在飞：等它结算，落点前提变了也不在这里重指向 —— 那会
+          // 把在途 attempt 的证据（tried / ids 快照）抹掉，等于替它免了账。
+          autoTopState.awaiting++;
+          autoTopState.lastReason = 'awaiting-host';
+          return;
+        }
+        // 前提变了（锁顶出现 / 释放 / 切换）：先按【旧落点】判那一次写。它在旧落点
+        // 上 = 写成了（不扣费）；不在 = 那一次写没落位（扣一次预算，和我们自己造成
+        // 的失败同一套记账，绝不因为前提变了就免账）。然后按新落点重算。
+        if (!topmostAtSlot(cap, ids, autoTopPending.id, autoTopPending.slot)) {
+          if (autoTopPending.tried && topmostCharge(autoTopRuntime(), autoTopPending.id, autoTopState)) {
+            autoTopState.failed++;
+          }
+        }
+        autoTopPending.slot = lockSlot.slot;
+        autoTopPending.lock = lockSlot.lock || '';
+        autoTopState.lastReason = 'slot-changed';
       } else if (hostCallBusy()) {
         // 宿主那次调用还在飞：这一趟【不下结论】，不扣预算，也不再写一次。
         autoTopState.awaiting++;
         autoTopState.lastReason = 'awaiting-host';
         return;
       } else if (topmostSameIds(ids, autoTopPending.ids)) {
-        // 形态还在、目标没到下标 0 = 确认失败。待办留着，下面按"这次变化还在"走。
+        // 形态还在、目标没到该落的位 = 确认失败。待办留着，下面按"这次变化还在"走。
         if (autoTopPending.tried && topmostCharge(autoTopRuntime(), autoTopPending.id, autoTopState)) {
           autoTopState.failed++;
         }
@@ -1881,13 +1953,13 @@ function __mmxStatusMain(cfg) {
     }
     if (topmostSameIds(prev, ids)) return;              // 顺序没变：一次调用都不考虑
     autoTopState.changes++;
-    // 锁顶意图在场时让位：那是用户按过按钮授权的一次意图，它的代次与维持预算都
-    // 归它，我们在这里插一脚只会和它对拉。
+    // 锁顶在场、却证不出它就在 raw[0]：让位。那是用户按过按钮授权的一次意图，它的
+    // 代次与维持预算都归它，我们在这里插一脚只会和它对拉。
     // 让位只【推迟】这一次补写，绝不把它取消：这里既不推进基线、也不建待办，于是
-    // 让位期间到达的新成员留在基线之外，锁一释放仍会被认成新成员并补到 0（这条是
-    // D1 修过的形状，抄同一条，不各自发明）。这一分支里【不得】出现任何宿主写，
-    // deferred 也仍然每趟 +1。
-    if (topmostLockView.id) {
+    // 让位期间到达的新成员留在基线之外，锁顶一旦能被证实仍会被认成新成员并补到
+    // 它该落的位（这条是 D1 修过的形状，抄同一条，不各自发明）。这一分支里【不得】
+    // 出现任何宿主写，deferred 也仍然每趟 +1。
+    if (lockSlot.blocked) {
       autoTopState.deferred++;
       autoTopState.lastReason = 'toplock-other';
       return;
@@ -1900,6 +1972,8 @@ function __mmxStatusMain(cfg) {
     for (var j = 0; j < ids.length; j++) {
       if (prev.indexOf(ids[j]) >= 0) continue;
       var one = ids[j];
+      // 锁顶自己永不当候选：它必须留在 raw[0]，我们只写它后面那一位。
+      if (lockSlot.lock && one === lockSlot.lock) continue;
       if (!topmostAutoTopId(one)) { refusalReason = 'not-local-id'; continue; }
       var ro;
       try { ro = !!cap.probe(one, cap.source); } catch (e) { ro = true; }
@@ -1917,7 +1991,9 @@ function __mmxStatusMain(cfg) {
       autoTopIds = ids.slice();
       return;
     }
-    if (pick === 0) {
+    // 目标已经在【它该落的那一位】上：无锁 = 置顶区最顶，有锁 = 紧跟锁顶之后。
+    // 一次写都不做（也不消耗预算）。
+    if (topmostAtSlot(cap, ids, ids[pick], lockSlot.slot)) {
       autoTopState.alreadyTop++;
       autoTopState.lastReason = 'already-top';
       autoTopIds = ids.slice();
@@ -1943,19 +2019,20 @@ function __mmxStatusMain(cfg) {
     if (!ticket) {
       autoTopState.blocked++;
       autoTopState.lastReason = 'gate-unavailable';
-      autoTopPending = { ids: ids.slice(), id: id, tried: false };
+      autoTopPending = { ids: ids.slice(), id: id, tried: false, slot: lockSlot.slot, lock: lockSlot.lock || '' };
       return;
     }
     // 待办【在调用之前】就记上：同步抛异常、reject、resolve 之后 order 没动，这三
     // 种都要被下一趟认出来，而不是在这一趟就把这次变化吃掉。
-    autoTopPending = { ids: ids.slice(), id: id, tried: true };
+    autoTopPending = { ids: ids.slice(), id: id, tried: true, slot: lockSlot.slot, lock: lockSlot.lock || '' };
     autoTopState.calls++;
     autoTopState.lastReason = 'calling';
     var ret;
     try {
       // EXACTLY three arguments, and it is the SAME single write the other two
       // entries use. No index means "append", which is the bug being corrected.
-      ret = cap.fn(id, true, 0);
+      // 落点：无锁 = 0，锁顶已证实在 raw[0] = 1（锁保持第一，目标紧跟其后）。
+      ret = cap.fn(id, true, lockSlot.slot);
     } catch (e) {
       hostCallRelease(ticket);
       autoTopState.blocked++;
@@ -2101,15 +2178,18 @@ function __mmxStatusMain(cfg) {
       promoteState.lastReason = 'baseline-armed';
       return;
     }
-    // 锁顶意图在场时让位，而且【不推进状态基线】：让位期间开始对话的那一项要留在
-    // 基线之外，锁一释放仍会被认成"刚刚开始对话"并被浮上去。这正是 D1
-    // （24.10b/24.10c）修过的形状，抄同一条，不各自发明。
+    // 这一趟锁顶的落点，与自动到顶那一段同一条判据：锁顶已证实在 raw[0] 时落点是
+    // 1（锁保持第一，正在跑的那一项紧跟其后），证不出来时才让位。
+    var lockSlot = topmostLockSlot(cap);
+    // 让位时【不推进状态基线】：让位期间开始对话的那一项要留在基线之外，锁顶一旦
+    // 能被证实仍会被认成"刚刚开始对话"并被浮上去。这正是 D1（24.10b/24.10c）修过
+    // 的形状，抄同一条，不各自发明。
     // 本分支里不得出现任何宿主写，deferred 仍然每趟 +1。
     //
     // 语句顺序在这里是【承重】的，不是排版：这一段让位必须排在下面的待办确认
     // （那是本段唯一扣预算的地方）之前，否则锁在场期间的 order 变化同样会被当成
     // "这次上浮没落位"而扣费——24 段踩过这个坑，见那里的同名注释。
-    if (topmostLockView.id) {
+    if (lockSlot.blocked) {
       promoteState.deferred++;
       promoteState.lastReason = 'toplock-other';
       return;
@@ -2119,29 +2199,58 @@ function __mmxStatusMain(cfg) {
     // 次没落位，扣一次预算，基线认下新观察）。确认失败时基线原地不动，于是这一条
     // 升沿在闸空闲的下一趟仍会被认出来并再浮一次。
     if (promotePending) {
-      if (ids.indexOf(promotePending.id) === 0) {
+      // 落点前提是否还成立？锁顶出现 / 释放 / 切换都会改落点，而那不是我们造成的
+      // 失败：前提变了就【不判定、不扣费】，只把待办重新指向新落点。
+      var pendSame = promotePending.slot === lockSlot.slot
+        && promotePending.lock === (lockSlot.lock || '');
+      if (lockSlot.lock && promotePending.id === lockSlot.lock) {
+        // 待办的目标就是锁顶自己。锁顶已经把它按在 raw[0]，那一次上浮【成了】——
+        // 它不是失败，不扣预算。【也不推进状态基线】：这一趟里别的升沿不能被这一次
+        // 作废顺带吞掉（吞掉了它们就再也不会被浮上去）。待办就此作废，下面照常
+        // 挑选别的升沿。
+        promotePending = null;
+        promoteState.lastReason = 'lock-absorbed';
+      } else if (topmostAtSlot(cap, ids, promotePending.id, lockSlot.slot)) {
         promotePrev = next;
         promotePending = null;
         promoteState.confirmed++;
         promoteState.lastReason = 'landed';
         return;
-      }
-      if (hostCallBusy()) {
+      } else if (!pendSame) {
+        if (hostCallBusy()) {
+          // 我们那一次调用还在飞：等它结算，落点前提变了也不在这里重指向 —— 那会
+          // 把在途 attempt 的证据（tried / ids 快照）抹掉，等于替它免了账。
+          promoteState.awaiting++;
+          promoteState.lastReason = 'awaiting-host';
+          return;
+        }
+        // 前提变了：先按【旧落点】判那一次写。它在旧落点上 = 写成了（不扣费）；
+        // 不在 = 那一次写没落位（扣一次预算，和我们自己造成的失败同一套记账）。
+        if (!topmostAtSlot(cap, ids, promotePending.id, promotePending.slot)) {
+          if (promotePending.tried && topmostCharge(promoteRuntime(), promotePending.id, promoteState)) {
+            promoteState.failed++;
+          }
+        }
+        promotePending.slot = lockSlot.slot;
+        promotePending.lock = lockSlot.lock || '';
+        promoteState.lastReason = 'slot-changed';
+      } else if (hostCallBusy()) {
         promoteState.awaiting++;
         promoteState.lastReason = 'awaiting-host';
         return;
-      }
-      if (promotePending.tried && topmostCharge(promoteRuntime(), promotePending.id, promoteState)) {
-        promoteState.failed++;
-      }
-      if (topmostSameIds(ids, promotePending.ids)) {
-        // 形态还在：这次升沿没落位，扣一次预算，待办留到下一趟。
-        promoteState.lastReason = 'confirm-failed';
       } else {
-        promoteState.lastReason = 'confirm-failed-shape';
-        promotePending = null;
-        promotePrev = next;
-        return;
+        if (promotePending.tried && topmostCharge(promoteRuntime(), promotePending.id, promoteState)) {
+          promoteState.failed++;
+        }
+        if (topmostSameIds(ids, promotePending.ids)) {
+          // 形态还在：这次升沿没落位，扣一次预算，待办留到下一趟。
+          promoteState.lastReason = 'confirm-failed';
+        } else {
+          promoteState.lastReason = 'confirm-failed-shape';
+          promotePending = null;
+          promotePrev = next;
+          return;
+        }
       }
     }
     // Object.create(null)：这份查找表只认"自家键"。用 {} 的话，一个恰好叫
@@ -2158,6 +2267,8 @@ function __mmxStatusMain(cfg) {
       if (was === undefined) continue;
       if (was) continue;                       // 上一趟就在跑：没有状态变化
       if (!next[c].running) continue;          // 这一趟也还没跑
+      // 锁顶自己永不当候选：它必须留在 raw[0]，我们只写它后面那一位。
+      if (lockSlot.lock && next[c].id === lockSlot.lock) continue;
       cand = c;
       break;                                    // 一次最多一项：下标最小的那一个
     }
@@ -2165,14 +2276,15 @@ function __mmxStatusMain(cfg) {
     // 到此为止。会话结束【不回位】，也是靠这里只更新 running 布尔、不记任何位置。
     if (cand < 0) { promoteState.noChange++; promotePrev = next; return; }
     promoteState.changes++;
-    // 判据要求下标 > 0。已经在最顶的那一项什么也不做，也不消耗预算。
-    if (cand === 0) {
+    var id = next[cand].id;
+    // 已经在【它该落的那一位】上的那一项什么也不做，也不消耗预算：无锁 = 置顶区
+    // 最顶，有锁 = 紧跟锁顶之后。
+    if (topmostAtSlot(cap, ids, id, lockSlot.slot)) {
       promoteState.alreadyTop++;
       promotePrev = next;
       promoteState.lastReason = 'already-top';
       return;
     }
-    var id = next[cand].id;
     promoteState.lastId = id;
     if (!topmostAutoTopId(id)) {
       promoteState.refused++;
@@ -2210,18 +2322,19 @@ function __mmxStatusMain(cfg) {
     if (!ticket) {
       promoteState.blocked++;
       promoteState.lastReason = 'gate-unavailable';
-      promotePending = { ids: ids.slice(), id: id, tried: false };
+      promotePending = { ids: ids.slice(), id: id, tried: false, slot: lockSlot.slot, lock: lockSlot.lock || '' };
       return;
     }
     promoteState.budget = rt.budget;
     promoteState.calls++;
     promoteState.lastReason = 'calling';
-    promotePending = { ids: ids.slice(), id: id, tried: true };
+    promotePending = { ids: ids.slice(), id: id, tried: true, slot: lockSlot.slot, lock: lockSlot.lock || '' };
     var ret;
     try {
       // EXACTLY three arguments, and it is the SAME single write the other three
       // entries use. No index means "append", which is the bug being corrected.
-      ret = cap.fn(id, true, 0);
+      // 落点：无锁 = 0，锁顶已证实在 raw[0] = 1（锁保持第一，目标紧跟其后）。
+      ret = cap.fn(id, true, lockSlot.slot);
     } catch (e) {
       hostCallRelease(ticket);
       promoteState.blocked++;

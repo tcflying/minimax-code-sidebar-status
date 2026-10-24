@@ -103,6 +103,8 @@ function makeHost(opts = {}) {
     rollbacks: 0,
     readOnly: new Set(opts.readOnly || []),
     noop: !!opts.noop,                 // resolves, but never moves the order
+    hangLeft: opts.hang || 0,          // never settles, never moves the order
+    hangSettle: null,
     throwLeft: opts.throwFirst || 0,    // synchronous throw, first N calls
     rejectLeft: opts.rejectFirst || 0,  // rejected promise, first N calls
     commitMode: opts.commitMode || 'micro',   // 'micro' | 'timer'
@@ -129,6 +131,12 @@ function makeHost(opts = {}) {
       // The host's own first statement: readonly is a SILENT return.
       if (h.deps[0](e, h.source)) return;
       if (h.rejectLeft > 0) { h.rejectLeft--; h.rollbacks++; throw new Error('host-reject'); }
+      if (h.hangLeft > 0) {
+        // The host took the call, moves nothing and never settles: the shared gate
+        // stays held by it until settleHang() is called.
+        h.hangLeft--;
+        return new Promise((resolve, reject) => { h.hangSettle = { resolve, reject }; });
+      }
       if (h.noop) { PinService.pinSession(e, l, l ? c : undefined, h.source); return; }
       const next = updatePinnedRefs(h.deps[1], { type: 'session', id: e }, l, c);
       h.deps[6](next);
@@ -139,6 +147,14 @@ function makeHost(opts = {}) {
   // arity-3 decoy the selector has to reject (no pinSession/getSessionInfo text).
   h.decoy = function (a, b, c2) { return [a, b, c2].length; };
   h.decoyDeps = [() => {}, h.order, h.source, {}, () => {}, () => {}, () => {}];
+  // Release a hung call: the gate is freed by the host's own settle.
+  h.settleHang = (err) => {
+    if (!h.hangSettle) return false;
+    const s = h.hangSettle;
+    h.hangSettle = null;
+    if (err) s.reject(err); else s.resolve();
+    return true;
+  };
   return h;
 }
 const SessionInfo = { getSessionInfo: async (id) => ({ id }) };const PinService = {
@@ -508,7 +524,8 @@ console.log('\n=== H. 原生取消置顶后重新置顶 ===');
 }
 
 // ---------------------------------------------------------------------------
-// I. A lock intent is in place across two new members, then it is released.
+// I. A lock intent is in place across two new members (user 2026-10-24 rule:
+//    the lock stays first, a new conversation goes right behind it).
 // ---------------------------------------------------------------------------
 console.log('\n=== I. 锁顶意图在场期间到达的新成员 ===');
 {
@@ -518,23 +535,143 @@ console.log('\n=== I. 锁顶意图在场期间到达的新成员 ===');
   nativePin(a.host, 'mvs_c');
   nativePin(a.host, 'mvs_d');
   await passes(a, 2);
-  const deferred = a.p.api.autoState.deferred;
-  // Sampled BEFORE the lock is released. "Zero host writes while the lock intent
-  // is in place" has to be read at that moment -- reading only the counters and
-  // the final order afterwards cannot tell a deferred pass from a late write.
-  const callsWhileLocked = a.host.calls.length;
-  const persistsWhileLocked = a.host.persists().length;
-  v('I.1 让位期间零宿主写、零后端落盘（释放前采样）',
-    callsWhileLocked === 0 && persistsWhileLocked === 0 && deferred >= 1,
-    `callsWhileLocked=${callsWhileLocked} persistsWhileLocked=${persistsWhileLocked} deferred=${deferred} ${seqOf(a)}`);
+  const calls = a.host.calls.length;
+  const callArgs = JSON.stringify(a.host.calls);
+  // Sampled WHILE the lock is in place. The lock is provably at raw[0] here
+  // (mvs_a is the first row of the pinned order), so the correction is NOT
+  // deferred: the new member goes to raw[1] and the lock stays at raw[0].
+  v('I.1 锁顶在场：新成员补到 raw[1]，锁留在 raw[0]',
+    calls === 1 && callArgs === JSON.stringify([['mvs_c', true, 1]])
+    && rawIds(a.host) === 'session:mvs_a,session:mvs_c,session:mvs_b,session:mvs_d',
+    `calls=${callArgs} ${seqOf(a)}`);
   a.p.api.lockView.id = '';
   await passes(a, 2);
   await passes(a, 2);
-  v('I.2 释放后让位期间到达的那一批仍被补到 order[0]',
-    rawIds(a.host) === 'session:mvs_c,session:mvs_a,session:mvs_b,session:mvs_d',
+  v('I.2 锁释放时仍在飞的待办被重新指向 order[0]（落点前提变了就重算）',
+    a.host.calls.length === 2
+    && JSON.stringify(a.host.calls[1]) === JSON.stringify(['mvs_c', true, 0])
+    && rawIds(a.host) === 'session:mvs_c,session:mvs_a,session:mvs_b,session:mvs_d',
     `${seqOf(a)} calls=${JSON.stringify(a.host.calls)}`);
-  limitRow('I.3 让位期间到达的第二项与 G 同样被吸收',
-    `raw index of mvs_d = ${a.host.order.findIndex((r) => r.id === 'mvs_d')}，它同样从未成为候选`);
+  limitRow('I.3 同一批里的第二项与 G 同样被吸收',
+    `raw index of mvs_d = ${a.host.order.findIndex((r) => r.id === 'mvs_d')}，${a.host.calls.length} 次调用，d 从未成为候选`);
+}
+
+// ---------------------------------------------------------------------------
+// I2. The lock intent is in place, but THIS pass's order cannot prove it sits
+//     at raw[0] (mvs_b is the second row, not the first). That is the one case
+//     where "a lock is in place" still means ZERO host writes: the corrector
+//     never guesses 0 and never guesses 1.
+// ---------------------------------------------------------------------------
+console.log('\n=== I2. 锁顶在场但证不出在 raw[0] → 零写 ===');
+{
+  const a = scene();
+  await passes(a, 2);
+  a.p.api.lockView.id = 'mvs_b';            // the lock is NOT at raw[0]
+  nativePin(a.host, 'mvs_c');
+  await passes(a, 4);
+  const calls = a.host.calls.length;
+  const persists = a.host.persists().length;
+  v('I2.1 证不出锁顶落点：零宿主写、零后端落盘（deferred 照记）',
+    calls === 0 && persists === 0 && a.p.api.autoState.deferred >= 1,
+    `calls=${calls} persists=${persists} deferred=${a.p.api.autoState.deferred} `
+    + `reason=${a.p.api.autoState.lastReason} ${seqOf(a)}`);
+  a.p.api.lockView.id = '';
+  await passes(a, 2);
+  await passes(a, 2);
+  v('I2.2 锁顶撤掉之后那一项仍然被补到 order[0]（让位只推迟，不取消）',
+    rawIds(a.host) === 'session:mvs_c,session:mvs_a,session:mvs_b',
+    `calls=${JSON.stringify(a.host.calls)} ${seqOf(a)}`);
+}
+
+// ---------------------------------------------------------------------------
+// I3. The lock takes over the very session the pending was about to move.
+//
+//     Sequence: c is pinned, the corrector writes it to raw[0] (pending, tried),
+//     and BEFORE that write is confirmed the user locks c. The lock owns raw[0]
+//     now, so the pending is not a failure and must not cost budget -- but the
+//     lock must also not swallow the members that were never consumed.
+// ---------------------------------------------------------------------------
+console.log('\n=== I3. 锁顶吸收了待办本身 → 不扣预算、不吞掉没消费的新成员 ===');
+{
+  const a = scene();
+  await passes(a, 2);
+  nativePin(a.host, 'mvs_c');
+  await passes(a, 2);                       // the corrector writes c to raw[0]
+  a.p.api.lockView.id = 'mvs_c';            // the user locks c (c sits at raw[0])
+  await passes(a, 3);                       // three passes with the lock in place
+  const failedAfterLock = a.p.api.autoState.failed;
+  nativePin(a.host, 'mvs_d');               // a NEW member arrives after the lock
+  await passes(a, 2);
+  await passes(a, 2);
+  v('I3.1 锁顶吸收待办：预算一格都没扣',
+    failedAfterLock === 0 && a.p.api.autoState.failed === 0,
+    `failed=${a.p.api.autoState.failed} budget=${a.p.api.autoState.budget}/${a.p.api.autoMax} `
+    + `reason=${a.p.api.autoState.lastReason}`);
+  v('I3.2 锁顶保持第一，新成员补到它后面（raw[1]），没被基线吞掉',
+    rawIds(a.host) === 'session:mvs_c,session:mvs_d,session:mvs_a,session:mvs_b'
+    && JSON.stringify(a.host.calls) === JSON.stringify([['mvs_c', true, 0], ['mvs_d', true, 1]]),
+    `calls=${JSON.stringify(a.host.calls)} ${seqOf(a)}`);
+}
+
+// ---------------------------------------------------------------------------
+// I4. The same shape on the OTHER corrector: b starts talking, the corrector
+//     writes it to raw[0], the user locks b, and then c starts talking. c must
+//     still float -- right behind the lock.
+// ---------------------------------------------------------------------------
+console.log('\n=== I4. 锁顶吸收了升沿 → 不扣预算、别的升沿不被吞掉 ===');
+{
+  const a = scene({ host: { order: [ref('mvs_a'), ref('mvs_b'), ref('mvs_c')] } });
+  const idle = {};
+  await promoPasses(a, idle, 2);            // arm the (member, running) baseline
+  await promoPasses(a, { mvs_b: 'running' }, 1);   // b's rising edge -> raw[0]
+  a.p.api.lockView.id = 'mvs_b';            // the user locks b (b sits at raw[0])
+  await promoPasses(a, { mvs_b: 'running' }, 2);
+  const failedAfterLock = a.p.api.promoteState.failed;
+  await promoPasses(a, { mvs_b: 'running', mvs_c: 'running' }, 2);
+  v('I4.1 锁顶吸收升沿：预算一格都没扣',
+    failedAfterLock === 0 && a.p.api.promoteState.failed === 0,
+    `failed=${a.p.api.promoteState.failed} budget=${a.p.api.promoteState.budget}/${a.p.api.promoteMax} `
+    + `reason=${a.p.api.promoteState.lastReason}`);
+  v('I4.2 锁顶保持第一，c 浮到它后面（raw[1]）',
+    rawIds(a.host) === 'session:mvs_b,session:mvs_c,session:mvs_a'
+    && JSON.stringify(a.host.calls) === JSON.stringify([['mvs_b', true, 0], ['mvs_c', true, 1]]),
+    `calls=${JSON.stringify(a.host.calls)} ${seqOf(a)}`);
+}
+
+// ---------------------------------------------------------------------------
+// I5. A call that is STILL IN FLIGHT when the lock switches.
+//
+//     The in-flight attempt owns the shared gate. The corrector must not steal
+//     a ticket, must not resend, and must NOT overwrite the in-flight attempt's
+//     evidence (tried / the ids snapshot) -- otherwise that attempt's failure
+//     is never charged. When the gate is finally released, the pending is
+//     re-aimed at the CURRENT slot and the failed attempt is charged once.
+// ---------------------------------------------------------------------------
+console.log('\n=== I5. 在途调用 + 锁顶切换 → 证据不丢、闸释放后按当前落点转移 ===');
+{
+  const a = scene({ host: { hang: 1 } });
+  await passes(a, 2);
+  nativePin(a.host, 'mvs_c');
+  await passes(a, 2);                       // the write goes out and HANGS
+  const callsInFlight = a.host.calls.length;
+  const busyInFlight = a.p.api.gateBusy();
+  a.p.api.lockView.id = 'mvs_a';            // the lock appears (a is at raw[0])
+  await passes(a, 3);                       // the gate is still held by that call
+  const callsWhileHeld = a.host.calls.length;
+  const failedWhileHeld = a.p.api.autoState.failed;
+  a.host.settleHang(new Error('host-hang-reject'));   // the host finally settles
+  await passes(a, 2);
+  await passes(a, 2);
+  v('I5.1 在途期间：不偷票、不重发、不扣费（闸一直被那次调用占着）',
+    callsInFlight === 1 && busyInFlight === true && callsWhileHeld === 1
+    && failedWhileHeld === 0 && a.p.api.autoState.failed === 1,
+    `callsInFlight=${callsInFlight} busy=${busyInFlight} callsWhileHeld=${callsWhileHeld} `
+    + `failed=${a.p.api.autoState.failed} budget=${a.p.api.autoState.budget}/${a.p.api.autoMax} `
+    + `reason=${a.p.api.autoState.lastReason}`);
+  v('I5.2 闸释放后按当前落点转移一次，那一次失败被记账',
+    JSON.stringify(a.host.calls) === JSON.stringify([['mvs_c', true, 0], ['mvs_c', true, 1]])
+    && rawIds(a.host) === 'session:mvs_a,session:mvs_c,session:mvs_b',
+    `calls=${JSON.stringify(a.host.calls)} ${seqOf(a)}`);
 }
 
 // ---------------------------------------------------------------------------
