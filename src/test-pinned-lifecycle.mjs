@@ -1199,7 +1199,9 @@ console.log('\n=== 8. 状态点语义：aria / 图例 / 汇总去重 ===');
   // ——import 进来的是模块作用域里的那份，测试里的任何变异都改不到它，于是这条
   // 断言会永远绿。切出来的那份与 pageScript 同源，s13 变异的就是它。
   {
-    const refreshFnSrc = sliceBlock('export function buildRefreshExpression(statusMap) {',
+    // 起始锚点只认函数名，不再把参数表写死：buildRefreshExpression 之后
+    // 多了第二个参数（newMainSessions），写死参数表会让这一刀切空。
+    const refreshFnSrc = sliceBlock('export function buildRefreshExpression(',
       'export function buildDisposeExpression() {').replace('export function', 'function');
     const refreshFn = new Function('GLOBAL', refreshFnSrc + '\nreturn buildRefreshExpression;')('__mmxStatus');
     const expr = refreshFn({ mvs_a: 'running' });

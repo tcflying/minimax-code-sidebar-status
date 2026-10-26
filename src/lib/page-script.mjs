@@ -5490,7 +5490,7 @@ export function buildBootstrapExpression(cfg) {
   return `(${PAGE_FN})(${JSON.stringify(full)})`;
 }
 
-export function buildRefreshExpression(statusMap) {
+export function buildRefreshExpression(statusMap, newMainSessions) {
   // topmost is a pure READ of the page: it resolves the host's own pin hook and
   // reports what it found, it never pins anything. It rides along with the
   // periodic refresh so the daemon log carries the capability and its reason
@@ -5503,7 +5503,15 @@ export function buildRefreshExpression(statusMap) {
   // thing the page can say, since the dots it is showing are exactly the ones
   // the host last told it about. The write is guarded: an older host whose api
   // object is frozen must degrade to "no timestamp", never to a thrown refresh.
-  return `(function(){var a=window.${GLOBAL};if(!a)return {ok:false,reason:'not-installed'};try{a.__sentAt=Date.now();}catch(e){}return {ok:true,stats:a.refresh(${JSON.stringify(statusMap)}),topmost:a.topmost(),topmostDiag:(function(){try{return a.topmostDiag();}catch(e){return {available:false,error:'collector-threw'};}})()};})()`;
+  //
+  // The new-main-session payload rides along as the SECOND argument of
+  // a.refresh(). The one-argument call is byte-for-byte what it always was, so
+  // every old caller (selftest, the offline suites, manual injection) keeps
+  // working unchanged; the page side that reads the second argument is a
+  // separate change and may simply ignore it until then.
+  const args = [JSON.stringify(statusMap)];
+  if (newMainSessions !== undefined) args.push(JSON.stringify(newMainSessions));
+  return `(function(){var a=window.${GLOBAL};if(!a)return {ok:false,reason:'not-installed'};try{a.__sentAt=Date.now();}catch(e){}return {ok:true,stats:a.refresh(${args.join(',')}),topmost:a.topmost(),topmostDiag:(function(){try{return a.topmostDiag();}catch(e){return {available:false,error:'collector-threw'};}})()};})()`;
 }
 
 export function buildDisposeExpression() {

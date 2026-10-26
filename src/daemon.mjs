@@ -9,6 +9,7 @@
 
 import { CdpSession, isCdpAvailable, version, listTargets } from './lib/cdp.mjs';
 import { StatusDb, DEFAULT_DB } from './lib/status-db.mjs';
+import { createNewMainSessionDetector } from './lib/new-main-sessions.mjs';
 import { pathToFileURL } from 'node:url';
 import {
   buildBootstrapExpression,
@@ -158,6 +159,374 @@ function safeJson(v) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// New-main-session delivery feed.
+//
+// lib/new-main-sessions.mjs judges "this row is a brand new local visible main
+// conversation". This is the DELIVERY half of that: it keeps the confirmed
+// ids in a bounded pending list, re-validates them against every successful
+// metadata read, and hands the page one small fixed-shape payload.
+//
+// The ORDERING state comes from the arguments alone: the rows, the observed
+// time and the fixed boundary. The DIAGNOSTICS are not pure -- they read the
+// clock (rate limiting) and write the log. The clock is never an input to an
+// ordering decision.
+// ---------------------------------------------------------------------------
+
+// Upper bound of the pending list. Same number as the detector's ledger limit.
+// Pending ids are never evicted FIFO: when the list is full a NEW event is
+// dropped (fail closed) instead of pushing an older, still undelivered event
+// out of the list.
+const NEW_MAIN_MAX_PENDING = 256;
+
+/**
+ * A metadata row is trustworthy only when every column the delivery predicate
+ * needs is present and usable. A NULL kind / visibility / archived /
+ * createdAtMs is not "the row says no" -- it is "the row cannot be read".
+ */
+function isTrustedMetadataRow(row) {
+  return (
+    !!row &&
+    typeof row.id === 'string' &&
+    row.id !== '' &&
+    Number.isSafeInteger(row.createdAtMs) &&
+    (row.parentSessionId === null || typeof row.parentSessionId === 'string') &&
+    typeof row.sessionKind === 'string' &&
+    row.sessionKind !== '' &&
+    typeof row.visibility === 'string' &&
+    row.visibility !== '' &&
+    typeof row.archived === 'number' &&
+    Number.isFinite(row.archived)
+  );
+}
+
+/**
+ * Two rows with the same id are the SAME row when every metadata column
+ * agrees. parent null and parent '' mean the same thing to the detector (both
+ * are "no parent"), so they are not a contradiction either.
+ */
+function sameMetadata(a, b) {
+  if (!a || !b) return false;
+  if (a.createdAtMs !== b.createdAtMs) return false;
+  if ((a.parentSessionId || '') !== (b.parentSessionId || '')) return false;
+  if (a.sessionKind !== b.sessionKind) return false;
+  if (a.visibility !== b.visibility) return false;
+  if (a.archived !== b.archived) return false;
+  return true;
+}
+
+/**
+ * One pass over the rows of a read: the FIRST row per id (duplicate rows with
+ * the same metadata are the same row) and the ids whose rows contradict
+ * themselves.
+ *
+ * A contradiction is scoped to that ONE id. It must not decide anything about
+ * the other rows of the same read: one unreadable row says nothing about the
+ * new conversation next to it.
+ */
+function indexMetadataRows(rows) {
+  const unique = new Map();
+  const conflicts = new Set();
+  for (const row of rows) {
+    if (!row || typeof row.id !== 'string') continue;
+    const prev = unique.get(row.id);
+    if (prev === undefined) {
+      unique.set(row.id, row);
+      continue;
+    }
+    if (!sameMetadata(prev, row)) conflicts.add(row.id);
+  }
+  return { unique, conflicts };
+}
+
+/**
+ * createNewMainFeed({ startedAtMs, maxTracked, candidateTtlMs, log })
+ *
+ * startedAtMs is the run boundary. It is fixed here, taken once with
+ * Date.now() before the first database read, and it never advances: it is NOT
+ * derived from the rows (a MAX(created_at_ms) would inherit whatever the
+ * database already had) and it does NOT move when candidates are delivered.
+ *
+ * The payload is fixed-shape on purpose:
+ *
+ *     { startedAtMs, sequence, available, observedAtMs, candidates: [{ id, createdAtMs }] }
+ *
+ * sequence advances only on a SUCCESSFUL observation, so two payloads built
+ * from the same observation carry the same sequence, and a response never
+ * creates or advances one. available=false means "this payload carries no
+ * fresh observation" -- then candidates is always empty, and an old metadata
+ * read is never passed off as a fresh one.
+ *
+ * observedAtMs is the moment of the last SUCCESSFUL read. It is what lets the
+ * page bound its own 3s apply timer: the page keeps a packet it can no longer
+ * trust, so it needs the age of the newest good packet. On available=false it
+ * is NOT advanced -- an unreadable database must not look like a fresh read.
+ */
+export function createNewMainFeed({
+  startedAtMs,
+  maxTracked = NEW_MAIN_MAX_PENDING,
+  candidateTtlMs,
+  log: logFn = () => {},
+} = {}) {
+  if (!Number.isSafeInteger(startedAtMs)) {
+    throw new TypeError('startedAtMs must be a safe integer');
+  }
+  const detector = createNewMainSessionDetector({ startedAtMs, maxTracked, candidateTtlMs });
+  /** id -> { id, createdAtMs }. Confirmed, not yet acknowledged by the page. */
+  const pending = new Map();
+  let sequence = 0;
+  /** The moment of the last SUCCESSFUL observation. 0 = never had one. */
+  let lastObservedAtMs = 0;
+  let lastPayload = {
+    startedAtMs,
+    sequence: 0,
+    available: false,
+    observedAtMs: 0,
+    candidates: [],
+  };
+  let diagCount = 0;
+  let lastDiagAt = 0;
+
+  /**
+   * Bounded, rate-limited diagnostics: the first few, then at most 1/min.
+   *
+   * The logger is called inside its own try/catch: a broken log function must
+   * never turn a metadata problem into a failed delivery (or into a failed
+   * refresh).
+   */
+  function diag(reason) {
+    diagCount++;
+    const now = Date.now();
+    if (diagCount <= 3 || now - lastDiagAt >= 60000) {
+      lastDiagAt = now;
+      try {
+        logFn('新会话通道诊断:', reason);
+      } catch {
+        /* a bad logger is not a delivery failure */
+      }
+    }
+  }
+
+  function copyPayload(p) {
+    return {
+      startedAtMs: p.startedAtMs,
+      sequence: p.sequence,
+      available: p.available,
+      observedAtMs: p.observedAtMs,
+      candidates: p.candidates.map((c) => ({ id: c.id, createdAtMs: c.createdAtMs })),
+    };
+  }
+
+  /**
+   * The payload for "no fresh observation". The last successful read time is
+   * KEPT, not refreshed: the page needs the age of the newest good packet, and
+   * a failed read must never look like a new one.
+   */
+  function unavailablePayload() {
+    return {
+      startedAtMs,
+      sequence,
+      available: false,
+      observedAtMs: lastObservedAtMs,
+      candidates: [],
+    };
+  }
+
+  /** Ascending creation time; same millisecond falls back to the id. */
+  function sortedCandidates() {
+    return [...pending.values()]
+      .sort((a, b) => a.createdAtMs - b.createdAtMs || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+      .map((c) => ({ id: c.id, createdAtMs: c.createdAtMs }));
+  }
+
+  /**
+   * Re-check every pending id against the rows of a SUCCESSFUL metadata read.
+   *
+   * Every outcome is scoped to ONE id. A single bad row must not decide
+   * anything about the new conversations next to it, and it must not stop the
+   * channel: the next clean read carries on.
+   *
+   *  - the row is gone -> withdraw. The sessions query filters archived = 0, so
+   *    an archived session simply stops appearing: it must NOT be re-pinned
+   *    after it was archived.
+   *  - the row says it no longer qualifies (parent / kind / visibility /
+   *    archived / out of the creation window) -> withdraw.
+   *  - the row contradicts itself (same id, different metadata) -> withdraw
+   *    that id. The detector tombstones it too, so it is never reported again.
+   *  - the row cannot be read (NULL fields) or its creation time changed ->
+   *    withdraw that id as well; the detector confirmed it only once, so it is
+   *    not re-sent either.
+   */
+  function revalidate(unique, conflicts, observedAtMs) {
+    for (const p of [...pending.values()]) {
+      if (conflicts.has(p.id)) {
+        pending.delete(p.id);
+        continue;
+      }
+      const row = unique.get(p.id);
+      if (!row) {
+        pending.delete(p.id);
+        continue;
+      }
+      if (!isTrustedMetadataRow(row)) {
+        pending.delete(p.id);
+        continue;
+      }
+      if (row.createdAtMs !== p.createdAtMs) {
+        pending.delete(p.id);
+        continue;
+      }
+      if (row.createdAtMs < startedAtMs || row.createdAtMs > observedAtMs) {
+        pending.delete(p.id);
+        continue;
+      }
+      if (row.parentSessionId !== null && row.parentSessionId !== '') {
+        pending.delete(p.id);
+        continue;
+      }
+      if (row.sessionKind !== 'conversation') {
+        pending.delete(p.id);
+        continue;
+      }
+      if (row.visibility !== 'visible') {
+        pending.delete(p.id);
+        continue;
+      }
+      if (row.archived !== 0) {
+        pending.delete(p.id);
+      }
+    }
+  }
+
+  /**
+   * Feed one SUCCESSFUL metadata read into the feed.
+   *
+   * Never throws: a broken read only makes the new channel unavailable for
+   * THIS round, and the next clean read brings it back. The caller must not
+   * call this at all when the database read failed -- an unobserved read must
+   * not look like progress.
+   */
+  function observeMetadata(rows, { observedAtMs } = {}) {
+    if (!Array.isArray(rows)) return unavailable('metadata-not-an-array');
+    if (!Number.isSafeInteger(observedAtMs)) return unavailable('bad-observed-at');
+    const { unique, conflicts } = indexMetadataRows(rows);
+    let result;
+    try {
+      result = detector.observe(rows, { observedAtMs });
+    } catch (e) {
+      // The whole read is unusable (a missing column, a clock that went
+      // backwards): this round is unavailable, the next clean read recovers.
+      diag('本轮新通道不可用: ' + (e && e.message ? e.message : String(e)));
+      lastPayload = unavailablePayload();
+      return copyPayload(lastPayload);
+    }
+    // The ledger is bounded and fails closed: past the limit a new candidate
+    // is DROPPED, not queued. That has to be visible, not silent.
+    if (result.overflow && result.overflow.droppedNow > 0) {
+      diag(
+        '新会话额度耗尽，丢弃候选 ' + result.overflow.droppedNow + ' 个（上限 ' + result.overflow.limit + '）'
+      );
+    }
+    for (const c of result.confirmedCandidates) {
+      if (pending.size >= maxTracked) {
+        diag('pending 已满，丢弃新事件: ' + c.id);
+        continue;
+      }
+      if (!pending.has(c.id)) pending.set(c.id, { id: c.id, createdAtMs: c.createdAtMs });
+    }
+    revalidate(unique, conflicts, observedAtMs);
+    sequence += 1;
+    lastObservedAtMs = observedAtMs;
+    lastPayload = {
+      startedAtMs,
+      sequence,
+      available: true,
+      observedAtMs: lastObservedAtMs,
+      candidates: sortedCandidates(),
+    };
+    return copyPayload(lastPayload);
+  }
+
+  /**
+   * Mark the new channel unavailable for now (the metadata read itself
+   * failed). The pending list is KEPT: the next successful read re-sends it.
+   */
+  function unavailable(reason) {
+    diag('本轮新通道不可用: ' + reason);
+    lastPayload = unavailablePayload();
+    return copyPayload(lastPayload);
+  }
+
+  /** A copy of the payload built from the last successful observation. */
+  function payload() {
+    return copyPayload(lastPayload);
+  }
+
+  /**
+   * Drop acknowledged ids from the pending list. Only ids that are still
+   * pending are dropped -- an unknown id changes nothing.
+   */
+  function acknowledge(ids) {
+    if (!Array.isArray(ids)) return 0;
+    let dropped = 0;
+    for (const id of ids) {
+      if (typeof id === 'string' && pending.delete(id)) dropped++;
+    }
+    return dropped;
+  }
+
+  /** Read-only diagnostics. The detector's own counters ride along. */
+  function snapshot() {
+    return {
+      startedAtMs,
+      sequence,
+      available: lastPayload.available,
+      observedAtMs: lastPayload.observedAtMs,
+      pending: sortedCandidates(),
+      detector: detector.snapshot(),
+    };
+  }
+
+  return { startedAtMs, observeMetadata, unavailable, payload, acknowledge, snapshot };
+}
+
+/**
+ * Read the metadata channel and feed it. Never throws: a metadata failure
+ * only makes the NEW channel unavailable, the colour path goes on.
+ */
+function observeNewMain(feed, db, observedAtMs = Date.now()) {
+  if (!feed) return undefined;
+  try {
+    const rows = typeof db.sessionMetadata === 'function' ? db.sessionMetadata() : null;
+    if (!Array.isArray(rows)) return feed.unavailable('metadata-unavailable');
+    return feed.observeMetadata(rows, { observedAtMs });
+  } catch (e) {
+    return feed.unavailable('metadata-read-failed:' + (e && e.message ? e.message : String(e)));
+  }
+}
+
+/** The ids a request actually carried. */
+function sentNewMainIds(payload) {
+  if (!payload || !Array.isArray(payload.candidates)) return [];
+  return payload.candidates.map((c) => c.id);
+}
+
+/**
+ * Apply a page receipt.
+ *
+ * Only ids that THIS request really carried and that are still pending are
+ * removed. A receipt from another run, an unknown id, or a late answer to an
+ * older request removes nothing -- and a promise that resolved, or an ok:true
+ * answer, is NOT a receipt: the page has to say which ids it applied.
+ */
+function applyNewMainReceipt(feed, receipt, sentIds) {
+  if (!feed || !receipt || typeof receipt !== 'object') return;
+  if (receipt.startedAtMs !== feed.startedAtMs) return;
+  const ack = Array.isArray(receipt.acknowledged) ? receipt.acknowledged : [];
+  const sent = new Set(sentIds);
+  feed.acknowledge(ack.filter((id) => sent.has(id)));
+}
+
 /**
  * The tick loop, extracted so it can be exercised by selftest.mjs with a fake
  * session (a real one needs a live renderer).
@@ -181,6 +550,9 @@ export function createRefreshLoop({
   setSession,
   db,
   bootstrapConfig,
+  // The new-main-session feed is OPTIONAL: an old offline fake db without a
+  // metadata channel keeps working exactly as before, with no payload at all.
+  feed = null,
   log: logFn = () => {},
   intervalMs = 2500,
   failureThreshold = FAILURE_THRESHOLD,
@@ -214,6 +586,13 @@ export function createRefreshLoop({
     stopped: false,
   };
   let timer = null;
+  /**
+   * tickNo -> the ids that request really carried. A receipt may only
+   * acknowledge the ids of ITS OWN request, so this has to be kept per
+   * request. Bounded: the oldest entry is dropped once the map is full, and a
+   * receipt that arrives more than a hundred ticks late simply acks nothing.
+   */
+  const sentByTick = new Map();
 
   /** Reinstall the payload after the renderer document was replaced. */
   async function runReboot() {
@@ -226,16 +605,28 @@ export function createRefreshLoop({
         try {
           db.refresh();
           const session = getSession();
+          const newMain = observeNewMain(feed, db);
           const boot = await session.evaluateWithRetry(
             // sentAt: A13 的起点。这一次【重新注入】本身就是最新的一次服务器刷新，
             // 所以时间戳取现在，而不是复用最初那次注入的时间。
-            buildBootstrapExpression({ status: db.snapshot(), sentAt: Date.now(), ...bootstrapConfig })
+            buildBootstrapExpression({
+              status: db.snapshot(),
+              sentAt: Date.now(),
+              ...bootstrapConfig,
+              // 重新注入也是一次投递：页面被换掉了，之前没送达的新会话要再送一遍。
+              newMainSessions: newMain,
+            })
           );
           if (!boot || boot.ok === true) {
             state.reboots++;
             state.notInstalled = 0;
             state.rebootBackoffMs = rebootBaseMs;
             logFn('重新注入成功:', safeJson(boot && boot.initial));
+            applyNewMainReceipt(
+              feed,
+              boot && boot.initial && boot.initial.newMainSessions,
+              sentNewMainIds(newMain)
+            );
             return;
           }
           // e.g. {ok:false, reason:'no-document-body'}: keep backing off.
@@ -347,6 +738,9 @@ export function createRefreshLoop({
   }
 
   function onTickOk(res, tickNo) {
+    // The ids THIS request carried. A receipt may only acknowledge those.
+    const sentIds = sentByTick.get(tickNo) || [];
+    sentByTick.delete(tickNo);
     // A not-installed answer PROVES the transport is alive (the request round
     // tripped and the page script replied), so the transport failure counter is
     // reset - this is class 2, not class 1.
@@ -362,6 +756,9 @@ export function createRefreshLoop({
       scheduleReboot();
       return;
     }
+    // Only a real receipt removes anything. A resolved promise or an ok:true
+    // answer is NOT an acknowledgement.
+    applyNewMainReceipt(feed, res && res.stats && res.stats.newMainSessions, sentIds);
     // Report the tick that PRODUCED this answer, not the current counter: when
     // the renderer stalls, many requests settle in the same second and using the
     // live counter printed "tick 20" dozens of times.
@@ -375,15 +772,29 @@ export function createRefreshLoop({
   function tick() {
     if (state.stopped) return;
     const tickNo = ++state.ticks;
-    let expression;
     try {
       db.refresh();
-      expression = buildRefreshExpression(db.snapshot());
     } catch (e) {
-      // Synchronous failure (sqlite locked, snapshot() threw): same channel.
+      // Synchronous failure (sqlite locked): same channel. Nothing is observed
+      // here: a failed read must not look like progress.
       noteFailure('tick 异常', e);
       return;
     }
+    // The new-session channel is fed ONLY from a successful read, and it never
+    // blocks the colour path: a broken metadata read just makes this round's
+    // new payload unavailable, the dots keep flowing.
+    const newMain = observeNewMain(feed, db);
+    let expression;
+    try {
+      expression = buildRefreshExpression(db.snapshot(), newMain);
+    } catch (e) {
+      // Synchronous failure (snapshot() threw): same channel.
+      noteFailure('tick 异常', e);
+      return;
+    }
+    const sentIds = sentNewMainIds(newMain);
+    sentByTick.set(tickNo, sentIds);
+    if (sentByTick.size > 128) sentByTick.delete(sentByTick.keys().next().value);
     let p;
     try {
       p = getSession().evaluateWithRetry(expression);
@@ -468,7 +879,18 @@ async function main() {
   const v = await version(args.port).catch(() => ({}));
   log('CDP 已连接:', v.Browser || '(unknown)', '|', (v['User-Agent'] || '').slice(-60));
 
+  // The run boundary for "a brand new conversation". Taken ONCE, with
+  // Date.now(), BEFORE the first database read: it is not a MAX(created_at_ms)
+  // (that would inherit whatever the database already had) and it never
+  // advances afterwards. The whole feed (initial bootstrap, every tick, every
+  // re-bootstrap) uses this one instance and this one boundary.
+  const startedAtMs = Date.now();
+  const feed = createNewMainFeed({ startedAtMs, log });
+
   const db = new StatusDb(args.db, { includeAborted: args.showAborted });
+  // StatusDb's constructor already did one SUCCESSFUL read, so this is the
+  // seeding read: it judges nothing and only establishes the baseline.
+  observeNewMain(feed, db);
   log('数据库:', args.db);
   log('状态分布:', JSON.stringify(db.counts()));
 
@@ -507,10 +929,23 @@ async function main() {
     ...(args.activeBgHover ? { activeBgHover: args.activeBgHover } : {}),
     ...(args.activeBar ? { activeBar: args.activeBar } : {}),
   };
+  // The initial bootstrap reuses the SEEDING packet. There is no new database
+  // read between the seeding read and this bootstrap, so observing again here
+  // would invent a successful read that never happened (and would push the
+  // detector's second read forward for no reason).
+  const newMain = feed.payload();
   const boot = await session.evaluateWithRetry(
     // sentAt: A13 的起点 —— 页面用它初始化 lastRefreshAt，之后每趟 refresh 由
     // buildRefreshExpression 把新的时间戳写进 api.__sentAt。
-    buildBootstrapExpression({ status: db.snapshot(), sentAt: Date.now(), ...bootstrapConfig })
+    buildBootstrapExpression({
+      status: db.snapshot(),
+      sentAt: Date.now(),
+      ...bootstrapConfig,
+      // The first delivery attempt: the page answers with a receipt in
+      // initial.newMainSessions, and only the ids it really applied are
+      // dropped from the pending list.
+      newMainSessions: newMain,
+    })
   );
   log('注入结果:', JSON.stringify(boot));
   if (boot && boot.ok === false) {
@@ -519,6 +954,11 @@ async function main() {
     db.close();
     process.exit(4);
   }
+  applyNewMainReceipt(
+    feed,
+    boot && boot.initial && boot.initial.newMainSessions,
+    sentNewMainIds(newMain)
+  );
   if (args.activeBg) log('选中行底色:', args.activeBg); else log('选中行底色: rgba(10,10,10,0.10) + 蓝色左条（默认）');
   log('done 点显示:', args.showDone ? '开' : '关（默认，只有绿/黄/红）');
   log('启动时折叠展开组:', args.collapse ? '开（主上要求：任何时候不自动展开）' : '关');
@@ -544,6 +984,7 @@ async function main() {
     setSession,
     db,
     bootstrapConfig,
+    feed,
     log,
     intervalMs: args.interval,
     reconnect: () => reconnectSession(args.port, { log }),

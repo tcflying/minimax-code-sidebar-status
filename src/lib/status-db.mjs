@@ -126,6 +126,43 @@ export function bucketFor({ status, terminalOutcome, hasErrorMessage, includeAbo
   return BUCKET.idle;
 }
 
+/**
+ * The one sessions query. Exported so the offline test can run the REAL
+ * statement against node:sqlite(':memory:') instead of a hand-written copy
+ * that could drift away from this one.
+ *
+ * The metadata columns (created_at_ms, parent_session_id, session_kind,
+ * visibility, archived) ride along in the SAME select as the status columns:
+ * one read per refresh, no extra query, no change to the WHERE clause and no
+ * change to the status mapping. The status snapshot still hides idle rows, so
+ * a brand new conversation is invisible in it; this extra channel is what
+ * makes "new" observable. Classification (root vs child vs task) is NOT done
+ * here -- the DB layer only reports columns.
+ *
+ * The WHERE clause still filters `s.archived = 0`, so these are the rows that
+ * are unarchived RIGHT NOW. That is a current-state filter, not a history: a
+ * row that is un-archived later comes back into this query on the next read.
+ * The query is deliberately NOT widened to reach rows that are archived at
+ * this moment, and it never answers "what was this session before" -- there
+ * is no history here to answer that from.
+ */
+export const SESSIONS_SQL = `
+      SELECT s.session_id        AS id,
+             s.status            AS status,
+             s.title             AS title,
+             s.error_message     AS err,
+             a.terminal_outcome  AS outcome,
+             s.created_at_ms     AS createdAtMs,
+             s.parent_session_id AS parentSessionId,
+             s.session_kind      AS sessionKind,
+             s.visibility        AS visibility,
+             s.archived          AS archived
+        FROM local_runtime_sessions s
+        LEFT JOIN local_runtime_session_agent_state a
+               ON a.session_id = s.session_id
+       WHERE s.archived = 0
+    `;
+
 export class StatusDb {
   constructor(dbPath = DEFAULT_DB, { includeAborted = false } = {}) {
     this.path = dbPath;
@@ -135,17 +172,7 @@ export class StatusDb {
     }
     // readOnly: true -> opens with SQLITE_OPEN_READONLY, safe while the app runs.
     this.db = new DatabaseSync(dbPath, { readOnly: true });
-    this._stmtSessions = this.db.prepare(`
-      SELECT s.session_id        AS id,
-             s.status            AS status,
-             s.title             AS title,
-             s.error_message     AS err,
-             a.terminal_outcome  AS outcome
-        FROM local_runtime_sessions s
-        LEFT JOIN local_runtime_session_agent_state a
-               ON a.session_id = s.session_id
-       WHERE s.archived = 0
-    `);
+    this._stmtSessions = this.db.prepare(SESSIONS_SQL);
     // ---- waiting overlay: two indexed, owner-scoped lookups -------------
     // refresh() runs every 2.5s against the user's LIVE database, so both
     // statements must be narrow. Measured on the real file: together they cost
@@ -170,6 +197,8 @@ export class StatusDb {
        GROUP BY owner_session_id, kind
     `);
     this._map = new Map();
+    /** Metadata rows of the last SUCCESSFUL refresh. See sessionMetadata(). */
+    this._metadata = [];
     /** id -> { subagent, bash } for every session that owns live work. */
     this.waitingDetail = new Map();
     this.refresh();
@@ -286,6 +315,7 @@ export class StatusDb {
 
   refresh() {
     const next = new Map();
+    const metadata = [];
     for (const row of this._stmtSessions.all()) {
       const hasErrorMessage = !!(row.err && String(row.err).trim() && String(row.err) !== 'aborted');
       const bucket = bucketFor({
@@ -301,14 +331,72 @@ export class StatusDb {
         title: row.title,
         bucket,
       });
+      // Metadata channel: columns only, no title / error / body. The values are
+      // passed through untouched on purpose -- a NULL parent stays null and an
+      // empty-string parent stays an empty string, because the detector is the
+      // only place allowed to decide what they mean. Same for a NULL
+      // visibility or a NULL session_kind: the DB layer reports, it does not
+      // repair.
+      //
+      // `archived` rides along for the record. The query already filters
+      // archived = 0, so in production it is always 0; the column is reported
+      // as-is rather than being filtered again here, and the query is NOT
+      // widened to cover archived rows.
+      metadata.push({
+        id: row.id,
+        createdAtMs: row.createdAtMs,
+        parentSessionId: row.parentSessionId,
+        sessionKind: row.sessionKind,
+        visibility: row.visibility,
+        archived: row.archived,
+      });
     }
 
     const detail = this.collectWaiting();
     this.waitingDetail = detail;
     StatusDb.applyWaitingOverlay(next, detail);
 
+    // One commit point: the map and the metadata move together, so a failed
+    // read can never leave one of them a generation ahead of the other.
     this._map = next;
+    this._metadata = metadata;
     return this._map;
+  }
+
+  /**
+   * Read-only metadata snapshot: one entry per row of the sessions query.
+   *
+   * SCOPE -- this is the metadata of the sessions that are UNARCHIVED RIGHT
+   * NOW, not the full session history. `WHERE s.archived = 0` is a
+   * CURRENT-STATE filter: a session that is archived at this moment is not in
+   * this channel, and a session that is archived and later RESTORED comes
+   * back into it on the next refresh, with its createdAtMs unchanged. The
+   * archived period itself is not tracked here, and the query is never widened
+   * to reach it.
+   *
+   * Whether such a restored row is an OLD session is NOT decided here: the
+   * caller applies its own fixed creation-time cutoff. This method only
+   * reports the columns.
+   *
+   * This is the channel that lets a brand new conversation be recognised while
+   * it is still idle -- snapshot() deliberately drops idle rows, so the status
+   * snapshot alone cannot tell a new session from an old one.
+   *
+   * Each entry carries metadata columns ONLY: id, createdAtMs,
+   * parentSessionId, sessionKind, visibility, archived. No title, no error
+   * message, no body. Nothing here is classified: a root session, a child and
+   * a task all look exactly like what the database says. A missing or NULL
+   * database value stays NULL -- converting it here would be guessing.
+   *
+   * Duplicate ids are KEPT (the SQL is the only source of truth here), so a
+   * caller can see a contradiction instead of having it silently resolved.
+   *
+   * The returned array and every entry are fresh copies: a caller that
+   * mutates them cannot reach into the database state.
+   */
+  sessionMetadata() {
+    const src = this._metadata || [];
+    return src.map((m) => ({ ...m }));
   }
 
   /** Serialisable snapshot handed to the page. */
