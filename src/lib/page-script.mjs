@@ -1082,6 +1082,11 @@ function __mmxStatusMain(cfg) {
     // 三者共用同一把 hostCallTake，谁在这一趟先拿到闸谁写，另两个本趟放弃，
     // 不排队、不补写。排序就是语句顺序，不另设一个仲裁器。
     pinnedPromoteTick(sharedTopmostCap, map);
+    // 新对话排最上面：daemon 交付的包在这一趟里被消费，cap 与上面三段共用同一
+    // 份已证明的 order。它排在让位链【之后】，并且【不再】因为锁顶在场就整段
+    // 跳过：锁在场时新对话照写 raw[0]，宿主把锁顺次下移到 raw[1]，锁那一侧
+    // 按 newMainYieldId 认这次让位（不抢回、不扣维持预算）。
+    newMainTick(sharedTopmostCap, stats);
 
     // The sidebar is virtualised, so rows are constantly created and destroyed.
     // Drop detached rows from the bookkeeping Set, otherwise a long-running
@@ -3939,6 +3944,7 @@ function __mmxStatusMain(cfg) {
     'host-rejected': '宿主拒绝了这次置顶',
     'unconfirmed-return': '宿主已返回但无法证明生效，自动维持已停用',
     'confirmed': '已确认位于最顶',
+    'yielded-to-new-main': '新对话已排到最前，本会话锁顶让位到其下',
     'locked': '已锁顶，等待后台确认',
     'storage-write-failed': '无法保存锁意图，未对宿主做任何写入',
     'store-init-failed': '无法读取锁意图存储，已停用',
@@ -3956,6 +3962,9 @@ function __mmxStatusMain(cfg) {
     phase: 'idle', reason: 'idle',
     intentId: '', intentSource: '',
     confirmedId: '', confirmedAtTop: false,
+    // 让位：锁在置顶区里、但不在 raw[0]，因为上面是我们自己刚放上去的新对话。
+    // 空串 = 没有让位。判据与写点都在新对话那一段（newMainYieldId）。
+    yieldedTo: '',
     injected: 0, clicks: 0, calls: 0, noops: 0, blocked: 0,
     releases: 0, cleared: 0, maintCalls: 0, maintBudget: TOPLOCK_MAX_MAINT, maintBlocked: 0,
     // The order array identity the in-flight call was issued against. A resolve
@@ -4490,7 +4499,10 @@ function __mmxStatusMain(cfg) {
     var blocked = !capRec.available && !isTarget;
     var desc, ariaDisabled = null;
     if (pressed) {
-      desc = '已在最顶（再点一次解除）';
+      // 让位时锁仍然成立，但它已经不在最顶了：文案要说真话，不能还写"已在最顶"。
+      desc = topLockState.yieldedTo
+        ? '新对话已排到最前，锁顶让位到其下（再点一次解除）'
+        : '已在最顶（再点一次解除）';
     } else if (isTarget && (phase === 'paused' || phase === 'awaiting')) {
       // 一个手势一个含义：点当前目标【永远】是解除，哪怕它正暂停着。暂停后的
       // 重试路径因此是"解除 -> 再点一次锁顶"，两步各自清楚，不猜。
@@ -4795,11 +4807,34 @@ function __mmxStatusMain(cfg) {
       topLockState.confirmedAtTop = true;
       topLockState.pendingOrderRef = null;
       topLockState.pendingOrderOwner = '';
+      topLockState.yieldedTo = '';
       topLockReason('confirmed', 'confirmed');
+      return true;
+    }
+    // 让位（用户新规则：新对话排到原锁顶项上面，成为第一项）。
+    //
+    // 判据【全部】在新对话那一段里（newMainYieldId），这一段只负责把它记下来：
+    // raw[0] 是我们自己刚放上去的那个新对话、而锁自己还在置顶区里（下标 >= 1）
+    // 时，锁【仍然成立】——红箭头继续亮着，phase 仍是 confirmed，理由记成
+    // 'yielded-to-new-main'——但这一趟【一次宿主写都不发】，维持预算一格都不扣。
+    // 抢回 raw[0] 是锁自己的老行为，不在这里发生。
+    //
+    // 那个 typeof 守卫不是防御性编程，是切片现实：离线套件（test-top-lock.mjs）
+    // 把这一块锁模块【单独】切出来编译执行，那一块里没有新对话那一段。缺了它
+    // 必须退化成"没有让位"，绝不能变成一个 ReferenceError。
+    var yielded = typeof newMainYieldId === 'function' ? newMainYieldId(view) : '';
+    if (yielded) {
+      topLockState.confirmedId = topLockState.intentId;
+      topLockState.confirmedAtTop = true;
+      topLockState.pendingOrderRef = null;
+      topLockState.pendingOrderOwner = '';
+      topLockState.yieldedTo = yielded;
+      topLockReason('yielded-to-new-main', 'confirmed');
       return true;
     }
     topLockState.confirmedAtTop = false;
     topLockState.confirmedId = '';
+    topLockState.yieldedTo = '';
     return false;
   }
 
@@ -4872,6 +4907,7 @@ function __mmxStatusMain(cfg) {
     topLockState.intentSource = 'local';
     topLockState.confirmedId = '';
     topLockState.confirmedAtTop = false;
+    topLockState.yieldedTo = '';
     // 新的意图 = 新的预算。旧代次欠下的维持次数不跟着过来。
     topLockState.maintBudget = TOPLOCK_MAX_MAINT;
     return true;
@@ -4895,6 +4931,7 @@ function __mmxStatusMain(cfg) {
     topLockState.intentSource = '';
     topLockState.confirmedId = '';
     topLockState.confirmedAtTop = false;
+    topLockState.yieldedTo = '';
     topLockState.pendingOrderRef = null;
     topLockState.pendingOrderOwner = '';
     var rt = topLockRuntime();
@@ -5119,6 +5156,274 @@ function __mmxStatusMain(cfg) {
 
   var timer = window.setInterval(scheduleApply, cfg.intervalMs || 3000);
 
+  // ---------------------------------------------------------------------
+  // 新对话排最上面（页面侧）
+  //
+  // daemon 随刷新送来的包，形状固定：
+  //   { startedAtMs, sequence, available, observedAtMs, candidates:[{id,createdAtMs}] }
+  // 候选按创建时间升序（同一毫秒按 id），也就是【旧到新】（包内第一个最老）。
+  //
+  // 这一段只做一件事：把候选里的会话按【宿主自己的顺序】写到 raw[0]（最顶），
+  // 并且只在【真的从宿主那份可信 order 里读到它已经在 raw[0]】之后才回执。
+  //
+  // 三条硬边界：
+  //   1. 写点只有 cap.fn(id, true, 0) 一处。cap 来自既有 topmostCapability
+  //      （fiber 树 / 唯一 hook / local 源 / 只读探针都已经证过），不另找路，
+  //      也绝不碰 DOM 行序。
+  //   2. 写走共享闸 hostCallTake()/hostCallRelease()，与「到最顶」菜单项、
+  //      红色锁顶、自动到顶、上浮同一条。
+  //   3. 宿主写是异步的：resolve 不等于生效。回执只来自【读到 order】，绝不
+  //      来自那一次 resolve；没读到就不回执，daemon 会继续 pending 重发。
+  //
+  // 两条新纪律（2026-11-15 独审后补）：
+  //   4. 回执只认【我们自己放上去的】那个候选，而且必须真的读到它在 raw[0]。
+  //      两个条件缺一不可：宿主自己把它放到 raw[0] 不算——那种情况下让位判据
+  //      也不成立（那个 id 不在我们写过的那一组里），锁会按原语义把 raw[0] 抢回
+  //      去，于是"已应用"是一句假话，daemon 据此摘掉 pending 就再也送不回来了。
+  //   5. 每个候选有【写尝试预算】（NEWMAIN_WRITE_MAX）。宿主写不落位时 daemon
+  //      每 2500ms 重发一次，没有这个刹车就是一场永久 storm（兄弟通道都有：
+  //      自动到顶 3 次、锁顶维持 3 次）。预算用完 = 【显式停手】，不是失败：
+  //      那个候选不再被写，理由记在 deferred 里。
+  //
+  // 锁在场【不挡路】：新对话照写 raw[0]。宿主那个三参 API 对未置顶项是
+  // 「置顶 + 首位」一步完成，对已置顶项是先摘出再插回 0，其余置顶项顺次
+  // 下移一位——所以锁自己会从 raw[0] 落到 raw[1]。那是让位，不是失败。
+  // 锁那一侧怎么认这次让位，判据全在下面 newMainYieldId 里。
+  var newMainPkg = cfg.newMainSessions ? cfg.newMainSessions : null;
+  // 写尝试预算：每个候选最多写这么多次。兄弟通道都有这个刹车
+  // （TOPMOST_AUTOTOP_MAX = 3、TOPLOCK_MAX_MAINT = 3）：没有它，宿主写不落位
+  // 时 daemon 每 2500ms 重发一次、页面每趟写一次，就是一场永久 storm。
+  // 预算用完不是"失败"，是【显式停手】：那个候选不再被写，理由写进 deferred。
+  var NEWMAIN_WRITE_MAX = 3;
+  var newMainState = {
+    run: null,        // 当前 run 的 startedAtMs（包自带，页面不自己编）
+    lastPkg: null,    // 上一次【允许写】的那个包对象
+    acked: [],        // 我们自己放上去、而且真的读到已经在 raw[0] 的 id
+    deferred: '',     // 这一趟为什么没写
+    placedIds: [],    // 我们发起过写的 id（= "我们放上去的"那一组）：回执与让位都只认这些
+    attempts: Object.create(null),   // id -> 已经写了几次（按候选计数的写预算）
+  };
+
+  // 候选 id 在宿主 order 里【唯一】出现吗？order 里混着非会话行，所以比对的
+  // 是 type === 'session' 且 id 相同的那一项：出现 0 次认不出是哪一位，出现
+  // 多次同样认不出。返回下标；-1 = 不在（或认不出），两者都拒绝。
+  function newMainOrderIndex(order, id) {
+    if (!isArray(order)) return -1;
+    var at = -1;
+    for (var i = 0; i < order.length; i++) {
+      var it = order[i];
+      if (!it || it.type !== 'session') continue;
+      if (String(it.id) !== id) continue;
+      if (at >= 0) return -1;
+      at = i;
+    }
+    return at;
+  }
+
+  // 回执。startedAtMs 是包自带的那个值，一个字节都不改；acknowledged 只含本页
+  // 【我们自己放上去、而且真的读到它在 raw[0]】的 id。deferred 是这一趟没写的原因
+  // （没有就不带）。
+  function newMainReceipt(stats, pkg) {
+    var out = { startedAtMs: pkg.startedAtMs, acknowledged: newMainState.acked.slice() };
+    if (newMainState.deferred) out.deferred = newMainState.deferred;
+    stats.newMainSessions = out;
+  }
+
+  function newMainTick(cap, stats) {
+    var pkg = newMainPkg;
+    newMainState.deferred = '';
+    // 老 daemon：根本没有包。什么都不写，什么都不回执。
+    if (!pkg || typeof pkg !== 'object') return;
+    var run = Number(pkg.startedAtMs);
+    if (!isFinite(run)) {
+      // 没有 run 边界就没有回执的形状可言：一个字节都不写。
+      newMainState.deferred = 'bad-payload';
+      newMainReceipt(stats, pkg);
+      return;
+    }
+    // run 变了（daemon 重启）：本地的"已应用/待确认"记忆按新 run 重置，允许
+    // 新一轮重发；旧 run 的 id 不卡住。写预算也按新 run 重置：新一轮交付从
+    // 头再来一次（否则上一轮用完的次数会把这一轮直接掐死）。让位那份记忆
+    // （placedIds）同样清掉：它记的是"我们写过谁"，新一轮交付从头开始。
+    // （run 变了必然伴随页面重新注入，新实例的记忆本来就是空的；这里再清
+    // 一次，是让代码和上面这句注释说的是同一件事。）
+    if (newMainState.run !== run) {
+      newMainState.run = run;
+      newMainState.acked = [];
+      newMainState.placedIds = [];
+      newMainState.attempts = Object.create(null);
+    }
+    // 可用性：包自己说不可用，就是没有可信的新会话名单。
+    if (pkg.available !== true) {
+      newMainState.deferred = 'unavailable';
+      newMainReceipt(stats, pkg);
+      return;
+    }
+    // 新鲜度：observedAtMs 距今超过 STALE_AFTER_MS 就不再写。复用现有的那个
+    // 常量，不另立第二套"过期"。
+    var observed = Number(pkg.observedAtMs);
+    var age = isFinite(observed) ? Date.now() - observed : Infinity;
+    if (age < 0) age = 0;
+    if (age > STALE_AFTER_MS) {
+      newMainState.deferred = 'stale';
+      newMainReceipt(stats, pkg);
+      return;
+    }
+    var cands = pkg.candidates;
+    if (!isArray(cands)) {
+      newMainState.deferred = 'bad-payload';
+      newMainReceipt(stats, pkg);
+      return;
+    }
+    // 候选 id，按包内顺序（创建时间升序）去重。
+    var ids = [];
+    for (var i = 0; i < cands.length; i++) {
+      var c = cands[i];
+      if (!c || c.id == null) continue;
+      var cid = String(c.id);
+      if (!cid || ids.indexOf(cid) >= 0) continue;
+      ids.push(cid);
+    }
+    // 写与确认都要一份【可信】的本地视图。cap 来自既有 topmostCapability：
+    // fiber 树、唯一 hook、local 源、只读探针都已经证过。
+    if (!cap || cap.available !== true || cap.source !== 'local'
+      || typeof cap.fn !== 'function' || typeof cap.probe !== 'function'
+      || !isArray(cap.order)) {
+      newMainState.deferred = 'view-unstable';
+      newMainReceipt(stats, pkg);
+      return;
+    }
+    // ---- 确认：回执只来自【这一份可信 order 里真的读到它在 raw[0]】 ----
+    // 两个条件缺一不可：
+    //   1. 这个 id 是【我们自己放上去的】（在 placedIds 里）。宿主自己把它放到
+    //      raw[0] 不算：那种情况下让位判据也不成立（那个 id 不在 placedIds
+    //      里），锁会按原语义把 raw[0] 抢回去——回执说"已应用"而实际停在第二位，
+    //      daemon 据此摘掉 pending 就再也送不回来了。
+    //   2. 这一份可信 order 里读到它就是 raw[0]。
+    // 宿主写是异步的，所以那一次 resolve【什么都不证明】：只有后面某一趟从
+    // order 里读到它已经在 raw[0]，它才算已应用。
+    for (var k = 0; k < ids.length; k++) {
+      if (newMainState.acked.indexOf(ids[k]) >= 0) continue;
+      if (newMainState.placedIds.indexOf(ids[k]) < 0) continue;
+      if (newMainOrderIndex(cap.order, ids[k]) === 0) newMainState.acked.push(ids[k]);
+    }
+    // ---- 写 ----
+    // 一个包里可能有好几个候选：按包内升序依次处理，每个都写 raw[0]，于是先写
+    // 的那个旧的会被后写的挤下去，最终最新的那个在最上。共享闸一次只容一张
+    // 票，所以一趟最多写一个，下一趟写下一个。
+    //
+    // 为什么不会出现 A/B 互相顶来顶去的乒乓：
+    //   * 回执过的候选【永远不再写】（下面第一道 continue）。
+    //   * 一趟只写一个，写的是包里【最老的那一个还没回执、还认得出是哪一位、
+    //     预算还没用完】的候选。于是 B 要被写，A 必须已经被回执（回执过的永远
+    //     不再写）、或者已经认不出、或者预算用完——三种情况里没有一种会让 A 和
+    //     B 轮流抢 raw[0]。
+    //   * 每个候选的写次数有上界（NEWMAIN_WRITE_MAX），所以就算别的通道把它从
+    //     raw[0] 挤走，它被再写一次也就收敛了。
+    // 只有【新到的那个包】才允许写：apply() 也会被 DOM 变化带着跑，那不是一次
+    // 新交付，拿它当新交付就成了一次交付一次（每帧一次宿主写）。
+    // 注意：这个守卫【不是】刹车——daemon 的 feed.payload() 每趟返回新对象，
+    // 它只能挡住同一趟 apply() 内的重复写。真正的刹车是下面那个写预算。
+    if (pkg === newMainState.lastPkg) {
+      newMainReceipt(stats, pkg);
+      return;
+    }
+    newMainState.lastPkg = pkg;
+    for (var j = 0; j < ids.length; j++) {
+      var wid = ids[j];
+      if (newMainState.acked.indexOf(wid) >= 0) continue;
+      var at = newMainOrderIndex(cap.order, wid);
+      if (at < 0) continue;                    // 不在 order 里 / 认不出是哪一位
+      // 写预算（按候选计）：写不落位时 daemon 会一直重发，没有这个刹车就是永久
+      // storm。预算用完 = 显式停手：不再写它，理由写进 deferred（一眼看得懂）。
+      var used = newMainState.attempts[wid] || 0;
+      if (used >= NEWMAIN_WRITE_MAX) {
+        if (!newMainState.deferred) newMainState.deferred = 'write-budget-exhausted';
+        continue;
+      }
+      // 目标自己过只读探针，绝不借见证行的结论。
+      var ro;
+      try { ro = !!cap.probe(wid, cap.source); } catch (e) { ro = true; }
+      if (ro) continue;
+      var ticket = hostCallTake();
+      if (!ticket) {
+        if (!newMainState.deferred) newMainState.deferred = 'gate-unavailable';
+        break;
+      }
+      var ret;
+      // 这一次【尝试】先记账：宿主抛异常 / reject 也是一次尝试，不记账的话
+      // "每次都抛"的宿主就是另一场永久 storm。同步抛错（catch 得到的那一支）
+      // 连"发起过"都不算：函数根本没返回；异步 reject 那一支算发起过，落没
+      // 落位交给回执去证明。
+      newMainState.attempts[wid] = used + 1;
+      try {
+        ret = cap.fn(wid, true, 0);
+        // 发起过写就算"我们放上去的"那一组里的一个（placedIds）。宿主写是
+        // 异步的：这里既不能同步判断它成没成，也不许因为它后来 reject 就反悔
+        // ——那正是 2026-11-15 第三轮独审查出的坑：一次没落位的写把已落位那条
+        // 的让位记录顶掉，锁随即抢回 raw[0]，已放好的新对话永久掉到第二位。
+        // 真落没落位由回执条件②（真的读到 order[0] 是它）另外证明。
+        if (newMainState.placedIds.indexOf(wid) < 0) newMainState.placedIds.push(wid);
+      } catch (e) {
+        hostCallRelease(ticket);
+        if (!newMainState.deferred) newMainState.deferred = 'call-threw';
+        break;
+      }
+      // 闸由宿主那一次调用自己结算时释放，而且只释放它自己那一张票。
+      Promise.resolve(ret).then(function () {
+        hostCallRelease(ticket);
+      }, function () {
+        hostCallRelease(ticket);
+      });
+      break;                                  // 一趟一次
+    }
+    newMainReceipt(stats, pkg);
+  }
+
+  // ---------------------------------------------------------------------
+  // 锁顶让位（判据全在这一段里）
+  //
+  // 用户新规则：新对话排到【原锁顶项】上面，成为第一项。宿主那个三参 API
+  // handlePinSession(id, true, 0) 正是这件事：未置顶项是「置顶 + 首位」一步
+  // 完成，已置顶项先摘出再插回 0，其余置顶项顺次下移一位。于是锁自己从
+  // raw[0] 落到 raw[1]——那是让位，不是失败，锁也没有被解除。
+  //
+  // 判据只有一条，而且只认【我们自己发起过写的那一组 id】（placedIds）：
+  //   1. raw[0] 是会话，而且它的 id 在 placedIds 里（我们写过它）；
+  //   2. 锁自己的 id 仍在宿主 order 里，且下标 >= 1（锁还在置顶区里）。
+  // 为什么是"一组"而不是"最后一次写的那个"：宿主写是异步的，一次没落位的写
+  // （reject / 回滚）照样会进 placedIds。若只认最后一个，这一次失败的写就能把
+  // 已落位那条的让位记录顶掉，锁随即抢回 raw[0]，已经放好的新对话就永久掉到
+  // 第二位（它已经被回执过，daemon 不会再送回来）。
+  // 别人手动置顶的会话顶上来（raw[0] 不在 placedIds 里）→ 不让位，锁按原有
+  // 行为抢回 raw[0]；我们放上去的那个新对话被用户挪走 → 同样不让位。
+  //
+  // 返回值：让位时是那个新对话的 id，否则空串。锁那一侧（topLockConfirm）
+  // 只负责把它记下来——让位这一趟一次宿主写都不发，维持预算一格都不扣。
+  // ---------------------------------------------------------------------
+  function newMainYieldId(view) {
+    if (!newMainState || !newMainState.placedIds.length) return '';
+    if (!view || view.source !== 'local') return '';
+    var order = view.order;
+    if (!isArray(order) || !order.length) return '';
+    var first = order[0];
+    if (!first || first.type !== 'session') return '';
+    var firstId = String(first.id);
+    // raw[0] 必须是我们【发起过写】的那一组里的一个（集合语义，不是"最后一次
+    // 写的那一个"：没落位的写不能顶掉已落位那条的让位记录）。
+    if (newMainState.placedIds.indexOf(firstId) < 0) return '';
+    var intent = topLockState.intentId;
+    if (!intent) return '';
+    for (var i = 0; i < order.length; i++) {
+      var it = order[i];
+      if (!it || it.type !== 'session') continue;
+      if (String(it.id) !== String(intent)) continue;
+      // 锁自己就在 raw[0]：那是"锁在首位"，不是让位（topLockConfirm 先判它）。
+      return i >= 1 ? firstId : '';
+    }
+    return '';
+  }
+
   var api = {
     cfg: cfg,
     mount: mount,
@@ -5327,6 +5632,9 @@ function __mmxStatusMain(cfg) {
           // "not proven right now" -- never "it is at the bottom".
           confirmedId: topLockState.confirmedId,
           confirmedAtTop: topLockState.confirmedAtTop === true,
+          // 让位对象：锁让位给的那个新对话 id（我们自己放到 raw[0] 的那个）。
+          // 空串 = 没有让位。仍然是只读快照里的一个 id，不带标题、不带正文。
+          yieldedTo: topLockState.yieldedTo,
           generation: topLockState.generation,
           busy: topLockState.busy === true,
           injected: topLockState.injected,
@@ -5432,6 +5740,17 @@ function __mmxStatusMain(cfg) {
       delete window[GLOBAL];
       return { removed: dots.length, restored: restored, disposed: true };
     },
+  };
+
+  // 交付侧把新对话包作为 refresh 的【第二个参数】送来（daemon 侧已冻结：刷新期
+  // 走 refresh 的第二个参数，注入期走 cfg.newMainSessions）。上面那个出厂的
+  // refresh 函数体一个字未动——先 apply 再 enforceNoAutoExpand——所以第二个
+  // 参数在这里接住，接住之后由 apply() 那一趟消费。老 daemon 只传一个参数，包
+  // 就是 undefined：页面什么都不写、什么都不回执。
+  var apiRefresh = api.refresh;
+  api.refresh = function (nextStatus) {
+    newMainPkg = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : null;
+    return apiRefresh.call(api, nextStatus);
   };
 
   window[GLOBAL] = api;
