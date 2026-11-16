@@ -3896,12 +3896,31 @@ powershell -NoProfile -WindowStyle Hidden -File .\src\set-mmx-taskbar-icon.ps1 `
 powershell -NoProfile -File .\src\set-mmx-taskbar-icon.ps1 -TargetProcessId 48588 -Stop
 ```
 
+#### 19.5.1 2026-11-16 → 2026-11-17 真机记录：自动更新自重启后图标回原图，手工热应用恢复红圆
+
+**结论**：2026-11-16 应用自动更新后自重启，任务栏按钮图标变回**官方原图**；2026-11-17 04:24 对新实例手工热应用成功，任务栏按钮恢复**红色实心圆**，应用未重启。
+
+**2026-11-16 现场（现象：任务栏按钮图标是官方原图）**
+
+- 2026-11-16 17:21 应用自动更新后自重启，新主进程 pid **63636**，命令行只有 `"D:\MiniMax\MiniMax Code\MiniMax Code.exe" --updated`，**没有** `--remote-debugging-port=9331` → **没走 launcher** → 新实例没有 keeper 被拉起 → 任务栏按钮图标是官方原图。
+- 旧实例 pid 23456（2026-11-15 15:40:53 起的那个）在这次更新后已经不在了；它的任务栏 keeper（pid 39492，目标 pid 23456，主窗口 hwnd 526766）在 **2026-11-16 14:43:34** 自行退出，`src\logs\taskbar-icon\keeper-23456-d9c851aa0981497cb3cdf5a07082b698.log` 末行原话：「主窗口已消失/被替换，释放图标并退出。」
+- 这次退出**早于**新实例创建（keeper 记录的新实例进程创建时间是 2026-11-16 17:21:44），**不是**一次干净的应用退出；所以「应用退出后 keeper 自然结束」仍按 §19.6 记为**未在真实应用上验证**。
+
+**2026-11-17 04:24 手工热应用成功（keeper 常驻进程方式）**
+
+- 目标：pid **63636**，主窗口 hwnd **526778**，class `Chrome_WidgetWin_1`，title `MiniMax Code`。
+- keeper 结果 `src\logs\taskbar-icon\keeper-63636-b17d5028921d4f30981bf9bd82916c92.json`：`ok=true / mode=apply / status=applied / applied=true / reason=ok / iconBigSize=56 / iconSmallSize=28 / nativeWriteCalls=4 / keeperPid=36048`。
+- 回读核对：`WM_GETICON` ICON_BIG=**1252591251**、ICON_SMALL=**1365182547**（两项都非 0）；窗口 rect **1,1-1762,1022**、`visible=True`。
+- 画面验收：真实桌面截图确认**任务栏上的 MiniMax Code 按钮已是红色实心圆**，应用未重启。截图只留在本地 `logs\` 目录（被 `.gitignore` 忽略、**不入库**），此处只留结论。
+- **未做**：没有重跑 launcher 去验证「launcher 冷启动 → 自动拉 keeper → 自动换红圆」这条整链路（本次是手工热应用，应用未重启）；「应用退出后 keeper 自然结束」也**未做**真机重放。
+
 ### 19.6 已知边界
 
 - 不写 `System.AppUserModel.ID` / `Relaunch*` 属性，不碰窗口类图标，不动注册表、快捷方式、官方 exe/asar/资源；不新建任务栏按钮、不造分组。
 - keeper 只在 MiniMax 运行期间存在；应用退出即结束；不新增开机自启、不加新服务。
-- **已完成真实应用热应用验收**：2026-10-22 对运行中的 MiniMax Code 应用任务栏图标，隐藏 keeper 返回 `status=applied / ok=true / applied=true`；主会话在真实桌面确认任务栏按钮为红色实心圆，应用未重启。
+- **已完成真实应用热应用验收**：2026-10-22 对运行中的 MiniMax Code 应用任务栏图标，隐藏 keeper 返回 `status=applied / ok=true / applied=true`；主会话在真实桌面确认任务栏按钮为红色实心圆，应用未重启。第二次同样的验收在 2026-11-17 04:24（自动更新后的新实例，手工热应用，见 19.5.1）。
 - **未做真实应用验收的边界**：`mmx-fix` 冷启动后由 launcher 自动启动 keeper 的整链路，以及应用退出后 keeper 自然结束；这两项尚未在真实应用上操作，仅有隔离自检与代码审查证据。
+- **只在 launcher 启动路径上自动生效**：任务栏按钮图标和托盘图标一样，**应用自动更新自重启或手工直启（不走 launcher）时不会自动换回红圆**；要红圆得用 launcher（桌面 `mmx-fix`）启动应用，或按 §19.5 对已在跑的新实例手工热应用。2026-11-16 那次自动更新自重启就是这种情形，现象 = 任务栏按钮图标回到官方原图（见 19.5.1）。
 - ⚠️ 2026-10-22 事故记录：自检里曾拿**真实主窗句柄**当假句柄，导致一次真 `WM_SETICON` 打到了用户正在用的窗口，随后 HICON 被销毁、窗口留下野句柄。已改：假句柄固定为不可能是窗口的值并加断言；`Remove-MmxTaskbarHeldIcons` 要求「能证明窗口不再引用」才允许销毁；原生适配器改成 **fail-closed**（桩缺失直接抛错，绝不回退真实 API）。
 - 事故留下的悬空句柄**已于 2026-10-22 归零，未重启应用**：用一次性候选脚本 `logs\taskbar-repair\repair-dangling-taskbar-icon.ps1` 归零（默认只读，`-Apply` 才写；门禁要求「同一 PID + 同一创建时间、同一窗口句柄/类/归属、当前图标一字不差等于事故记录」，任何一条不符立即拒绝；只发 `WM_SETICON(NULL)`，绝不 `DestroyIcon` 旧句柄）。归零后再按正常流程起 keeper，它保存的 Old 就是 0，`-Stop` 恢复的也是 0。该脚本是**一次性本地恢复工具，只针对这次事故的那一个窗口**：它**未入库**（`logs/` 被 `.gitignore` 忽略）、**不随本补丁分发**，新克隆者拿不到它，也不是可以直接照抄运行的通用步骤 —— 需要同样处理时请按本节机制另写工具，而不是找这个脚本。
 - ⚠️ **强杀 keeper = 图标重新变悬空**：HICON 由 keeper 进程持有，进程一死系统就销毁它，窗口会再次挂上野句柄（和上面那次事故同形状）。要停就用 `-Stop`（先恢复原图再退出），别直接杀进程。
