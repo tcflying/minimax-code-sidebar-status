@@ -3905,6 +3905,91 @@ powershell -NoProfile -File .\src\set-mmx-taskbar-icon.ps1 -TargetProcessId 4858
 - ⚠️ 2026-10-22 事故记录：自检里曾拿**真实主窗句柄**当假句柄，导致一次真 `WM_SETICON` 打到了用户正在用的窗口，随后 HICON 被销毁、窗口留下野句柄。已改：假句柄固定为不可能是窗口的值并加断言；`Remove-MmxTaskbarHeldIcons` 要求「能证明窗口不再引用」才允许销毁；原生适配器改成 **fail-closed**（桩缺失直接抛错，绝不回退真实 API）。
 - 事故留下的悬空句柄**已于 2026-10-22 归零，未重启应用**：用一次性候选脚本 `logs\taskbar-repair\repair-dangling-taskbar-icon.ps1` 归零（默认只读，`-Apply` 才写；门禁要求「同一 PID + 同一创建时间、同一窗口句柄/类/归属、当前图标一字不差等于事故记录」，任何一条不符立即拒绝；只发 `WM_SETICON(NULL)`，绝不 `DestroyIcon` 旧句柄）。归零后再按正常流程起 keeper，它保存的 Old 就是 0，`-Stop` 恢复的也是 0。该脚本是**一次性本地恢复工具，只针对这次事故的那一个窗口**：它**未入库**（`logs/` 被 `.gitignore` 忽略）、**不随本补丁分发**，新克隆者拿不到它，也不是可以直接照抄运行的通用步骤 —— 需要同样处理时请按本节机制另写工具，而不是找这个脚本。
 - ⚠️ **强杀 keeper = 图标重新变悬空**：HICON 由 keeper 进程持有，进程一死系统就销毁它，窗口会再次挂上野句柄（和上面那次事故同形状）。要停就用 `-Stop`（先恢复原图再退出），别直接杀进程。
+- 通知区（右下角）里那个**托盘图标**是**另一套机制**（`Shell_NotifyIcon` / `NIM_MODIFY`），见 §21；本节只管任务栏按钮，两套互相独立。
+
+---
+
+## 21. 托盘图标换红圆（Shell_NotifyIcon / NIM_MODIFY）
+
+把**右下角通知区里那个 MiniMax Code 托盘图标**换成 `assets\mmx-red-circle.ico` 那个红圆。
+
+和 §19 是**两套独立机制**：§19 改的是**任务栏按钮**（`WM_SETICON`），本节改的是**通知区里的托盘项**（`Shell_NotifyIcon`）。两个开关（`-NoTaskbarIcon` / `-NoTrayIcon`）也互相独立。
+
+### 21.1 机制（官方源码 + WinAPI，不猜）
+
+| 事实 | 出处 |
+|---|---|
+| 托盘图标的宿主是隐藏顶级窗口，类名 `Electron_NotifyIconHostWindow`，归属 Electron 主进程 | `electron/shell/browser/ui/win/notify_icon_host.cc` |
+| 图标 ID 从 `BaseIconID` 起递增（**非 GUID 样式**） | 同上 |
+| 读托盘图标屏幕矩形用 `Shell_NotifyIconGetRect(hWnd + uID)` | `electron/shell/browser/ui/win/notify_icon.cc::GetBounds` |
+| 换图只发 `NIF_ICON(0x2)` + `NIM_MODIFY(0x1)`，不动 tooltip / 回调 / 菜单 | `electron/shell/browser/ui/win/notify_icon.cc::SetImage` |
+| `Shell_NotifyIconW` / `Shell_NotifyIconGetRect` | <https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shell_notifyiconw> 、<https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shell_notifyicongetrect> |
+
+所以本工具**不新建托盘项**：只对**已经存在**的托盘项改图（`NIM_MODIFY`），**不 `NIM_ADD`、不 `NIM_DELETE`**，也不动 tooltip / 回调消息 / 右键菜单。
+
+图标 ID **不假定是 2**：在 2..32 区间逐个实测 `Shell_NotifyIconGetRect`，只有「恰好一个」`S_OK` 且矩形非空才认；0 个 / 多个 / GUID 样式认不出来 → 一律拒绝（fail closed）。
+
+### 21.2 两个文件 + 逃生开关
+
+- `src/set-mmx-tray-icon.ps1` —— 默认**只读探测**（枚举窗口 + 读图标矩形，**一个写 API 都不调**）；`-Apply` 才下发一次 `NIM_MODIFY`（HICON 由本进程 `LoadImageW` 出来，用完 `DestroyIcon`）。`-WaitSeconds` 是「等目标出现」和「等矩形落定」两份预算（上限 30，默认 0）。
+- `src/test-tray-icon.ps1` —— 自检（原生结构偏移 / 门禁反向用例 / 写前复检 / 落定重试 / launcher 接线静态检查）。2026-11-15 本轮修复后：**PASS 188 / FAIL 0 / SKIP 0**（那次应用在跑、CDP 端口唯一）。2026-11-16 应用自重启后**没带 CDP 端口**再跑一次：**PASS 182 / FAIL 0 / SKIP 1**，跳过的那 1 项是「真实 probe：MiniMax Code 没在跑 / CDP 端口不唯一」。**计数不是固定的**，跟着「应用在不在跑、CDP 端口唯一不唯一」变。
+- `src/launch-mmx-status.ps1` —— `-NoTrayIcon` 逃生开关（出问题或不想换时用这个关掉）；换图发生在 **daemon 起来之后**（不拖慢应用启动），`-NoDaemon` 分支照常换图，失败只记 WARN、绝不影响启动流程。
+
+### 21.3 门禁（fail closed，一个都不放宽）
+
+写之前要过两道：目标门禁（进程 EXE 规范路径 / 命令行可得且不是辅助子进程 / host 窗口唯一且归属正确 / 图标 ID 唯一）+ 写前复检（进程创建时间、EXE、进程号、host 窗口句柄与归属、图标 ID、矩形与基线一致），防 PID 复用 / stale / 窗口被换。身份不明（拿不到命令行）一律拒绝写。
+
+### 21.4 2026-11-15 事故：`stale-rect` 输给通知区排版
+
+**现象**：2026-11-15 15:41:07 冷启动后，**任务栏**图标换图成功（keeper 结果 `applied=true`），**托盘**图标没换成功，`src\logs\launch-20261115-154049.log` 里是：
+
+```
+托盘图标未更换（不影响启动流程）：reason=stale-rect
+```
+
+**根因**：helper 写之前要做一次写前复检（两次状态快照比一遍）。Win11 通知区在应用刚起来时还在**重新排版**，两次快照之间的托盘图标矩形会挪位置 → 复检命中 `stale-rect` 分支直接拒绝写。同一时刻任务栏那条路不依赖托盘矩形，所以它成功了。**布局稳定之后跑同一条命令就成功**（2026-11-15 真机实测：`ok=true / applied=true / hostWindow=198300 / iconId=3 / nativeWriteCalls=2`，画面上托盘图标变成红圆）。
+
+**修复（2026-11-15）**：`stale-rect` 是**唯一的瞬时条件**，现在只对它做**有界重试**，其余 stale 原因一律不重试：
+
+- 预算 = `-WaitSeconds`（launcher 从 8 提到 **20**，helper 上限 30），每轮间隔 250ms；
+- **身份门禁照旧对着原始基线核**（进程创建时间 / EXE 路径 / 进程号 / 命令行 / host 窗口句柄与归属 / 图标 ID 一个都没放宽）；矩形改成「**相邻两次读数完全一致**」才算落定（这两次读之间隔了 250ms，比原来那两次背靠背的读更能证明排版已经停住）；
+- 其他 stale 原因（进程没了 / 创建时间变了 / EXE 变了 / host 窗口被换 / 图标 ID 变了 / 命令行取不到）**仍然立刻硬失败，不重试**；
+- 预算用完仍拿不到稳定矩形 → `reason=stale-rect-timeout`，**继续 fail closed**：不写、`ok=false`、`applied=false`、零原生写调用。
+
+**reason 码口径**
+
+| reason | 出处 | 含义 | 写过吗 |
+|---|---|---|---|
+| `stale-rect` | `Compare-MmxTrayState`（纯门禁函数） | 两次读到的托盘图标矩形不一致 | 否 |
+| `stale-rect-timeout` | `Invoke-MmxTrayIconTask`（最终结果） | 预算内矩形**始终**在动，通知区一直没排定 | 否 |
+| `stale-process-gone` / `stale-creation-time` / `stale-executable` / `stale-process-id` / `stale-host-window` / `stale-host-window-gone` / `stale-host-class` / `stale-host-pid` / `stale-icon-id` / `stale-baseline-*` / `commandline-unavailable` | `Compare-MmxTrayState` | 身份/归属类不一致，**一律立刻硬失败** | 否 |
+
+**2026-11-16 后续：应用自动更新自重启 → §21 整条链路这次根本没跑**
+
+**现象**：2026-11-16 17:21 应用自动更新后自重启，用户看到的现象是「**托盘图标没变**」——通知区里那个图标仍是官方原图。
+
+**现场**：新主进程 pid **63636**，命令行只有 `"D:\MiniMax\MiniMax Code\MiniMax Code.exe" --updated`，**没有** `--remote-debugging-port=9331`。也就是说应用**没走 launcher**（launcher 才带 CDP 端口参数并触发 §21 的换图链路）→ **§21 整条链路这次根本没跑** → 托盘图标是官方原图。**这跟上面那个 `stale-rect` 不是同一件事**：那次是链路跑了、但写前复检拒写；这次是链路压根没启动。
+
+**旧实例**：pid 23456（2026-11-15 15:40:53 起的那个）在这次更新后已经不在了；它的任务栏 keeper 于 **2026-11-16 14:43:34** 自行退出（`src\logs\taskbar-icon\keeper-23456-d9c851aa0981497cb3cdf5a07082b698.log`：主窗口已消失/被替换，释放图标并退出）。
+
+**手动重跑换图成功（2026-11-16 真机）**：
+
+```
+pwsh -NoProfile -File src\set-mmx-tray-icon.ps1 -TargetProcessId 63636 -ExpectedExecutable "D:\MiniMax\MiniMax Code\MiniMax Code.exe" -IconPath assets\mmx-red-circle.ico -Apply -WaitSeconds 6
+```
+
+结果：`ok=true / mode=apply / applied=true / reason=ok / hostWindow=526286 / hostClassName=Electron_NotifyIconHostWindow / iconId=3 / nativeWriteCalls=2`；`iconRect` = left 2587 / top 1778 / right 2629 / bottom 1849（物理像素）。
+
+**画面验收**：托盘图标所在位置（物理坐标约 x=2608, y=1813）换图前是应用默认的浅蓝图标，换图后**实测截屏确认变成红圆**。截图只留在本地 `logs\` 目录（被 `.gitignore` 忽略、**不入库**），所以此处只留结论和坐标。
+
+### 21.5 已知边界
+
+- 官方自己重建托盘（Explorer 重启、通知区重排）或应用冷启动 → 官方会把原图装回去；本工具**不做常驻监控、不加后台服务/自启**，重跑一次 launcher 就重新换红圆。
+- **没有「恢复原图」开关**：不提供会触发 Electron `DELETE+ADD` 的回滚入口（少一个误操作面）。
+- 不碰官方 exe / app.asar / 官方资源 / 注册表 / 快捷方式；桌面 `mmx-fix` 快捷方式图标还是原来的 M。
+- 官方直启动（不走 launcher）不经过这条链路。
+- **应用不走 launcher 启动（自动更新后自重启、手工直启）时，托盘图标就是官方原图，§21 链路不参与**；要红圆得用 launcher（桌面 `mmx-fix`）启动应用。2026-11-16 那次自动更新自重启就是这样，现象 = 托盘图标没变（见 21.4）。
+- ⚠️ **本轮未做真机冷启动重放**：修复后只做了离线自检（188 项全绿，含用「测试进程自建 fixture 托盘项」跑通的真 `NIM_MODIFY` 回路）和代码审查；**没有**重启应用重放 2026-11-15 那次冷启动现场。「布局稳定后换图成功」有真机证据（见 21.4），「冷启动 + 通知区排版 + 换图成功」这条整链路**尚未**在真机上重跑过。
 
 ---
 

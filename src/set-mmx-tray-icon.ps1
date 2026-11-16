@@ -28,6 +28,13 @@
     - 身份不明（拿不到命令行 / 判定不出是不是主进程）-> 一律拒绝写。
     - 写之前二次核对：PID 的进程创建时间、EXE 规范全路径、host 窗口归属、
       IsWindow、图标 ID、矩形，全部与基线一致才动手（防 stale / PID 复用）。
+    - 托盘图标矩形位移（stale-rect）是唯一的瞬时条件：Win11 通知区在应用刚
+      起来时还在重新排版，两次读到的托盘图标矩形会挪位置（2026-11-15 实测事故）。
+      只这一种原因允许有界重试（预算 = -WaitSeconds，每轮隔 250ms）：身份门禁
+      照样对着原始基线核，矩形改成「相邻两次读数一致」才算落定。其他 stale-* 原因
+      （进程没了 / 创建时间变了 / EXE 变了 / host 窗口被换 / 图标 ID 变了 /
+      命令行取不到）一律立刻硬失败，不重试。预算用完仍拿不到稳定矩形 ->
+      reason=stale-rect-timeout，继续 fail closed：一个原生写 API 都不调。
 
   结构体尺寸（Win64，依据 Windows Kits 10.0.26100.0\um\shellapi.h:1042-1071，
   1177-1182）：
@@ -67,8 +74,10 @@ param(
   [string]$IconPath = (Join-Path (Split-Path -Parent $PSScriptRoot) 'assets\mmx-red-circle.ico'),
   # 显式开关：真正下发 NIM_MODIFY。
   [switch]$Apply,
-  # 等待目标出现（托盘窗口/图标 ID 可能晚于进程起来）。上限 30 秒，默认 0。
-  # launcher 冷启动时传 8（有界等待，超时只是不换图，不影响启动）。
+  # 等待目标出现（托盘窗口/图标 ID 可能晚于进程起来）的上限；同一个值也是
+  # 「托盘图标矩形落定」重试的预算（两段各一份，最坏 2 倍）。上限 30 秒，默认 0
+  # （0 = 不等，立即判定）。
+  # launcher 冷启动时传 20（有界等待，超时只是不换图，不影响启动）。
   [int]$WaitSeconds = 0
 )
 
@@ -415,7 +424,9 @@ function Test-MmxTrayTarget {
 function Compare-MmxTrayState {
     # 纯门禁（无副作用）：写前复检，防止 stale / PID 复用 / 窗口被换掉。
     # ExpectedProcessId > 0 时，额外核对进程号本身（防 PID 复用后仍是同一 exe）。
-    param($Baseline, $Current, [int]$ExpectedProcessId = 0)
+    # -SkipRectCheck 只跳过最后那条矩形比对，其余门禁一个都不跳过：
+    # 用途是「通知区重排版导致矩形位移」时的落定判定（见 Invoke-MmxTrayIconTask）。
+    param($Baseline, $Current, [int]$ExpectedProcessId = 0, [switch]$SkipRectCheck)
     $d = @{ Ok = $false; Reason = $null }
     if (-not $Current -or -not $Current.Process -or -not $Current.Process.Ok) { $d.Reason = 'stale-process-gone'; return $d }
     if (-not $Baseline -or -not $Baseline.Process) { $d.Reason = 'stale-baseline-missing'; return $d }
@@ -450,14 +461,40 @@ function Compare-MmxTrayState {
     if ($baseIds.Count -ne 1) { $d.Reason = 'stale-baseline-icon-id'; return $d }
     if ($curIds.Count -ne 1) { $d.Reason = 'stale-icon-id'; return $d }
     if ([int]$curIds[0].Id -ne [int]$baseIds[0].Id) { $d.Reason = 'stale-icon-id'; return $d }
-    if ($curIds[0].Left -ne $baseIds[0].Left -or $curIds[0].Top -ne $baseIds[0].Top -or
-        $curIds[0].Right -ne $baseIds[0].Right -or $curIds[0].Bottom -ne $baseIds[0].Bottom) {
-        $d.Reason = 'stale-rect'; return $d
+    if (-not $SkipRectCheck) {
+        if ($curIds[0].Left -ne $baseIds[0].Left -or $curIds[0].Top -ne $baseIds[0].Top -or
+            $curIds[0].Right -ne $baseIds[0].Right -or $curIds[0].Bottom -ne $baseIds[0].Bottom) {
+            $d.Reason = 'stale-rect'; return $d
+        }
     }
 
     $d.Ok = $true
     $d.Reason = 'ok'
     return $d
+}
+
+function Test-MmxTrayRectEqual {
+    # 纯门禁（无副作用）：两次读到的托盘图标矩形是否完全一致。
+    # 「通知区还在重排版」= 矩形在挪位置；只有相邻两次读数一模一样才认落定。
+    param($Baseline, $Current)
+    if (-not $Baseline -or -not $Current) { return $false }
+    $baseIds = @($Baseline.IconCandidates | Where-Object { $_.Valid })
+    $curIds = @($Current.IconCandidates | Where-Object { $_.Valid })
+    if ($baseIds.Count -ne 1) { return $false }
+    if ($curIds.Count -ne 1) { return $false }
+    return ($curIds[0].Left -eq $baseIds[0].Left -and $curIds[0].Top -eq $baseIds[0].Top -and
+            $curIds[0].Right -eq $baseIds[0].Right -and $curIds[0].Bottom -eq $baseIds[0].Bottom)
+}
+
+function ConvertTo-MmxTrayRect {
+    # 纯转换（无副作用）：图标候选 -> 结果对象里用的矩形字段。
+    param($Candidate)
+    if (-not $Candidate) { return $null }
+    return @{
+        left = [int]$Candidate.Left; top = [int]$Candidate.Top
+        right = [int]$Candidate.Right; bottom = [int]$Candidate.Bottom
+        width = [int]$Candidate.Width; height = [int]$Candidate.Height
+    }
 }
 
 function Invoke-MmxTrayIconTask {
@@ -530,11 +567,7 @@ function Invoke-MmxTrayIconTask {
     $result.hostWindow = [long]$decision.HostWindow.Handle
     $result.hostClassName = $decision.HostWindow.ClassName
     $result.iconId = [int]$decision.IconId
-    $result.iconRect = @{
-        left = [int]$decision.Rect.Left; top = [int]$decision.Rect.Top
-        right = [int]$decision.Rect.Right; bottom = [int]$decision.Rect.Bottom
-        width = [int]$decision.Rect.Width; height = [int]$decision.Rect.Height
-    }
+    $result.iconRect = ConvertTo-MmxTrayRect -Candidate $decision.Rect
 
     if (-not $Apply) {
         $result.ok = $true
@@ -546,6 +579,35 @@ function Invoke-MmxTrayIconTask {
     # 写之前二次核对：PID 复用 / 窗口被换 / 矩形变了 -> 全部拒绝
     $state2 = & $StateProvider $TargetProcessId
     $fresh = Compare-MmxTrayState -Baseline $state -Current $state2 -ExpectedProcessId $TargetProcessId
+    if (-not $fresh.Ok -and $fresh.Reason -eq 'stale-rect') {
+        # 唯一的瞬时条件：通知区正在重排版（Win11 冷启动时托盘图标会挪位置）。
+        # 只有这一种原因允许重试：换一组相邻读数，矩形一致了才认落定；
+        # 其他 stale-* 原因（进程 / EXE / host 窗口 / 图标 ID 变了）一律硬失败，不重试。
+        $settleDeadline = (Get-Date).AddSeconds($WaitSeconds)
+        $timedOut = $true
+        while ($true) {
+            if ((Get-Date) -ge $settleDeadline) { break }
+            Start-Sleep -Milliseconds 250
+            $state3 = & $StateProvider $TargetProcessId
+            # 身份门禁照旧对着原始基线核（-SkipRectCheck 只跳过矩形那一条）。
+            $idCheck = Compare-MmxTrayState -Baseline $state -Current $state3 -ExpectedProcessId $TargetProcessId -SkipRectCheck
+            if (-not $idCheck.Ok) { $fresh = $idCheck; $timedOut = $false; break }
+            # 矩形：相邻两次读数一致 = 通知区已经排定。
+            if (Test-MmxTrayRectEqual -Baseline $state2 -Current $state3) {
+                $state2 = $state3
+                $fresh = $idCheck
+                $timedOut = $false
+                $settledValid = @($state3.IconCandidates | Where-Object { $_.Valid })
+                if ($settledValid.Count -eq 1) { $result.iconRect = ConvertTo-MmxTrayRect -Candidate $settledValid[0] }
+                break
+            }
+            $state2 = $state3
+        }
+        if ($timedOut) {
+            # 预算用完仍拿不到稳定矩形 -> 继续 fail closed：一个原生写 API 都不调。
+            $fresh = @{ Ok = $false; Reason = 'stale-rect-timeout' }
+        }
+    }
     if (-not $fresh.Ok) {
         $result.reason = $fresh.Reason
         $result.nativeWriteCalls = $script:MmxTrayNativeWriteCount

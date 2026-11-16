@@ -284,6 +284,10 @@ if (-not $cdpUp) {
 # 位置要求：函数定义和调用都在 DryRun 退出、CDP 失败退出之后；
 # 调用点放在 daemon 启动之后（不拖慢 daemon 起来），-NoDaemon 分支照常调用。
 # 失败只记 WARN：绝不影响 daemon 启动，也不改应用生命周期。
+#
+# 通知区排版：Win11 在应用刚起来时还在重排通知区，托盘图标矩形会短暂位移。
+# helper 对这一种瞬时情况（stale-rect）做有界重试，等矩形落定再换图；
+# 其他门禁失败（进程 / EXE / host 窗口 / 图标 ID 不对）一律硬失败、不换图。
 # ---------------------------------------------------------------------------
 function Invoke-MmxTrayIconSwap {
   param([int]$CdpPort, [string]$ExePath)
@@ -297,9 +301,11 @@ function Invoke-MmxTrayIconSwap {
       }
       # helper 自己会再证明一次：EXE 规范路径一致、是主进程、host 窗口唯一、
       # 图标 ID 唯一。任何一条不成立就只返回失败原因，不会写。
-      # -WaitSeconds 8：冷启动时托盘 host 窗口可能晚于 CDP 就绪，给它有界等待
-      # （helper 上限 30；等不到就只是不换图，绝不影响启动流程）。
-      $trayOut = @(& $trayHelper -TargetProcessId $listenerPid -ExpectedExecutable $ExePath -Apply -WaitSeconds 8)
+      # -WaitSeconds 20：冷启动时托盘 host 窗口可能晚于 CDP 就绪，给它有界等待；
+      # 而且 Win11 通知区在应用刚起来时还在重新排版，托盘图标矩形会短暂位移
+      # （helper 内部对这一种瞬时情况做有界重试，等矩形落定再换图）。
+      # helper 上限 30；等不到就只是不换图，绝不影响启动流程。
+      $trayOut = @(& $trayHelper -TargetProcessId $listenerPid -ExpectedExecutable $ExePath -Apply -WaitSeconds 20)
       $tray = if ($trayOut.Count -gt 0) { $trayOut[-1] } else { $null }
       if ($tray -and $tray.ok) {
         Write-Log "托盘图标已换成红圆：pid=$listenerPid host=$($tray.hostWindow) id=$($tray.iconId)" 'INFO'

@@ -19,11 +19,16 @@
        换图逻辑封成函数、daemon 起来后才调用、失败只 WARN。
     8. 编译临时目录重定向：Add-Type 期间 TEMP/TMP 指向项目 logs（不落 C 盘），
        结束后进程环境恢复原样。
+    9. 落定重试（stale-rect 有界重试）：矩形在动 -> 重试到落定后换图成功
+       （只写一次 NIM_MODIFY）；矩形一直不稳定 -> fail closed
+       （reason=stale-rect-timeout，零原生写调用）；非矩形类 stale 原因
+       （host 窗口被换等）-> 立刻硬失败、不重试。
 
-  绝不真 Apply，也绝不调用整个 launcher。唯一会调 Shell_NotifyIconW 的负例
-  （Shell_NotifyIconW 返回 FALSE）用假 host 句柄，且调用前先实测该句柄
-  IsWindow=false、对应图标 ID 的 GetRect 非 S_OK；任一条不成立就跳过这项
-  负例并明确报告，绝不凭假设去打真 app 的托盘项。
+  绝不真 Apply，也绝不调用整个 launcher。Shell_NotifyIconW 只在本测试进程
+  自建的 fixture 托盘项上调用（自建窗口 + 自选图标 ID，用完 NIM_DELETE）；
+  另有负例用假 host 句柄，且调用前先实测该句柄 IsWindow=false、对应图标 ID
+  的 GetRect 非 S_OK；任一条不成立就跳过这项负例并明确报告，绝不凭假设去
+  打真 app 的托盘项。
 
 .EXAMPLE
   powershell -NoProfile -File .\test-tray-icon.ps1
@@ -573,6 +578,165 @@ Assert-True -Name '编译期间 TEMP 指向项目 logs（D 盘）' -Ok ($script:
 Assert-Equal -Name '编译结束后 TEMP 恢复' -Expected $origTemp -Actual $env:TEMP
 Assert-Equal -Name '编译结束后 TMP 恢复' -Expected $origTmp -Actual $env:TMP
 Assert-True -Name '编译临时目录在项目 logs 下' -Ok ($script:MmxTrayCompileTemp -like (Join-Path $Root 'logs*')) $script:MmxTrayCompileTemp
+
+# ---------------------------------------------------------------------------
+# 7e. 落定重试（stale-rect 有界重试）
+#     fixture：本测试进程自建的 STATIC 顶级窗口 + 自己加的托盘项。
+#     只碰自己建的托盘项（hWnd + uID 都是自己的），绝不碰真 app 的托盘项；
+#     用完 NIM_DELETE 清理。写调用计数只统计 helper 自己的原生调用。
+# ---------------------------------------------------------------------------
+$fixtureSource = @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class MmxTrayFixtureNative
+{
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr CreateWindowExW(int exStyle, string className, string windowName, uint style,
+        int x, int y, int w, int h, IntPtr hWndParent, IntPtr hMenu, IntPtr hInstance, IntPtr lpParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool DestroyWindow(IntPtr hWnd);
+}
+'@
+$fixtureOk = $true
+try {
+    Invoke-MmxTrayWithCompileTemp { Add-Type -TypeDefinition $fixtureSource -ErrorAction Stop } | Out-Null
+} catch {
+    $fixtureOk = $false
+    Write-Host ("FAIL  tray fixture 原生声明编译失败  |  " + $_.Exception.Message)
+    $script:fail++
+    [void]$script:failures.Add('tray fixture 原生声明编译失败')
+}
+
+$fixtureHwnd = [IntPtr]::Zero
+$fixtureIcon = [IntPtr]::Zero
+$fixtureIconId = 7
+$fixtureAdded = $false
+
+if ($fixtureOk) {
+    # WS_OVERLAPPEDWINDOW = 0，不带 WS_VISIBLE -> 窗口不可见、不上任务栏。
+    $fixtureHwnd = [MmxTrayFixtureNative]::CreateWindowExW(0, 'STATIC', 'mmx-tray-fixture', 0, 0, 0, 100, 100, [IntPtr]::Zero, [IntPtr]::Zero, [IntPtr]::Zero, [IntPtr]::Zero)
+    Assert-True -Name 'tray fixture 窗口创建成功' -Ok ($fixtureHwnd -ne [IntPtr]::Zero) ("hwnd=" + [long]$fixtureHwnd)
+    if ($fixtureHwnd -ne [IntPtr]::Zero) {
+        # 原生 owner 读回：证明这个句柄归本测试进程所有，才允许往它身上加托盘项。
+        $fixtureOwner = [uint32]0
+        [void][MmxTrayNative]::GetWindowThreadProcessId($fixtureHwnd, [ref]$fixtureOwner)
+        Assert-Equal -Name 'tray fixture 归属本测试进程（原生 owner 读回）' -Expected $PID -Actual ([int]$fixtureOwner)
+        if ([int]$fixtureOwner -ne $PID) {
+            [void][MmxTrayFixtureNative]::DestroyWindow($fixtureHwnd)
+            $fixtureHwnd = [IntPtr]::Zero
+        }
+    }
+}
+
+if ($fixtureHwnd -ne [IntPtr]::Zero) {
+    $fixtureIcon = [MmxTrayNative]::LoadImageW([IntPtr]::Zero, $IconPath, 1, 0, 0, 16)
+    Assert-True -Name 'tray fixture 图标加载成功' -Ok ($fixtureIcon -ne [IntPtr]::Zero) ("icon=" + [long]$fixtureIcon)
+    if ($fixtureIcon -ne [IntPtr]::Zero) {
+        $addBuf = New-MmxTrayDataBuffer -Window $fixtureHwnd -IconId $fixtureIconId -Icon $fixtureIcon
+        try {
+            # NIM_ADD(0)：加的是「本进程自建窗口 + 自选 uID」的托盘项，与真 app 的托盘项无关。
+            $fixtureAdded = [MmxTrayNative]::Shell_NotifyIconW(0, $addBuf)
+            Assert-True -Name 'tray fixture 自建托盘项加入成功' -Ok ([bool]$fixtureAdded) ''
+        } finally {
+            [System.Runtime.InteropServices.Marshal]::FreeHGlobal($addBuf)
+        }
+    }
+}
+
+# A) 前几次读到的矩形在动、之后稳定 -> 有界重试到落定 -> 换图成功
+$script:traySettleCalls = 0
+$settleProvider = {
+    param($id)
+    $script:traySettleCalls++
+    $s = New-FakeState -ProcessId $PID -Handle ([long]$fixtureHwnd) -ValidIds @($fixtureIconId) -InvalidIds @(2)
+    if ($script:traySettleCalls -le 3) {
+        # 通知区还在重排版：托盘图标矩形每次都挪一点
+        $s.IconCandidates[1].Left = 2600 + ($script:traySettleCalls * 7)
+        $s.IconCandidates[1].Right = 2642 + ($script:traySettleCalls * 7)
+    }
+    return $s
+}
+
+if ($fixtureAdded) {
+    $script:traySettleCalls = 0
+    $before = $script:MmxTrayNativeWriteCount
+    $rSettle = Invoke-MmxTrayIconTask -TargetProcessId $PID -ExpectedExecutable $FakeExe -IconPath $IconPath -Apply -WaitSeconds 5 -StateProvider $settleProvider
+    $after = $script:MmxTrayNativeWriteCount
+    Assert-True -Name '落定重试：applied = true' -Ok ([bool]$rSettle.applied) ("reason=" + $rSettle.reason)
+    Assert-True -Name '落定重试：ok = true' -Ok ([bool]$rSettle.ok) ("reason=" + $rSettle.reason)
+    Assert-Equal -Name '落定重试：写 API 调用数增量 = 2（LoadImageW + 一次 NIM_MODIFY）' -Expected 2 -Actual ($after - $before)
+    Assert-True -Name '落定重试：确实重试过（provider 调用次数 > 2）' -Ok ($script:traySettleCalls -gt 2) ("calls=" + $script:traySettleCalls)
+    Assert-Equal -Name '落定重试：reason = ok' -Expected 'ok' -Actual $rSettle.reason
+    Assert-Equal -Name '落定重试：图标 ID 就是 fixture 的 ID' -Expected $fixtureIconId -Actual $rSettle.iconId
+    Assert-Equal -Name '落定重试：host 窗口就是 fixture 的句柄' -Expected ([long]$fixtureHwnd) -Actual ([long]$rSettle.hostWindow)
+    # 上报的矩形是「落定那一组」的矩形（不是最早那次还在动的）
+    Assert-Equal -Name '落定重试：上报矩形 = 落定后的矩形' -Expected 2629 -Actual ([int]$rSettle.iconRect.left)
+} else {
+    $settleSkipMsg = '落定重试正例：fixture 托盘项没建起来，跳过（其余负例照跑）。'
+    [void]$script:skips.Add($settleSkipMsg)
+    Write-Host ('SKIP  ' + $settleSkipMsg)
+}
+
+# B) 矩形一直不稳定 -> 到预算仍拿不到稳定矩形 -> fail closed
+$script:traySettleCalls = 0
+$alwaysMovingProvider = {
+    param($id)
+    $script:traySettleCalls++
+    $s = New-FakeState -ProcessId $PID -Handle 1000001 -ValidIds @(3) -InvalidIds @(2)
+    $s.IconCandidates[1].Left = 2600 + ($script:traySettleCalls * 7)
+    $s.IconCandidates[1].Right = 2642 + ($script:traySettleCalls * 7)
+    return $s
+}
+$before = $script:MmxTrayNativeWriteCount
+$rTimeout = Invoke-MmxTrayIconTask -TargetProcessId $PID -ExpectedExecutable $FakeExe -IconPath $IconPath -Apply -WaitSeconds 1 -StateProvider $alwaysMovingProvider
+$after = $script:MmxTrayNativeWriteCount
+Assert-Equal -Name '矩形一直不稳定：reason = stale-rect-timeout' -Expected 'stale-rect-timeout' -Actual $rTimeout.reason
+Assert-True -Name '矩形一直不稳定：ok = false' -Ok (-not $rTimeout.ok) ("ok=" + $rTimeout.ok)
+Assert-True -Name '矩形一直不稳定：applied = false' -Ok (-not $rTimeout.applied) ("applied=" + $rTimeout.applied)
+Assert-Equal -Name '矩形一直不稳定：写 API 调用数增量 = 0' -Expected 0 -Actual ($after - $before)
+Assert-True -Name '矩形一直不稳定：确实重试过（provider 调用次数 > 2）' -Ok ($script:traySettleCalls -gt 2) ("calls=" + $script:traySettleCalls)
+
+# C) 非矩形类 stale 原因（host 窗口被换）-> 立刻硬失败、不重试
+$script:traySettleCalls = 0
+$hostSwapProvider = {
+    param($id)
+    $script:traySettleCalls++
+    if ($script:traySettleCalls -eq 1) { return (New-FakeState -ProcessId $PID -Handle 1000001 -ValidIds @(3) -InvalidIds @(2)) }
+    # 第二次读：host 窗口被换掉了 —— 这一条必须立刻硬失败，不能靠重试绕过
+    return (New-FakeState -ProcessId $PID -Handle 111 -ValidIds @(3) -InvalidIds @(2))
+}
+$before = $script:MmxTrayNativeWriteCount
+$rHard = Invoke-MmxTrayIconTask -TargetProcessId $PID -ExpectedExecutable $FakeExe -IconPath $IconPath -Apply -WaitSeconds 5 -StateProvider $hostSwapProvider
+$after = $script:MmxTrayNativeWriteCount
+Assert-Equal -Name 'host 窗口被换：reason = stale-host-window' -Expected 'stale-host-window' -Actual $rHard.reason
+Assert-Equal -Name 'host 窗口被换：provider 只被调用 2 次（没重试）' -Expected 2 -Actual $script:traySettleCalls
+Assert-Equal -Name 'host 窗口被换：写 API 调用数增量 = 0' -Expected 0 -Actual ($after - $before)
+Assert-True -Name 'host 窗口被换：applied = false' -Ok (-not $rHard.applied) ("applied=" + $rHard.applied)
+
+# D) 探测模式（不带 -Apply）在矩形一直在动时依然零副作用
+$script:traySettleCalls = 0
+$before = $script:MmxTrayNativeWriteCount
+$rProbeMoving = Invoke-MmxTrayIconTask -TargetProcessId $PID -ExpectedExecutable $FakeExe -IconPath $IconPath -StateProvider $alwaysMovingProvider
+$after = $script:MmxTrayNativeWriteCount
+Assert-Equal -Name '探测模式：写 API 调用数增量 = 0' -Expected 0 -Actual ($after - $before)
+Assert-True -Name '探测模式：not applied' -Ok (-not $rProbeMoving.applied) ("applied=" + $rProbeMoving.applied)
+Assert-True -Name '探测模式：ok = true' -Ok ([bool]$rProbeMoving.ok) ("reason=" + $rProbeMoving.reason)
+
+# fixture 清理：只删自己建的托盘项，再销毁自己建的窗口和图标
+if ($fixtureAdded) {
+    $delBuf = New-MmxTrayDataBuffer -Window $fixtureHwnd -IconId $fixtureIconId -Icon ([IntPtr]::Zero)
+    try {
+        # NIM_DELETE(2)：只删本进程自建的托盘项。
+        [void][MmxTrayNative]::Shell_NotifyIconW(2, $delBuf)
+    } finally {
+        [System.Runtime.InteropServices.Marshal]::FreeHGlobal($delBuf)
+    }
+}
+if ($fixtureIcon -ne [IntPtr]::Zero) { [void][MmxTrayNative]::DestroyIcon($fixtureIcon) }
+if ($fixtureHwnd -ne [IntPtr]::Zero) { [void][MmxTrayFixtureNative]::DestroyWindow($fixtureHwnd) }
 
 # ---------------------------------------------------------------------------
 # 8. helper 源码静态检查：不能有 exit（会杀掉 & 调用方）
