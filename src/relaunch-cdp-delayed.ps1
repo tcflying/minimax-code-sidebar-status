@@ -28,14 +28,22 @@ function Say($m) {
 
 Say "延迟 ${DelaySec}s 后开始。日志: $Log"
 
-# ---- 0. 探测 exe：优先 G 盘（本机真实路径），再回落 ----
-$exe = $null
-foreach ($c in @(
-    'G:\MiniMax\MiniMax Code\MiniMax Code.exe',
-    (Join-Path $env:LOCALAPPDATA 'Programs\MiniMax Code\MiniMax Code.exe'),
-    'C:\Program Files\MiniMax Code\MiniMax Code.exe')) {
-  if ($c -and (Test-Path -LiteralPath $c -PathType Leaf)) { $exe = $c; break }
+# ---- 0. 探测 exe：优先 MINIMAX_CODE_EXECUTABLE，再按常见安装位置回落 ----
+# 2026-11-17 之前第一候选写死 G:\ 盘（本机真实路径是 D:\MiniMax\MiniMax Code\
+# MiniMax Code.exe，这台机器上根本没有 G 盘），所以「延迟重启」工具在本机必然
+# FATAL 找不到 exe。G: 盘降级成最后兜底。
+function Get-MiniMaxExecutable {
+  $candidates = New-Object System.Collections.Generic.List[string]
+  if ($env:MINIMAX_CODE_EXECUTABLE) { $candidates.Add($env:MINIMAX_CODE_EXECUTABLE) }
+  $candidates.Add((Join-Path $env:LOCALAPPDATA 'Programs\MiniMax Code\MiniMax Code.exe'))
+  $candidates.Add('C:\Program Files\MiniMax Code\MiniMax Code.exe')
+  $candidates.Add('G:\MiniMax\MiniMax Code\MiniMax Code.exe')
+  foreach ($c in $candidates) {
+    if ($c -and (Test-Path -LiteralPath $c -PathType Leaf)) { return $c }
+  }
+  return $null
 }
+$exe = Get-MiniMaxExecutable
 if (-not $exe) { Say "FATAL 找不到 MiniMax Code.exe"; exit 1 }
 Say "exe = $exe"
 

@@ -4263,6 +4263,89 @@ pwsh -NoProfile -File src\set-mmx-tray-icon.ps1 -TargetProcessId 63636 -Expected
 
 ---
 
+## 22. 启动器事故复盘（2026-11-17）
+
+**结论先行**：2026-11-17 05:30 那次「把 MiniMax Code 拉回带 CDP 状态」失败了。
+根因是启动器杀进程时**取错了 id 属性名**，旧实例一个都没死，新实例被 Electron
+单实例锁吞掉，CDP 端口起不来，daemon 也就没起来 —— 侧边栏的**选中行底色、
+running 行置顶、锁顶让位**这三个功能同时失效（它们都靠 daemon 注入页面脚本）。
+代码已修并加了回归断言，但**真机链路本轮没有跑过**（见文末「未验证」）。
+
+### 现象与证据
+
+- 现场日志：`src\logs\launch-20261117-053054.log`
+- 05:30:57 记的是「检测到 10 个进程在跑且无 CDP，结束它们并带 CDP 参数重启」，
+  紧接着连着 10 条「跳过一个枚举瞬间消失的进程（已自行退出，无需结束）」——
+  **一条「已结束 pid=xxx」都没有**，说明一个都没杀。
+- 05:31:07 用 `--remote-debugging-port=9331` 起了新实例；05:36:09 报
+  「CDP 端口 9331 未就绪，启动 daemon 无意义，放弃」。中间白等约 5 分钟，
+  日志里没有任何「旧实例还在」这类线索。
+
+### 根因
+
+`src\launch-mmx-status.ps1` 里 `Get-MiniMaxProcesses` 返回的是 **`Get-Process` 对象**
+（2026-10-02 从 `Get-CimInstance -Filter` 改过来的），它的进程 id 属性叫 **`Id`**；
+但杀进程的循环取的是 **`$p.ProcessId`** —— 那是 `Get-CimInstance` 才有的属性名。
+对 `Get-Process` 对象读 `.ProcessId` 得到 `$null`，于是每个进程都被当成
+「枚举瞬间消失」跳过，一个都没杀。
+
+> 同文件里 `Get-PortFromProcessCommandLine` 的 `$p.ProcessId` **是对的** —— 那里的
+> `$p` 来自 `Get-CimInstance`。两处不能混，这是本次事故的全部根因。
+
+### 这次修了哪几处（2026-11-17）
+
+1. **杀进程取值**：kill 路径统一走新函数 `Stop-ProcessById`，只读 `Get-Process` 的
+   `Id`；函数里留了一行注释写明「`Get-Process` 给的是 `Id`，`Get-CimInstance` 才给
+   `ProcessId`，别再混」，防止再犯。空 id 仍然「跳过 + 记日志」，但**正常的
+   `Get-Process` 对象不会走进这个分支**（旧代码里每个进程都走进去了）。
+2. **旧实例没死透就 fail fast**：杀完**复核**同名进程是否真的没了；还在就记 ERROR
+   并写明**还剩哪些 pid**，以**独立退出码 6** 直接退出，**绝不启动注定被单实例锁
+   吞掉的新实例**。
+   退出码表（写在脚本头注释里）：`0` 正常 / `1` 找不到 exe / `3` CDP 未就绪 /
+   `4` `-NoRestart` / `5` 找不到 node / `6` 旧实例没死透。
+3. **CDP 起不来这条路径给出可操作线索**：判据**不变**（必须拿到 HTTP 200 +
+   `webSocketDebuggerUrl` 才算真通，端口在监听不算），但日志会补上「同名残留进程
+   pid」「端口是否被别的程序占着」这类线索，并且**启动前先确认没有残留同名进程**
+   —— 残留就 fail fast，不再白等 5 分钟。
+   另外 `-DryRun` 之前会真的结束进程（与它自己「只探测不改动任何东西」的约定
+   矛盾），现在 `-DryRun` 只报计划、不结束任何进程。
+4. **`relaunch-cdp-delayed.ps1` 的 exe 探测**：候选第一位改成
+   `$env:MINIMAX_CODE_EXECUTABLE`（本机真实路径
+   `D:\MiniMax\MiniMax Code\MiniMax Code.exe`），G:\ 那条降级成最后兜底。
+   修之前这个「延迟重启」工具在本机必然 `FATAL 找不到 MiniMax Code.exe`。
+   该脚本其余地方用 `Get-CimInstance`，`.ProcessId` 是对的，没动。
+5. **`test-launcher.ps1` 不再挂住**：冷启动那段的 exe 写死
+   `'G:\MiniMax\MiniMax Code\MiniMax Code.exe'`（本机没有 G 盘）→ 永远等不到 CDP
+   → 整个测试卡住。改成和 launcher 同一套解析（`MINIMAX_CODE_EXECUTABLE` 优先），
+   拿不到就 **SKIP 并写明原因**，不许挂住。
+   冷启动组会真的启动一个 MiniMax Code 实例，现在**默认 SKIP**，要跑加
+   `-AllowColdStart`。
+6. **新增回归断言**（`src\test-launcher.ps1` 的 E 组，四条）：
+   - (a) 静态：杀进程那段用的 id 属性名必须是 `Get-Process` 真实暴露的那个
+     （并断言 `Get-Process` 对象确实只有 `Id`、没有 `ProcessId`）；
+   - (b) 功能：真起一个 fixture 进程（`pwsh -NoProfile -Command "Start-Sleep 300"`），
+     用修复后的取值逻辑**真的把它杀掉**（只碰自己起的那个进程）；
+   - (c) fail fast：用**桩**（Get-Process / Stop-Process / Start-Process /
+     Invoke-WebRequest / Start-Sleep 全换成假的）验证旧实例没死透时
+     **不启动新实例**、退出码是 6、日志里写明还剩哪些 pid；
+   - (d) `relaunch-cdp-delayed.ps1` 的 exe 探测在本机能解析出真实路径
+     （含 `MINIMAX_CODE_EXECUTABLE` 分支）。
+
+### 未验证 / 已知限制
+
+- ⚠️ **「真机走 launcher 从无 CDP 实例切到带 CDP 实例」这条链路，修完之后还没有在
+  真机上跑过。** 本节所有结论来自离线代码改动 + `src\test-launcher.ps1` 的离线断言
+  （含桩验证），**不是**「已修复并验证」。真机链路由主会话另行排程实测。
+- 侧边栏三个功能（选中行底色 / running 行置顶 / 锁顶让位）的恢复效果，同样要等
+  真机那次 CDP 切换成功之后才能确认。
+- 冷启动组（B 组）默认 SKIP，本轮**没有**在真机上跑过带 `--user-data-dir` 的
+  一次性实例。
+- 本轮只动了 `src\launch-mmx-status.ps1`、`src\relaunch-cdp-delayed.ps1`、
+  `src\test-launcher.ps1` 和本 README；没有碰 daemon / keeper / 托盘 / 任务栏
+  换图脚本。
+
+---
+
 ## 20. 致谢
 
 - 第三方项目 [`sqing33/minimax-code-skin`](https://github.com/sqing33/minimax-code-skin)

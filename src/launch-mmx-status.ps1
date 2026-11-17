@@ -11,6 +11,9 @@
   与 start-mmx-status.ps1 的区别：本脚本没有 Read-Host，完全非交互，
   且自己拉起 daemon 后立即返回，控制台窗口不会留在桌面上。
 
+  退出码：0 正常 / 1 找不到 exe / 3 CDP 未就绪 / 4 -NoRestart /
+          5 找不到 node / 6 旧实例没死透（不启动新实例，直接退出）
+
 .EXAMPLE
   powershell.exe -NoProfile -WindowStyle Hidden -File .\launch-mmx-status.ps1
 #>
@@ -179,6 +182,36 @@ function Get-MiniMaxProcesses {
   return @(Get-Process -Name $name -ErrorAction SilentlyContinue)
 }
 
+function Stop-ProcessById {
+  # 结束一个进程。返回 $true / $false。
+  #
+  # id 属性必须是 Id —— Get-Process 给的是 Id，Get-CimInstance 才给 ProcessId，
+  # 别再混。2026-11-17 事故根因：这里读的是 $p.ProcessId，对 Get-Process 对象
+  # 取到 $null，10 个旧实例一个都没死，新实例被 Electron 单实例锁吞掉，
+  # CDP 端口起不来，daemon 也就不起。
+  param($Proc)
+  if (-not $Proc) { return $false }
+  $procId = $Proc.Id
+  if (-not $procId) {
+    Write-Log '跳过一个取不到 id 的进程对象（Get-Process 的 Id 为空），没有结束它。' 'WARN'
+    return $false
+  }
+  try {
+    Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+    return $true
+  } catch {
+    Write-Log "结束 pid=$procId 失败：$($_.Exception.Message)" 'WARN'
+    return $false
+  }
+}
+
+function Get-LeftoverProcessIds {
+  # 还在跑的同名进程 id（空数组 = 全没了）。
+  param([string]$ExePath)
+  $name = [System.IO.Path]::GetFileNameWithoutExtension($ExePath)
+  return @(Get-Process -Name $name -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+}
+
 # ---------------------------------------------------------------------------
 # 陈旧 daemon 清理（2026-10-02 实测事故）
 #
@@ -216,28 +249,40 @@ if ($runningCount -gt 0 -and -not $cdpUp) {
   }
   # 非交互：直接结束并重启，不做 Read-Host 确认。
   Write-Log "检测到 $runningCount 个进程在跑且无 CDP，结束它们并带 CDP 参数重启（当前会话会被中断）。" 'WARN'
-  foreach ($p in $procs) {
-    # 枚举到的进程可能在我们拿列表和动手之间恰好退出（Electron 父进程死后
-    # 子进程还在陆续退出），$p.ProcessId 属性读取为 $null。Stop-Process -Id $null
-    # 抛参数绑定错误（2026-10-02 冷启动实测：结束 pid= 失败：无法将参数绑定
-    # 到参数"Id"）。跳过即可：它已经死了，无需我们动手。
-    if (-not $p -or -not $p.ProcessId) {
-      Write-Log "跳过一个枚举瞬间消失的进程（已自行退出，无需结束）。" 'WARN'
-      continue
+  if ($DryRun) {
+    # -DryRun 的约定是「只探测不改动任何东西」：这里只报计划，不结束任何进程。
+    Write-Log "[dry-run] 会结束这 $runningCount 个进程再带 CDP 参数重启；-DryRun 不结束任何进程。" 'WARN'
+  } else {
+    foreach ($p in $procs) { [void](Stop-ProcessById -Proc $p) }
+    $name = [System.IO.Path]::GetFileNameWithoutExtension($exe)
+    for ($i = 0; $i -lt 80; $i++) {
+      if (@(Get-Process -Name $name -ErrorAction SilentlyContinue).Count -eq 0) { break }
+      Start-Sleep -Milliseconds 100
     }
-    try { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
-    catch { Write-Log "结束 pid=$($p.ProcessId) 失败：$($_.Exception.Message)" 'WARN' }
-  }
-  $name = [System.IO.Path]::GetFileNameWithoutExtension($exe)
-  for ($i = 0; $i -lt 80; $i++) {
-    if (@(Get-Process -Name $name -ErrorAction SilentlyContinue).Count -eq 0) { break }
-    Start-Sleep -Milliseconds 100
+    # 复核：旧实例真的没死透吗？没死透就不能启动新实例 —— 新实例会被
+    # Electron 单实例锁吞掉，CDP 端口永远起不来（2026-11-17 事故）。
+    $left = @(Get-LeftoverProcessIds -ExePath $exe)
+    if ($left.Count -gt 0) {
+      Write-Log "旧实例没死透，还剩 $($left.Count) 个进程（pid: $($left -join ',')）。不启动新实例：它会被单实例锁吞掉，CDP 端口也起不来。" 'ERROR'
+      exit 6
+    }
   }
   $cdpUp = $false
 }
 
 if (-not $cdpUp) {
   if ($port -le 0) { $port = 9331 }
+  # 启动前先确认没有残留同名进程：有残留说明旧实例还活着（或者它自己重启
+  # 了），这时再启动新实例只会被 Electron 单实例锁吞掉，CDP 端口起不来。
+  $left = @(Get-LeftoverProcessIds -ExePath $exe)
+  if ($left.Count -gt 0) {
+    if ($DryRun) {
+      Write-Log "[dry-run] 启动前有残留同名进程（pid: $($left -join ',')）：真跑会直接失败，不会启动新实例。" 'WARN'
+    } else {
+      Write-Log "启动前有残留同名进程（pid: $($left -join ',')）：旧实例可能还在，新实例会被单实例锁吞掉，不启动。" 'ERROR'
+      exit 6
+    }
+  }
   Write-Log "以 --remote-debugging-port=$port 启动: $exe"
   $cdpArgs = @("--remote-debugging-port=$port", '--remote-debugging-address=127.0.0.1')
   if ($DryRun) {
@@ -246,6 +291,9 @@ if (-not $cdpUp) {
     Start-Process -FilePath $exe -ArgumentList $cdpArgs
     for ($i = 0; $i -lt 120; $i++) {
       Start-Sleep -Milliseconds 500
+      if ($i -eq 30) {
+        Write-Log "还在等 CDP 端口 $port（已等约 15s，最多约 5 分钟）。旧实例没死透或端口被占，都会在这里等满。" 'WARN'
+      }
       if (Test-CdpPort $port) { $cdpUp = $true; break }
     }
   }
@@ -266,6 +314,21 @@ if ($DryRun) {
 }
 
 if (-not $cdpUp) {
+  # 判据不变：必须拿到 HTTP 200 + webSocketDebuggerUrl 才算真通（端口在监听不算）。
+  # 这里只补可操作的线索 —— 2026-11-17 事故里这条路径白等约 5 分钟，
+  # 日志却看不出「旧实例还在 / 新实例被单实例锁吞了」。
+  $left = @(Get-LeftoverProcessIds -ExePath $exe)
+  if ($left.Count -gt 0) {
+    Write-Log "CDP 没起来时同名进程还在（pid: $($left -join ',')）：旧实例可能没死透，新实例被单实例锁吞掉了。" 'WARN'
+  } else {
+    Write-Log 'CDP 没起来时没有同名残留进程：更可能是端口被别的程序占着，或应用起来就崩了。' 'WARN'
+  }
+  $listeners = @()
+  try { $listeners = @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue) } catch { }
+  if ($listeners.Count -gt 0) {
+    $lpids = ($listeners | ForEach-Object { $_.OwningProcess }) -join ','
+    Write-Log "端口 $port 在监听（pid: $lpids）但不是 CDP：端口被别的程序占着。" 'WARN'
+  }
   Write-Log "CDP 端口 $port 未就绪，启动 daemon 无意义，放弃。" 'ERROR'
   Write-Log '手工验证: curl.exe http://127.0.0.1:<port>/json/version'
   exit 3
