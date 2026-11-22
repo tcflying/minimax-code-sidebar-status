@@ -4445,6 +4445,284 @@ running 行置顶、锁顶让位**这三个功能同时失效（它们都靠 dae
 
 ---
 
+## 23. 活动会话上浮被锁顶让位挡住（2026-11-23）
+
+**结论先行**：用户要的「正在跑的会话跳到最顶」这条通道**一直存在**（仓库里那条注释
+「已置顶的会话开始对话后浮到置顶区最顶部」，代码在 `src/lib/page-script.mjs` 的
+`pinnedPromoteTick`），但它**一次宿主写都不发**——真机那个日志里
+`pinnedPromote.calls` 恒为 0（该日志共 2544 条 tick 行，tick 号 10…26010，那 2544 条
+快照里 `calls` 全是 0）。根因是「锁已经让位」这一支（`lock-not-at-top`）被当成
+「证不出来」处理，在候选扫描**之前**就 return 了。本轮把它放行，并补上让位登记，
+让「锁让位」这条语义同时覆盖新对话与活动会话两条通道。
+
+### 用户诉求与确认结论
+
+- 用户原话（2026-11-23）：「最新会话不会自动置顶」。
+- 主会话用只读证据排除掉另外两种读法之后，用户在问卷里明确选了：
+  **正在跑的会话要跳到最顶**。
+- 本轮按这一条实现：**从 idle 变成 running** 的置顶区会话被写到宿主的 `raw[0]`
+  （置顶区最顶），写点仍然是宿主自己的三参函数 `cap.fn(id, true, 0)`。
+
+### 现象与实测证据（主会话 2026-11-23 01:43–06:19 只读取证）
+
+真机：MiniMax Code pid 67932（带 `--remote-debugging-port=9331`），daemon pid 32952
+（`src\daemon.mjs --port 9331 --interval 2500`，起于 2026-11-21 20:25:50）。
+
+1. **功能全死**：`src\logs\daemon-9331-20261121-202542.log` 里共 **2544** 条 tick 行
+   （tick 号 **10…26010**），`reorder.moved` **恒为 0**、`reorder.runningLists` **恒为 0**、
+   `aborted` 从未出现。daemon 启动行明写 `running 行置顶: 开（默认开启）`。
+2. **页面 API 状态**（**单趟快照**，逐字取自同一份日志的 **tick 19050**；那一行开头
+   的日志时间戳是 `[mmx-status 17:43:49]`——日志时间戳是 UTC，本地 2026-11-22
+   01:43:49）：
+
+   ```json
+   {"passes":21563,"settleMiss":10,"changes":0,"noChange":0,"calls":0,"blocked":0,"refused":0,"unproven":136,"deferred":21416,"exhausted":0,"alreadyTop":0,"noBaseline":1,"budget":3,"budgetMax":3,"lastId":"","lastReason":"toplock-other"}
+   ```
+
+   —— `calls:0`：这条通道**一次宿主写都没发过**。
+3. **DOM 实测**：可见 **62 个会话行**，其中 **42 个在置顶区**（`data-pinned-section` 内），
+   20 个不在。正在跑的两个会话（`mvs_631c11…` 与本会话 `mvs_d67b5c…`）**都在置顶区里**。
+   `findListRoots()` 只认出 **2 个**列表根（`class="space-y-px"`，一个 12 个孩子、
+   一个 7 个），两个里面**一个 running 行都没有** → `applyReorder()` 每趟空转。
+   （DOM 那条 `applyReorder` 是**另一条通道**，按设计 D1 **排除置顶区**——置顶区的
+   顺序归宿主，不能有两个写者。本轮**没有**动它。）
+4. **本会话（正在跑）在可见列表第 7 行**（y=563），上面压着 6 个不运行的会话。
+   视口最上一行是 `mvs_631c11…`。
+5. **锁顶状态**：`api.topLock()` =
+   `{phase:"confirmed", reason:"yielded-to-new-main", reasonText:"新对话已排到最前，
+   本会话锁顶让位到其下", intent:{id:"mvs_0506b714e442499cb8eace1d43d7c242"},
+   confirmedId: 同, confirmedAtTop:true, yieldedTo:"mvs_631c11aafbf0415ca75388abb01f089a",
+   maintCalls:0, maintBlocked:143, maintBudget:3}`。
+   锁在宿主 order 里**不在下标 0**（它在可见列表第 9 位）→
+   `topmostLockSlot(cap)` 走的就是 `blocked: 'lock-not-at-top'` 这一支。
+
+### 根因
+
+`pinnedPromoteTick(capIn, status)` 每一趟先算：
+
+```js
+var lockSlot = topmostLockSlot(cap);        // 2218 行
+if (lockSlot.blocked) {                       // 2231 行
+  promoteState.deferred++;
+  promoteState.lastReason = 'toplock-other';
+  return;                                    // ← 候选扫描之前就 return 了
+}
+```
+
+`topmostLockSlot(cap)`（1703 行）在「锁存在、但在 order 里不在下标 0」时返回
+`{ slot: 0, lock: '', blocked: 'lock-not-at-top' }`。
+
+⇒ 锁一旦被新对话挤下去（§15.18 的让位语义，本来就是设计好的），**活动会话上浮这条
+通道就永久 defer**，一次宿主写都不发（`calls:0` 就是这么来的）。
+
+关键判断：`lock-not-at-top` 与另外四种 blocked **不是一类东西**。
+`view-unstable` / `source-not-local` / `not-local-id` / `order-missing-id` 是
+**「证不出来」**（视图不可信、来源不明、id 形状不对、锁不在 order 里）；
+`lock-not-at-top` 是**「证出来了，而且结论就是锁不在最顶」**——它是可证的事实。
+把后者当成前者，等于把一条已经证明了的让位当成没证明。
+
+### 修法（R1–R6）
+
+**R1 · 解除「锁不在 raw[0]」这一种 blocked**
+
+- `lockSlot.blocked === 'lock-not-at-top'` → **不再 defer**，活动会话上浮按 slot 0 走。
+- 其余四种 blocked（`view-unstable` / `source-not-local` / `not-local-id` /
+  `order-missing-id`）**保持硬拒绝**：一次宿主写都不发生（仓库既有纪律：
+  「证不出来就一次宿主写都不发生」）。这四条一个都没有放宽。
+
+**R2 · 写宿主顺序，不动 DOM**
+
+- 写点仍然只有宿主自己的三参函数：`cap.fn(id, true, 0)`
+  （`handlePinSession(sessionId, pinned, insertIndex)`，`insertIndex = 0` = 插到置顶
+  顺序最前）。
+- **没有**用 `insertBefore` 去动置顶区的 DOM 行序——那正是 D1 说的第二个写者。
+- 让位那一支的落点是**宿主 order 的 raw 下标 0**。order 里混着非会话行时，
+  「会话顺序里的第一个」与「raw 下标 0」不是一回事，所以落点确认新增了一条判据
+  `promoteLanded(cap, ids, id, slot, raw)`：`raw = true` 看 raw 下标 0，
+  `raw = false` 沿用本模块一直用的会话下标口径（无锁 = 0、锁已证实在 `raw[0]` = 1）。
+  原有那三种落点的口径一个字没改。
+
+**R3 · 让位登记（本轮最关键的一条，漏了会被锁抢回去）**
+
+- 锁的让位判据在 `newMainYieldId(view)`：它要求 `order[0].id` 在
+  **「我们发起过写的那一组 id」**里。原来那一组是 `newMainState.placedIds`，
+  只有新对话通道往里写。
+- 现在：**活动会话上浮通道写完之后把自己的 id 登记进新集合 `promoteHoistedIds`**，
+  `newMainYieldId` 认的是**两个集合的并集**。锁下一趟看到 `raw[0]` 是运行会话、
+  而运行会话在我们发起过写的那一组里 → 判让位 → 锁不抢回 `raw[0]`、
+  维持预算一格不扣（`topLockState.yieldedTo` 记下让位对象）。
+- `promoteHoistedIds` 只在**同一个页面实例**内有效：daemon 重启会重新注入页面、重建
+  整个闭包，这个集合随之归零（修前 `passes:21563` → daemon 重启后第一趟 tick 10 就是
+  `passes:11`，闭包重建的实证）。新对话那一组 `placedIds` 是被 `run` 变更显式清空的，
+  本轮这个集合**没有**那一条显式清空语句，但结果同样是跨 daemon 重启归零。
+- 新对话的 `placedIds` + `acked` **保持现状**（随 run 变更清空，§15.18「已知副作用」
+  已记这条，既有测试也钉着）。
+- 新对话的**回执**只认新对话那一个集合：活动会话的登记不是一次新对话交付，
+  不能进回执。
+
+**R4 · 候选排除补齐**
+
+- 让位那一支里 `lockSlot.lock` 是空字符串，原来那条「锁顶自己永不当候选」的排除
+  会失效。
+- 现在用**真实的锁 id** 排除（`topmostLockView.id`——与 `topmostLockSlot` 认锁用的是
+  同一个 id）：锁在场时它与 `lockSlot.lock` 是同一个，锁不在场时它是空串、
+  排除自然不生效。锁顶自己正在跑也**永远不会被写**：它必须留在它该在的位置。
+
+**R5 · 预算、闸、升沿形状全部保持**
+
+- 写预算 `TOPMOST_PROMOTE_MAX = 3` 按会话计，用完显式停手（`budget-exhausted`），
+  **没有放宽**。
+- 共享闸 `hostCallTake()` / `hostCallRelease()`：闸被占时**不消费**升沿，留待办，
+  下一趟补。
+- 升沿语义不变：一个会话**从 idle 变成 running** 那一趟算升沿，只浮一次；持续
+  running 不再重复写（避免每趟重排）。
+- 待办确认的记账不变（写完下一趟确认落位、确认失败才扣预算）；新分支的落点是
+  `raw[0]`，确认条件是「这个 id 真的到了 order 下标 0」。
+
+**R6 · 可观察性**
+
+- 新增对外理由码 **`running-hoisted`**：`api.topmost().pinnedPromote.lastReason`
+  在活动会话上浮写成功、以及那一趟落位被确认时都报它；daemon 日志里能一眼看出
+  「这一趟是活动会话上浮写的」，而不是笼统的 `calling` / `host-returned`。
+- `topmostReasonText` 那张表里给它补了一句人话：「正在运行的会话已置顶到最前」
+  （没补的话对外会落到兜底文案「当前宿主版本不支持置顶排序」）。
+- **其余通道对外的 `toplock-other` 口径不变**：自动到顶纠正器、菜单项等仍然一律
+  报 `toplock-other`。
+
+### 离线测试
+
+新增 `src/test-running-topmost.mjs`（**49 项断言**），照仓库既有做法把
+`page-script.mjs` 里**真的**那段代码切出来编译执行，断言的是**宿主 order 的最终
+顺序**：
+
+- **整页**（真的 `buildBootstrapExpression`，真的锁机器 + 真的新对话通道 + 真的上浮
+  通道 + 真的共享闸）：锁让位 → 运行会话被写到 `raw[0]`（三参，第三参是 0）→
+  下一趟锁认这次让位（`yielded-to-new-main` / `yieldedTo = 运行会话` / 零写零扣预算）
+  → 活动会话的登记不进新对话回执 → run 变更清空新对话的记忆但不清空活动会话的
+  （这里说的是**同一个页面实例内**的 `run` 变更；跨 daemon 重启会重建闭包、两者都
+  归零，见「边界与已知限制」）。
+- **切片**（真的「到最顶」那一块，与 `test-new-pin-adversarial.mjs` 同一个切片）：
+  四种 blocked 各一条**零宿主写**（`view-unstable` / `source-not-local` /
+  `not-local-id` / `order-missing-id`）、锁自己永不当候选、写预算 ≤3 用完显式停手
+  （`budget-exhausted`）、升沿只消费一次、已经在 `raw[0]` 的运行会话零写
+  （`already-top`）。
+
+两个变异点被验证过有牙齿：把让位那一支改回 defer（23 项断言变红）、把让位判据改回
+单集合（6 项断言变红，锁立刻把 `raw[0]` 抢回去、维持预算被扣掉一格）。
+
+### 边界与已知限制（如实记）
+
+- **升沿语义不变**：会话**从 idle 变成 running** 那一趟浮一次；持续 running
+  **不重复浮**。这不是「每趟都把 running 拽到最顶」——那条更重的规则本轮**明确不做**
+  （它会和新对话通道抢 `raw[0]`），用户也没要求。
+- ⚠️ **新对话后来创建时仍会占 `raw[0]`**，运行会话掉到第二位且**不会自己回来**
+  （它的升沿已经消费掉）。这是本轮明确不做的更重规则的直接后果，如实写成已知边界。
+- ⚠️ **daemon 重启会让新对话的让位记录清空**（既有已知副作用，§15.18 已记），
+  锁可能抢回 `raw[0]`。真机那次运行会话**保住位置**，**不是因为**活动会话的登记
+  没清空，而是因为 daemon 重启清空了**新对话**的让位记录 → 锁重新被证实自己就在
+  `raw[0]` → 活动会话走的是**既有 slot-1 路径**（日志 `lastReason:"landed"`，全程
+  没有出现过 `running-hoisted`）。
+- ⚠️ **跨 daemon 重启（= 页面重新注入、闭包重建）后，`promoteHoistedIds` 归零**：
+  此时若锁需要抢回 `raw[0]`，它不会认得「这个运行会话是我们放上去的」，于是运行
+  会话从 `raw[0]` 掉到 `raw[1]` 并停在那里（它的升沿已消费，不会自己回来）。影响
+  很小——那正是 §15.18 对新对话早就有的已知副作用。
+- ⚠️ **`promoteHoistedIds` 在同一个页面实例内永不清空**（陈旧登记）：任何被我们上浮
+  过的 id 会永久留在锁的让位集合里。后果：用户之后**手动**把同一个会话拖到最顶时，
+  锁会认为「`raw[0]` 是我们放上去的」而**持续让位**、不再抢回 `raw[0]`
+  （§15.18 的让位语义）。
+- **锁已证实自己在 `raw[0]` 时**，运行会话仍然落在**紧跟锁顶之后**（slot 1，
+  §15.17 的既有语义），不是 `raw[0]`——那一支本轮没有改。
+- **2.5s 轮询的既有已知限制不变**：一个在两次采样之间就起完的短对话，可能整段
+  没被观察到，于是这一次不上浮（代码里那段注释一个字没改）。
+
+### §15.18 的口径变化（本轮新增一条）
+
+§15.18 原文**一个字没改**（仓库惯例是只追加）。这里补记它在本轮的口径变化：
+
+- 让位语义现在**同时覆盖两条通道**：新对话通道（`newMainState.placedIds`）与
+  活动会话上浮通道（`promoteHoistedIds`），让位判据认的是**两个集合的并集**。
+- 对外理由码：`api.topmost().pinnedPromote.lastReason` 新增 **`running-hoisted`**
+  （活动会话上浮这一支专用）。**其余通道的 `toplock-other` 口径不变**——
+  自动到顶纠正器与菜单项仍然一律对外报 `toplock-other`。
+
+### 真机验证
+
+**结论先行**：真机这次验证的是**既有 slot-1 路径**（锁已证实在 `raw[0]` → 运行会话落
+slot 1、紧跟锁之后），**不是**本轮新放行的 `lock-not-at-top → raw[0]` 绝对最顶那一支。
+新分支目前**只有离线验证**，是本轮的**未验证项**。
+
+#### 一、部署（重启 daemon，让新代码生效）
+
+- 重启脚本：`logs\sidebar-new-main-20261025\restart-daemon.ps1`（WMI
+  `Invoke-CimMethod Win32_Process Create` 脱离 Job Object 拉起，日志写
+  `src\logs\daemon-9331-manual.log`）。
+- 旧 daemon pid **32952** 被杀掉；新 daemon pid **31508**，命令行
+  `node src\daemon.mjs --port 9331 --interval 2500`，创建时间 2026-11-23 06:34:51。
+- 首趟注入结果 `{"ok":true,...}`，注入正常。**应用没有重启**（pid 67932，全程未动）。
+- 部署后立刻观察：`pinnedPromote.deferred` = **0**、`lastReason` = `"baseline-armed"`
+  （不再是修前那个 `"toplock-other"`）。
+
+#### 二、升沿触发与落位确认
+
+- daemon 日志 `src\logs\daemon-9331-manual.log` **tick 110**（日志里的时间戳是 UTC：
+  `[mmx-status 22:39:28]`，本地时间 2026-11-23 06:39:28）：
+  `pinnedPromote = {passes:111, settleMiss:3, changes:1, noChange:105, calls:1, blocked:0, refused:0, unproven:0, deferred:0, exhausted:0, alreadyTop:0, noBaseline:1, budget:3, budgetMax:3, lastId:"mvs_d67b5cdd69024f32b1145f0eeed69f1c", lastReason:"landed"}`
+- 同一趟 `autoTop = {changes:1, calls:0, noCandidate:1, lastReason:"no-new-member"}`
+  （自动到顶纠正器没写、也没候选，**没有**和活动会话上浮通道抢写入）。
+- 触发时机：**idle → running 的升沿**。这一趟之前 `pinnedPromote.calls` 恒为 0、
+  `lastReason` 恒为 `"baseline-armed"`；升沿那一趟 `calls` 从 0 变 1、`changes` 从 0 变 1、
+  `lastReason` 变 `"landed"`。之后 tick 120 / 130 保持 `calls:1 / changes:1 /
+  lastReason:"landed"` —— **只浮一次，没有每趟重复写**。
+- 宿主写入走的是宿主自己的三参接口，落位被下一趟确认（`lastReason:"landed"` 就是确认成功）。
+
+#### 三、DOM 实测（可见列表顺序，CDP 只读探针 `logs\sidebar-new-main-20261025\accept-running-topmost.mjs`）
+
+- 可见会话行 **62** 行，置顶区 42 行。
+- **修前**（2026-11-23 06:19:12 截图 `accept-before-20261123.png`）：本会话
+  `mvs_d67b5cdd69024f32b1145f0eeed69f1c` 停在可见列表**第 7 行**（y=563），上面压着 6 个
+  不运行的会话；视口最上一行是 `mvs_631c11aafbf0415ca75388abb01f089a`（rea-video）。
+- **修后**（同一探针复跑 + 截图 `accept-after-20261123.png`）：
+  - 第 1 行 y=377 → `mvs_0506b714e442499cb8eace1d43d7c242`「🔴dsh官方版」= **锁顶**，仍在第一
+  - 第 2 行 y=408 → `mvs_d67b5cdd69024f32b1145f0eeed69f1c`「🔴mmx code 侧边栏 ⑂ Finish」
+    = **本会话，running bucket**，从第 7 行上浮到第 2 行
+  - 第 3 行 y=465 → `mvs_631c11aafbf0415ca75388abb01f089a`（rea-video）顺次下移到第 3
+- 探针输出里 `runningRows` 只有一条，就是本会话（`bucket:"running"`, `inPinned:true`）。
+
+#### 四、锁顶状态（修后）
+
+- `api.topLock()` = `{available:true, schema:"top-lock/1", phase:"confirmed", reason:"confirmed", reasonText:"已确认位于最顶", intent:{id:"mvs_0506b714e442499cb8eace1d43d7c242"}, confirmedId:"mvs_0506b714e442499cb8eace1d43d7c242", confirmedAtTop:true, yieldedTo:"", generation:1, injected:62, clicks:0, calls:1, noops:0, blocked:0, releases:0, cleared:0, maintCalls:1, maintBudget:2, maintBudgetMax:3, maintBlocked:0, storageWrites:0, storageFailures:0, corrupt:0, anchorOk:7750, anchorRefused:0}`
+- 关键对比：修前 `maintCalls:0, maintBlocked:143`（锁的维持通道 143 趟全被挡）；修后
+  `maintCalls:1, maintBlocked:0`，`anchorOk:7750 / anchorRefused:0`。
+- `api.topmost()` = `{reason:"already-top", reasonText:"已在置顶区最顶", id:"mvs_0506b714e442499cb8eace1d43d7c242", source:"local", alreadyTop:true, orderLength:42, orderFirst:"session:mvs_0506b714e442499cb8eace1d43d7c242", calls:0, blocked:0}`
+  —— 宿主 order 的 raw[0] 是锁。
+
+#### 五、必须如实写清的边界
+
+1. **真机这次走的是「锁已证实在 `raw[0]` → 运行会话落 slot 1（紧跟锁之后）」这条既有路径**
+   （§15.17 的老语义），不是本轮新放行的 `lock-not-at-top → raw[0]` 绝对最顶那一支。
+2. **本轮新放行的 `lock-not-at-top → raw[0]` 分支目前只有离线验证**
+   （`src/test-running-topmost.mjs` 整页用例：锁让位 → 运行会话被写到 raw[0]、三参第三参
+   是 0 → 下一趟锁认这次让位）。真机要走到新分支，前提是锁先被新对话挤下去（锁不在
+   raw[0]）——这需要真机上真的创建一个新对话，**本轮没有做**（不制造真实对话、不抢前台）。
+   这条是本轮**未验证项**。
+3. daemon 重启会清空「新对话让位」记录 → 锁抢回 `raw[0]`、`rea-video` 从第 1 位掉到第 2 位
+   （§15.18 既有已知副作用，**非本次修复引入**）。运行会话这次保住位置**不是因为**
+   `promoteHoistedIds` 没清空——daemon 重启会重新注入页面、重建整个闭包，那个集合
+   **同样归零**（修前 `passes:21563` → daemon 重启后第一趟 tick 10 就是 `passes:11`，
+   闭包重建的实证）。真正的原因是：锁重新被证实自己就在 `raw[0]`，于是活动会话走的是
+   **既有 slot-1 路径**（日志 `lastReason:"landed"`，全程没有出现过 `running-hoisted`）。
+4. ⚠️ **新对话后来创建仍会占 `raw[0]`**，运行会话掉到第二位且不会自己回来（升沿已消费）
+   ——本轮明确不做的更重规则的直接后果。
+5. 真机取证方式：CDP 只读探针 + `Page.captureScreenshot`（抓应用自身渲染，**不抓物理屏幕、
+   不抢前台**）。物理屏幕截图当时被 ToDesk 遮挡，拍不到应用。
+6. 证据文件（`logs\` 目录被 .gitignore 忽略，**只在本地，不入库**）：
+   - `logs\sidebar-new-main-20261025\accept-before-20261123.png`（修前：运行会话第 7 行）
+   - `logs\sidebar-new-main-20261025\accept-after-20261123.png`（修后：运行会话第 2 行）
+   - `src\logs\daemon-9331-manual.log`（tick 110 那行是落位证据）
+   - `logs\sidebar-new-main-20261025\accept-running-topmost.mjs`（只读探针）
+
+---
+
 ## 20. 致谢
 
 - 第三方项目 [`sqing33/minimax-code-skin`](https://github.com/sqing33/minimax-code-skin)

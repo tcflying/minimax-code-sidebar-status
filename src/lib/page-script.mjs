@@ -2123,6 +2123,22 @@ function __mmxStatusMain(cfg) {
   // 闸占着的那一趟不算消费掉这次升沿——闸一空闲就补，对抗测试 P.2 / Q.3 就是这
   // 一条。tried 记有没有真的叫过 cap.fn：没叫过不扣预算。
   var promotePending = null;
+  // 活动会话上浮这一条通道自己发起过写的 id（形状同 newMainState.placedIds：
+  // "我们发起过写的那一组"）。锁的让位判据只认这一组，所以上浮写完之后必须把自
+  // 己的 id 登记进来，否则锁下一趟就把 raw[0] 抢回去，刚浮上去的会话又掉回第二位
+  // ——而它的升沿已经消费掉，再也不会上来。
+  // 【不随 daemon 的 run 变更清空】：daemon 每次应用自动更新都会重启，新对话那一
+  // 组的记忆随重启清掉是既有设计（§15.18「已知副作用」）；这一组清掉的话，运行会
+  // 话刚浮上去就被锁抢回 raw[0]，同样再也不会上来——那等于把这次的修复变成一次性
+  // 动作。
+  var promoteHoistedIds = [];
+  // 【口径更新 · 本轮】上面那句「不随 daemon 的 run 变更清空」说的是【没有那条显式
+  // 清空语句】，不是说它跨 daemon 重启还活着：daemon 每次启动都会重新注入页面，
+  // buildBootstrapExpression 注入的 __mmxStatusMain 会先 previous.dispose() 再建一
+  // 整套新的闭包变量，这个数组随之归零。实测：老 daemon 那个日志里 passes 已经数到
+  // 21563，daemon 重启后的新日志第一趟 tick 10 就是 passes:11 —— 计数器归零重数，
+  // 闭包重建的实证。（新对话那一组 placedIds 是被 run 变更显式清空的；这一组没有
+  // 那一条显式清空语句，但结果同样是跨 daemon 重启归零。）
   // 与 autoTopRuntime / topLockRuntime 同一套纪律：槽存不下 = 拒绝，绝不是给一份
   // 用完即弃的预算（那正是 r3 的 w3 缺陷）。
   function promoteRuntime() {
@@ -2136,6 +2152,20 @@ function __mmxStatusMain(cfg) {
     }
     if (window[TOPMOST_PROMOTE_KEY] !== fresh) return null;
     return fresh;
+  }
+  // 落点确认（两条口径，别混）：
+  //   raw = true  -> 宿主 order 的【raw 下标 0】。让位那一支（锁已经不在 raw[0]）
+  //                  用这一条：宿主那个插入下标就是 raw 下标，而 order 里混着非会
+  //                  话行，所以"会话顺序里的第一个"与"raw 下标 0"不是一回事。
+  //   raw = false -> 本模块一直用的会话下标口径（无锁 = 0，锁已证实在 raw[0] = 1）。
+  function promoteLanded(cap, ids, id, slot, raw) {
+    if (raw) {
+      var order = cap && cap.order;
+      if (!isArray(order) || !order.length) return false;
+      var first = order[0];
+      return !!(first && first.type === 'session' && String(first.id) === String(id));
+    }
+    return topmostAtSlot(cap, ids, id, slot);
   }
   // status 是 apply() 那一趟算好的那份状态 map（daemon 的 snapshot 过滤掉 idle），
   // 原样传进来，本段不重查。capIn 同理，见上面 apply() 里的注释。
@@ -2186,6 +2216,10 @@ function __mmxStatusMain(cfg) {
     // 这一趟锁顶的落点，与自动到顶那一段同一条判据：锁顶已证实在 raw[0] 时落点是
     // 1（锁保持第一，正在跑的那一项紧跟其后），证不出来时才让位。
     var lockSlot = topmostLockSlot(cap);
+    // 【口径限定】下面这两句（"让位时【不推进状态基线】…本分支里不得出现任何宿主
+    // 写，deferred 仍然每趟 +1"）只讲【其余四种 blocked 那一支】：view-unstable /
+    // source-not-local / not-local-id / order-missing-id，也就是【证不出来】的那几
+    // 种。'lock-not-at-top' 那一支不在其中——它是【证出来了让位】，口径见下面。
     // 让位时【不推进状态基线】：让位期间开始对话的那一项要留在基线之外，锁顶一旦
     // 能被证实仍会被认成"刚刚开始对话"并被浮上去。这正是 D1（24.10b/24.10c）修过
     // 的形状，抄同一条，不各自发明。
@@ -2195,9 +2229,31 @@ function __mmxStatusMain(cfg) {
     // （那是本段唯一扣预算的地方）之前，否则锁在场期间的 order 变化同样会被当成
     // "这次上浮没落位"而扣费——24 段踩过这个坑，见那里的同名注释。
     if (lockSlot.blocked) {
-      promoteState.deferred++;
-      promoteState.lastReason = 'toplock-other';
-      return;
+      // 只有"锁已经让位"这一支放行。lock-not-at-top 的意思是【锁存在，但它自己
+      // 已经不在 raw[0]】：那是这一份 cap.order 证出来的【事实】，不是"证不出来"。
+      // 用户 2026-11-15 的让位语义（§15.18）在这里同样成立：锁让位，正在跑的会话
+      // 按 raw[0] 走。这一支原来在这里直接 return，于是活动会话上浮这条通道被永
+      // 久 defer（真机实测：19050 趟 tick，calls 恒 0、deferred 21257、lastReason
+      // 恒为 toplock-other）。
+      // 其余四种 blocked（view-unstable / source-not-local / not-local-id /
+      // order-missing-id）是【证不出来】：一次宿主写都不发生，这四条一个都不放宽。
+      // 与上面那段「让位时【不推进状态基线】」正好相反：【本支会写宿主写，状态基线
+      // 照常推进】（deferred 也不再每趟 +1）——它不是"证不出来"，是"证出来了让位"。
+      // 【口径更新 · 本轮】上面那句「真机实测：19050 趟 tick，calls 恒 0、deferred
+      // 21257、lastReason 恒为 toplock-other」里的数字来自两趟不同的快照：deferred
+      // 21257 是 tick 19010 的，passes 21563 是 tick 19050 的（那一趟 deferred 是
+      // 21416）。逐字快照见 README §23「现象与实测证据」第 2 条。「calls 恒为 0」
+      // 在全日志 2544 条快照里都成立（其中 2542 条 lastReason 是 toplock-other，
+      // 另有 2 条 view-unstable）。
+      if (lockSlot.blocked !== 'lock-not-at-top') {
+        promoteState.deferred++;
+        promoteState.lastReason = 'toplock-other';
+        return;
+      }
+      // 让位这一支的落点是宿主 order 的 raw 下标 0（宿主那个插入下标就是 raw 下标），
+      // 不是"会话顺序里的第一个"。lock 留空字符串：锁自己永不当候选这件事由下面
+      // 那条【真实锁 id】的排除来管，不靠这个字段。
+      lockSlot = { slot: 0, lock: '', raw: true };
     }
     // 基线【不】在判据之前推进。升沿留在 promotePending 里，直到下一趟确认它：真的
     // 浮到了下标 0（成功，不扣预算），或者那一份顺序形态已经被别的纠正改写（这一
@@ -2207,7 +2263,10 @@ function __mmxStatusMain(cfg) {
       // 落点前提是否还成立？锁顶出现 / 释放 / 切换都会改落点，而那不是我们造成的
       // 失败：前提变了就【不判定、不扣费】，只把待办重新指向新落点。
       var pendSame = promotePending.slot === lockSlot.slot
-        && promotePending.lock === (lockSlot.lock || '');
+        && promotePending.lock === (lockSlot.lock || '')
+        // raw 也是落点前提的一部分：让位那一支的落点是 raw[0]，别的分支是会话下标
+        // 口径，两者不能互相当成"落点没变"。
+        && !!promotePending.raw === !!lockSlot.raw;
       if (lockSlot.lock && promotePending.id === lockSlot.lock) {
         // 待办的目标就是锁顶自己。锁顶已经把它按在 raw[0]，那一次上浮【成了】——
         // 它不是失败，不扣预算。【也不推进状态基线】：这一趟里别的升沿不能被这一次
@@ -2215,11 +2274,14 @@ function __mmxStatusMain(cfg) {
         // 挑选别的升沿。
         promotePending = null;
         promoteState.lastReason = 'lock-absorbed';
-      } else if (topmostAtSlot(cap, ids, promotePending.id, lockSlot.slot)) {
+      } else if (promoteLanded(cap, ids, promotePending.id, lockSlot.slot, lockSlot.raw)) {
+        var landedRaw = !!promotePending.raw;
         promotePrev = next;
         promotePending = null;
         promoteState.confirmed++;
-        promoteState.lastReason = 'landed';
+        // 让位那一支的落位有自己的理由码：daemon 日志里要能一眼看出"这一趟是活动
+        // 会话上浮写的"，而不是笼统的 landed。
+        promoteState.lastReason = landedRaw ? 'running-hoisted' : 'landed';
         return;
       } else if (!pendSame) {
         if (hostCallBusy()) {
@@ -2231,13 +2293,14 @@ function __mmxStatusMain(cfg) {
         }
         // 前提变了：先按【旧落点】判那一次写。它在旧落点上 = 写成了（不扣费）；
         // 不在 = 那一次写没落位（扣一次预算，和我们自己造成的失败同一套记账）。
-        if (!topmostAtSlot(cap, ids, promotePending.id, promotePending.slot)) {
+        if (!promoteLanded(cap, ids, promotePending.id, promotePending.slot, promotePending.raw)) {
           if (promotePending.tried && topmostCharge(promoteRuntime(), promotePending.id, promoteState)) {
             promoteState.failed++;
           }
         }
         promotePending.slot = lockSlot.slot;
         promotePending.lock = lockSlot.lock || '';
+        promotePending.raw = !!lockSlot.raw;
         promoteState.lastReason = 'slot-changed';
       } else if (hostCallBusy()) {
         promoteState.awaiting++;
@@ -2273,7 +2336,12 @@ function __mmxStatusMain(cfg) {
       if (was) continue;                       // 上一趟就在跑：没有状态变化
       if (!next[c].running) continue;          // 这一趟也还没跑
       // 锁顶自己永不当候选：它必须留在 raw[0]，我们只写它后面那一位。
-      if (lockSlot.lock && next[c].id === lockSlot.lock) continue;
+      // 让位那一支（lock-not-at-top）里锁自己已经不在 raw[0]，而 lockSlot.lock
+      // 是空字符串，所以那条排除会失效——这里用【真实的锁 id】来排除：锁在场时
+      // 它与 lockSlot.lock 是同一个（那正是 topmostLockSlot 认锁用的那个 id），
+      // 锁不在场时它是空串，排除自然不生效。
+      var lockId = lockSlot.lock || topmostLockView.id || '';
+      if (lockId && next[c].id === lockId) continue;
       cand = c;
       break;                                    // 一次最多一项：下标最小的那一个
     }
@@ -2283,8 +2351,8 @@ function __mmxStatusMain(cfg) {
     promoteState.changes++;
     var id = next[cand].id;
     // 已经在【它该落的那一位】上的那一项什么也不做，也不消耗预算：无锁 = 置顶区
-    // 最顶，有锁 = 紧跟锁顶之后。
-    if (topmostAtSlot(cap, ids, id, lockSlot.slot)) {
+    // 最顶，有锁 = 紧跟锁顶之后，让位那一支 = 宿主 order 的 raw 下标 0。
+    if (promoteLanded(cap, ids, id, lockSlot.slot, lockSlot.raw)) {
       promoteState.alreadyTop++;
       promotePrev = next;
       promoteState.lastReason = 'already-top';
@@ -2327,19 +2395,29 @@ function __mmxStatusMain(cfg) {
     if (!ticket) {
       promoteState.blocked++;
       promoteState.lastReason = 'gate-unavailable';
-      promotePending = { ids: ids.slice(), id: id, tried: false, slot: lockSlot.slot, lock: lockSlot.lock || '' };
+      promotePending = { ids: ids.slice(), id: id, tried: false, slot: lockSlot.slot, lock: lockSlot.lock || '', raw: !!lockSlot.raw };
       return;
     }
     promoteState.budget = rt.budget;
     promoteState.calls++;
-    promoteState.lastReason = 'calling';
-    promotePending = { ids: ids.slice(), id: id, tried: true, slot: lockSlot.slot, lock: lockSlot.lock || '' };
+    // 让位那一支的写有自己的理由码：daemon 日志里要能一眼看出"这一趟是活动会话
+    // 上浮写的"，而不是笼统的 calling。
+    var hoistWrite = !!lockSlot.raw;
+    promoteState.lastReason = hoistWrite ? 'running-hoisted' : 'calling';
+    promotePending = { ids: ids.slice(), id: id, tried: true, slot: lockSlot.slot, lock: lockSlot.lock || '', raw: hoistWrite };
     var ret;
     try {
       // EXACTLY three arguments, and it is the SAME single write the other three
       // entries use. No index means "append", which is the bug being corrected.
       // 落点：无锁 = 0，锁顶已证实在 raw[0] = 1（锁保持第一，目标紧跟其后）。
+      // 让位那一支（锁已经不在 raw[0]）的 lockSlot.slot 就是 0，也就是 raw[0]，
+      // 锁同样让位。
       ret = cap.fn(id, true, lockSlot.slot);
+      // 发起过写就算"我们放上去的"那一组里的一个（形状同 newMainState.placedIds）：
+      // 锁的让位判据只认【我们自己发起过写的那一组 id】，活动会话这一组是其中一部
+      // 分。宿主写是异步的：这里既不能同步判断它成没成，也不许因为它后来 reject
+      // 就反悔——没落位的写照样进集合，只是多一个成员（集合语义，见 §15.18）。
+      if (promoteHoistedIds.indexOf(id) < 0) promoteHoistedIds.push(id);
     } catch (e) {
       hostCallRelease(ticket);
       promoteState.blocked++;
@@ -2351,7 +2429,9 @@ function __mmxStatusMain(cfg) {
     // 它自己的结算释放，而且只释放它自己那一张票。
     Promise.resolve(ret).then(function () {
       hostCallRelease(ticket);
-      promoteState.lastReason = 'host-returned';
+      // 让位那一支保留它自己的理由码：宿主的 resolve 只说明"它处理完了"，不是
+      // "生效了"，而 daemon 日志里这一趟要能看出是活动会话上浮写的。
+      promoteState.lastReason = hoistWrite ? 'running-hoisted' : 'host-returned';
     }, function () {
       hostCallRelease(ticket);
       promoteState.blocked++;
@@ -3189,6 +3269,10 @@ function __mmxStatusMain(cfg) {
     // 版本不支持置顶排序"——对一个明明可用的会话说宿主不支持置顶排序，等于把
     // "不用做"报成了"做不到"。
     'already-top': '已在置顶区最顶',
+    // 活动会话上浮这一支写成功时的理由码：锁已经让位（不在 raw[0]），于是正在跑
+    // 的会话被写到 raw[0]。人话给用户看，机器码留在 api.topmost().pinnedPromote
+    // .lastReason 里给 daemon 日志读。
+    'running-hoisted': '正在运行的会话已置顶到最前',
     'untrusted-click': '只响应真实点击',
     'row-gone': '会话行已变化',
     'menu-gone': '菜单已关闭',
@@ -5390,6 +5474,9 @@ function __mmxStatusMain(cfg) {
   //
   // 判据只有一条，而且只认【我们自己发起过写的那一组 id】（placedIds）：
   //   1. raw[0] 是会话，而且它的 id 在 placedIds 里（我们写过它）；
+  // 【口径更新 · 本轮】上面那句「判据只有一条，而且只认 placedIds」写的是本轮改动
+  // 之前的样子。实现现在认的是【两个】集合的并集：placedIds（新对话那一组）∪
+  // promoteHoistedIds（活动会话上浮那一组）。函数体里有完整说明。
   //   2. 锁自己的 id 仍在宿主 order 里，且下标 >= 1（锁还在置顶区里）。
   // 为什么是"一组"而不是"最后一次写的那个"：宿主写是异步的，一次没落位的写
   // （reject / 回滚）照样会进 placedIds。若只认最后一个，这一次失败的写就能把
@@ -5402,7 +5489,25 @@ function __mmxStatusMain(cfg) {
   // 只负责把它记下来——让位这一趟一次宿主写都不发，维持预算一格都不扣。
   // ---------------------------------------------------------------------
   function newMainYieldId(view) {
-    if (!newMainState || !newMainState.placedIds.length) return '';
+    // 让位判据认【两个】集合的并集：
+    //   newMainState.placedIds  新对话那一组（随 daemon 的 run 变更清空，既有设计）
+    //   promoteHoistedIds       活动会话上浮那一组（【不清空】：daemon 每次应用自
+    //                           动更新都会重启，清掉它的话运行会话刚浮上去就被锁
+    //                           抢回 raw[0]，而它的升沿已经消费掉、再也不会上来）
+    // 【口径更正 · 追加】上面那句「【不清空】」说的是【没有那条显式清空语句】——
+    // 不像 newMainState.placedIds 有 run 变更显式清空那一行；它【不是】说这个集合
+    // 跨 daemon 重启还活着：daemon 每次启动都会重新注入页面，注入的
+    // __mmxStatusMain 会先 previous.dispose() 再建一整套新的闭包变量，这个集合随
+    // 之归零。所以它只在【同一个页面实例】内有效（页面重新注入同样重建：老日志
+    // tick 4400 那趟渲染进程文档被替换、重新注入，passes 从 4668 归零重数）。
+    // 实证见上面那段：passes:21563 → daemon 重启后新日志第一趟 tick 10 = passes:11。
+    // 新对话的【回执】只认它自己那一个集合：活动会话的登记不是一次新对话交付，
+    // 不能进回执（回执口径见上面「回执口径」那一小节）。
+    // 那个 typeof 守卫不是防御性编程，是切片现实：离线套件把新对话这一段【单独】
+    // 切出来编译执行，那一块里没有活动会话上浮那一段。
+    var hoisted = (typeof promoteHoistedIds !== 'undefined' && promoteHoistedIds) ? promoteHoistedIds : [];
+    if (!newMainState) return '';
+    if (!newMainState.placedIds.length && !hoisted.length) return '';
     if (!view || view.source !== 'local') return '';
     var order = view.order;
     if (!isArray(order) || !order.length) return '';
@@ -5411,7 +5516,7 @@ function __mmxStatusMain(cfg) {
     var firstId = String(first.id);
     // raw[0] 必须是我们【发起过写】的那一组里的一个（集合语义，不是"最后一次
     // 写的那一个"：没落位的写不能顶掉已落位那条的让位记录）。
-    if (newMainState.placedIds.indexOf(firstId) < 0) return '';
+    if (newMainState.placedIds.indexOf(firstId) < 0 && hoisted.indexOf(firstId) < 0) return '';
     var intent = topLockState.intentId;
     if (!intent) return '';
     for (var i = 0; i < order.length; i++) {
