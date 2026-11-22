@@ -4269,7 +4269,9 @@ pwsh -NoProfile -File src\set-mmx-tray-icon.ps1 -TargetProcessId 63636 -Expected
 根因是启动器杀进程时**取错了 id 属性名**，旧实例一个都没死，新实例被 Electron
 单实例锁吞掉，CDP 端口起不来，daemon 也就没起来 —— 侧边栏的**选中行底色、
 running 行置顶、锁顶让位**这三个功能同时失效（它们都靠 daemon 注入页面脚本）。
-代码已修并加了回归断言，但**真机链路本轮没有跑过**（见文末「未验证」）。
+代码已修并加了回归断言，**真机链路也已跑通两次**：2026-11-17 19:31 和 2026-11-21
+20:25（见下面「真机实测」）。侧边栏三个功能里，本轮只读探针**直接证实了「注入已生效
++ 选中行底色与左侧蓝条正确」**；running 行置顶、锁顶让位**本轮没有复验**。
 
 ### 现象与证据
 
@@ -4331,13 +4333,110 @@ running 行置顶、锁顶让位**这三个功能同时失效（它们都靠 dae
    - (d) `relaunch-cdp-delayed.ps1` 的 exe 探测在本机能解析出真实路径
      （含 `MINIMAX_CODE_EXECUTABLE` 分支）。
 
+### 真机实测（2026-11-17 / 11-21 / 11-22）
+
+#### 第一次跑通：2026-11-17 19:31
+
+- launcher 日志：`src\logs\launch-20261117-193125.log`
+- 19:31:28「检测到 10 个进程在跑且无 CDP，结束它们并带 CDP 参数重启（当前会话会被中断）。」
+  → 后面**没有** 05:30 那样的 10 条「跳过一个枚举瞬间消失的进程」，也没再白等 5 分钟；
+  19:31:29 就起了带 CDP 的新实例，CDP 随后就绪（验收报告里 CDP OK）。
+  （launcher 不逐条打「已结束 pid=xxx」，差别看这几条。）
+- 19:31:29「以 --remote-debugging-port=9331 启动」
+- 19:31:33「已用 cleanup.mjs 还原旧 daemon 留下的注入（exit=0）」
+- 19:31:34「daemon pid=48500，启动器退出」
+- 19:31:38「托盘图标已换成红圆：pid=5872 host=9114054 id=3」
+- 19:31:39「已启动任务栏图标辅助进程（pid=22828，目标 pid=5872）」
+- 验收报告：`logs\sidebar-new-main-20261025\after-restart-check-20261117-193216.md`
+  ——「CDP 端口 9331: OK (HTTP 200 + webSocketDebuggerUrl)」；daemon pid=48500
+  start=2026/11/17 19:31:34；应用主进程 pid=5872 start=2026/11/17 19:31:29，
+  命令行带 `--remote-debugging-port=9331 --remote-debugging-address=127.0.0.1`。
+- 同轮只读探针（`logs\sidebar-new-main-20261025\after-restart-probe-193222.json`，
+  **该文件是 11-17 的历史落盘：会话标题中文有编码乱码，整体不是合法 JSON，只有
+  `rowCount` 与 `vars` 可读**）`rowCount=53`，注入变量已生效：
+  `--mmx-active-bg: rgba(10, 10, 10, 0.10)`、
+  `--mmx-active-bar: rgba(0, 148, 252, 0.90)`。
+
+#### 第二次跑通：2026-11-21 20:25
+
+- **早一轮验收是 FAIL**：`logs\sidebar-new-main-20261025\after-restart-check-20261121-200754.md`
+  —— 20:07:54 记的是「CDP 端口 9331: FAIL (120 次重试耗尽)」；应用主进程
+  pid=58592 start=2026/11/21 19:56:57，命令行是 `--updated`（19:56 的自动更新把
+  应用自己重启成了不带 CDP 的实例），daemon 还是 11-17 那个 pid=48500。
+  **这一轮不算跑通**，20:25 那次 launcher 重排后才恢复。
+- launcher 日志：`src\logs\launch-20261121-202542.log`
+- 20:25:45「以 --remote-debugging-port=9331 启动」
+- 20:25:49「发现 1 个占用端口 9331 的旧 daemon，先结束它，免得它继续用旧代码快照服务。」
+  → 20:25:49「已结束旧 daemon pid=48500」。这是 `src\lib-stale-daemon.ps1` 的
+  **陈旧 daemon 清理路径**（2026-10-02 就有的），旧 daemon 清掉后启动继续往下走；
+  「旧实例没死透就 fail fast」（退出码 6）这次**没有触发**，启动流程正常。
+- 20:25:50「cleanup.mjs 返回 exit=-1073740791（node 进程崩溃 0xC0000409，
+  常见于 app 刚被强杀、CDP target 消失的瞬间），旧注入可能没还原干净
+  （不影响启动，新 daemon 会重新注入）。」—— 新观察到的非阻塞问题，见下面「已知限制」。
+- 20:25:50「daemon pid=32952，启动器退出」
+- 20:25:55「托盘图标已换成红圆：pid=67932 host=2101444 id=3」
+- 20:25:57「已启动任务栏图标辅助进程（pid=62380，目标 pid=67932）」
+- keeper 结果文件 `src\logs\taskbar-icon\keeper-67932-292b7b8377b74713a237c97a3bbf7806.json`：
+  `status=applied`、`targetProcessId=67932`、`keeperPid=62380`、
+  `processCreatedUtc=2026-11-21T12:25:45.4470495Z`（= 20:25:45 +08:00）、
+  命令行带 `--remote-debugging-port=9331 --remote-debugging-address=127.0.0.1`。
+- **这轮没有单独的验收报告**：全仓唯一的「CDP 端口 9331: OK (HTTP 200 +
+  webSocketDebuggerUrl)」验收记录是 11-17 那份
+  （`after-restart-check-20261117-193216.md`）；11-21 这轮 CDP 通的证据是下面三样——
+  launcher 日志、11-22 只读探针、活体进程（pid=67932 命令行带 CDP 参数、
+  daemon pid=32952 在跑）。
+
+#### 第三次：2026-11-22 只读复验（不点击、不注入）
+
+命令：`node logs\sidebar-new-main-20261025\after-restart-probe.mjs --port 9331`
+（脚本头注释写明「纯读：不点击、不注入、不改任何 DOM」）。
+
+- CDP：`http://127.0.0.1:9331/json/version` → HTTP 200，带 `webSocketDebuggerUrl`。
+- 应用主进程 pid=67932，启动于 2026-11-21 20:25:45，命令行
+  `--remote-debugging-port=9331 --remote-debugging-address=127.0.0.1`。
+- daemon pid=32952，启动于 2026-11-21 20:25:50，命令行
+  `node ...\src\daemon.mjs --port 9331 --interval 2500`。
+- 原始输出落点（两份快照都在 logs 目录，gitignored，不入库）：
+  `logs\sidebar-new-main-20261025\after-restart-probe-20261122-165x.json`（`rowCount=53`）
+  和 `logs\sidebar-new-main-20261025\after-restart-probe-20261122-170x.json`（`rowCount=60`）。
+- 注入变量两次都生效：`--mmx-active-bg: rgba(10, 10, 10, 0.10)`、
+  `--mmx-active-bar: rgba(0, 148, 252, 0.90)`（应用自身默认底色只有 0.04）。
+- 选中行的 domIndex 和文本**随当时打开/聚焦的会话变化，不是固定值**：53 行那次是
+  domIndex 24「zcode反代」，60 行那次是 domIndex 3「🔴mmx code 侧边栏⑂Finish」。
+  两次的底色与左侧蓝条一致：
+  `bg=rgba(10, 10, 10, 0.1)`、`shadow=rgba(0, 148, 252, 0.9) 3px 0px 0px 0px inset`。
+- 非选中行 `bg=rgba(0, 0, 0, 0)`；`rgba(10, 10, 10, 0.04)` 那一行**只出现在 53 行那次**
+  ——domIndex 27「LiteFlow Agent ev 智能分流 沙箱与会话」，是应用自己着色的默认值，
+  不是注入值。60 行那次没有这一行。
+- 行数 53 → 60 是**渲染行数净增 7**：两份快照的会话 id 交集 49、新增 11、消失 4，
+  会话列表有进有出，不是单纯多了 7 条。
+
 ### 未验证 / 已知限制
 
-- ⚠️ **「真机走 launcher 从无 CDP 实例切到带 CDP 实例」这条链路，修完之后还没有在
-  真机上跑过。** 本节所有结论来自离线代码改动 + `src\test-launcher.ps1` 的离线断言
-  （含桩验证），**不是**「已修复并验证」。真机链路由主会话另行排程实测。
-- 侧边栏三个功能（选中行底色 / running 行置顶 / 锁顶让位）的恢复效果，同样要等
-  真机那次 CDP 切换成功之后才能确认。
+- ✅ **「真机走 launcher 从无 CDP 实例切到带 CDP 实例」这条链路，已在真机上跑通**：
+  2026-11-17 19:31 杀 10 个无 CDP 进程 → 带 `--remote-debugging-port=9331` 启动 →
+  cleanup exit=0 → daemon pid=48500 → 托盘红圆 pid=5872 → 任务栏 keeper pid=22828
+  （日志 `src\logs\launch-20261117-193125.log`）；2026-11-21 20:25 应用自更新成
+  `--updated`、CDP 不通后由 launcher 重排 → 旧 daemon pid=48500 被结束 →
+  daemon pid=32952 → 托盘红圆 pid=67932 host=2101444 id=3 → 任务栏 keeper
+  pid=62380（目标 pid=67932，日志 `src\logs\launch-20261121-202542.log`）。
+  **两轮的证据来源不同**：11-17 那轮有验收报告
+  `logs\sidebar-new-main-20261025\after-restart-check-20261117-193216.md`，记的是
+  「CDP 端口 9331: OK (HTTP 200 + webSocketDebuggerUrl)」；11-21 20:25 那轮
+  **没有**单独验收报告（当轮 20:07 的 `after-restart-check-20261121-200754.md`
+  是 FAIL），它 CDP 通的证据是 launcher 日志 + 11-22 只读探针 + 活体进程
+  （pid=67932 命令行带 `--remote-debugging-port=9331 --remote-debugging-address=127.0.0.1`、
+  daemon pid=32952 在跑、`/json/version` HTTP 200 带 `webSocketDebuggerUrl`）。
+- ✅ **侧边栏「选中行底色」已实测恢复**：2026-11-22 两份只读探针快照都读到注入变量
+  `--mmx-active-bg: rgba(10, 10, 10, 0.10)`、
+  `--mmx-active-bar: rgba(0, 148, 252, 0.90)`，选中行两次都是
+  `bg=rgba(10, 10, 10, 0.1)` + `shadow=rgba(0, 148, 252, 0.9) 3px 0px 0px 0px inset`
+  （选中的是哪个会话会变，样式不变）。
+- ⚠️ **running 行置顶、锁顶让位：本轮没有复验，不能算「已验证」。** 只读探针不点击、
+  不注入，要观察这两项需要一个正在跑的会话和一个新建会话，超出只读范围。
+- ⚠️ **新观察到的非阻塞问题**：`cleanup.mjs` 在 app 刚被强杀、CDP target 消失的瞬间
+  可能崩掉（2026-11-21 20:25:50 记的是 exit=-1073740791，node 崩溃 0xC0000409），
+  旧注入可能没还原干净。**不影响启动**，新 daemon 会重新注入。
 - 冷启动组（B 组）默认 SKIP，本轮**没有**在真机上跑过带 `--user-data-dir` 的
   一次性实例。
 - 本轮只动了 `src\launch-mmx-status.ps1`、`src\relaunch-cdp-delayed.ps1`、
